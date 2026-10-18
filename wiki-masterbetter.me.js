@@ -7962,12 +7962,15 @@ const MY_USERNAME = "xxx";
   // Feature GLM (cont'd): on every page, each leaf element (p, span, a, h1...) whose whole text is a member's name
   // gets a span.wm-guild-badge sibling right after it (the site's framework owns the name's content). Hovering the
   // name or the icon shows the member's personal description (Feature UDS, "desc-{username}") when there is one,
-  // else "Membre de la guilde". Names embedded in a longer sentence (notifications) are not decorated. Badges of
+  // else "Membre de la guilde". The name may be preceded by the "De " / "À " of /trades. On the guild list itself
+  // (links carrying ?from=guild) there is no badge: the description is shown under the name instead
+  // (p.wm-guild-row-desc), when there is one. Names embedded in a longer sentence (notifications) are not decorated. Badges of
   // people who are no longer members, or whose name is gone, are removed.
   // ============================================================
   const GUILD_MEMBERS_KEY = "wm-guild-members";
   const GUILD_BADGE_SVG =
     '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"></path></svg>';
+  const GUILD_ROW_LINK_SELECTOR = 'a[href^="/profile/"][href*="from=guild"]';
   const GUILD_NAME_SELECTOR = "p, span, a, h1, h2, h3, h4, strong, b, li, div";
 
   let guildMoreClickedAt = -1;
@@ -8043,8 +8046,44 @@ const MY_USERNAME = "xxx";
     return readUserDescription(name) || "Membre de la guilde";
   }
 
+  // The member a name element designates: its whole text, optionally preceded by the "De " / "À " of /trades
+  function getGuildMemberName(el, members) {
+    const text = el.textContent.trim();
+    if (members.has(text)) return text;
+    const stripped = text.replace(/^(?:De|À)\s+/, "");
+    return stripped !== text && members.has(stripped) ? stripped : null;
+  }
+
+  // On the guild list itself, the description replaces the badge: it is shown under each member's name
+  function syncGuildRowDescriptions() {
+    document
+      .querySelectorAll('a[href^="/profile/"][href*="from=guild"] p.truncate')
+      .forEach((nameEl) => {
+        const nameRow = nameEl.parentElement;
+        const host = nameRow?.parentElement;
+        if (!host) return;
+
+        const text = readUserDescription(nameEl.textContent.trim());
+        const existing = host.querySelector(":scope > .wm-guild-row-desc");
+        if (!text) {
+          existing?.remove();
+          return;
+        }
+        if (existing) {
+          if (existing.textContent !== text) existing.textContent = text;
+          return;
+        }
+
+        const p = document.createElement("p");
+        p.className = "wm-guild-row-desc";
+        p.textContent = text;
+        nameRow.after(p);
+      });
+  }
+
   function decorateGuildMembers() {
     const members = readGuildMembers();
+    syncGuildRowDescriptions();
 
     // Badges whose user left the guild, or whose name element is gone
     document.querySelectorAll(".wm-guild-badge").forEach((badge) => {
@@ -8052,10 +8091,19 @@ const MY_USERNAME = "xxx";
       const stillThere = Array.from(badge.parentElement?.children ?? []).some(
         (child) => child !== badge && child.textContent.trim() === name,
       );
-      if (!members.has(name) || !stillThere) badge.remove();
+      if (
+        !members.has(name) ||
+        !stillThere ||
+        badge.closest(GUILD_ROW_LINK_SELECTOR)
+      )
+        badge.remove();
     });
     document.querySelectorAll("[data-wm-guild-title]").forEach((el) => {
-      if (members.has(el.textContent.trim())) return;
+      if (
+        getGuildMemberName(el, members) &&
+        !el.closest(GUILD_ROW_LINK_SELECTOR)
+      )
+        return;
       el.removeAttribute("title");
       delete el.dataset.wmGuildTitle;
     });
@@ -8064,8 +8112,9 @@ const MY_USERNAME = "xxx";
     document.querySelectorAll(GUILD_NAME_SELECTOR).forEach((el) => {
       if (el.children.length > 0 || el.classList.contains("wm-guild-badge"))
         return;
-      const name = el.textContent.trim();
-      if (!members.has(name) || !el.parentElement) return;
+      const name = getGuildMemberName(el, members);
+      if (!name || !el.parentElement || el.closest(GUILD_ROW_LINK_SELECTOR))
+        return;
 
       const text = guildBadgeText(name);
       el.title = text;
@@ -8099,6 +8148,13 @@ const MY_USERNAME = "xxx";
         margin-left: 0.25rem;
         color: #38bdf8;
         cursor: help;
+      }
+      .wm-guild-row-desc {
+        margin: 0;
+        font-size: 0.75rem;
+        color: var(--color-foreground);
+        opacity: 0.5;
+        overflow-wrap: anywhere;
       }
       .wm-guild-badge svg {
         width: 1em;
