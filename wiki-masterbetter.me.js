@@ -3853,6 +3853,10 @@ const MY_USERNAME = "xxx";
       id: "rule-39",
       label: "Barres de progression des succès en bas à droite",
     },
+    {
+      id: "rule-40",
+      label: "Modale de gestion des étiquettes élargie (90 % de l'écran)",
+    },
   ];
 
   function readFeatureFlags() {
@@ -7857,6 +7861,37 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Rule 40: whenever the tag manager modal ("Gérer les étiquettes" — the one to create, rename,
+  // recolor or delete tags) enters the DOM, widen it from the site's max-w-lg to 90vw so long tag names stay readable
+  // and easy to edit. The modal is spotted from its h2 reading "Gérer les étiquettes": its closest
+  // div.card-frame-solid gets the "wm-tag-manager-modal" class, which CSS turns into "max-width: 90vw". That class
+  // doubles as the guard against re-processing it on every later mutation.
+  // ============================================================
+  function widenTagManagerModal() {
+    document.querySelectorAll("h2").forEach((heading) => {
+      if (heading.textContent.trim() !== "Gérer les étiquettes") return;
+
+      const modal = heading.closest("div.card-frame-solid");
+      if (modal && !modal.classList.contains("wm-tag-manager-modal")) {
+        modal.classList.add("wm-tag-manager-modal");
+      }
+    });
+  }
+
+  function watchTagManagerModalWidth() {
+    GM_addStyle(`
+      .wm-tag-manager-modal {
+        max-width: 90vw !important;
+      }
+    `);
+
+    widenTagManagerModal();
+
+    const observer = new MutationObserver(() => widenTagManagerModal());
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   function main() {
@@ -7933,6 +7968,7 @@ const MY_USERNAME = "xxx";
     run("rule-38", watchNoEvalHalo);
     run("feature-uds", watchUserDescriptions);
     run("rule-39", watchAchievementProgressBars);
+    run("rule-40", watchTagManagerModalWidth);
 
     watchFeatureConfigButton();
     watchTutorialButton();
