@@ -2097,10 +2097,8 @@ const MY_USERNAME = "xxx";
   // "observed-{card name}" (h1.flex-1). A legacy entry still stored under the untagged card name is migrated to that
   // prefixed key on read. Skips while div.animate-spin is present (the page is still loading). Each stored entry is
   // tagged as "{price}-{tag}", tag being the bid UUID's second segment, so the same bid can never be recorded twice.
-  // Each card keeps at most N entries: once full, a new price replaces the array's current highest value, but only
-  // when it's strictly lower than that value.
+  // Every sold price is kept, with no cap per card.
   // ============================================================
-  const MAX_STORED_PRICES = 5;
   const PRICE_ENTRY_REGEX = /^\d+-[0-9a-f]+$/i;
   const BSP_KEY_PREFIX = "observed-";
 
@@ -2139,24 +2137,16 @@ const MY_USERNAME = "xxx";
     return JSON.parse(raw ?? "[]");
   }
 
-  // Feature BSP (cont'd): the reference price averaged from stored entries is weighted rather than plain —
-  // out of N prices, the lowest weighs N, the second-lowest N-1, ... the highest weighs 1 — so a single high
-  // outlier among mostly-low sales pulls the reference up less than an unweighted average would.
-  function computeWeightedAveragePrice(numericPrices) {
+  // Feature BSP (cont'd): the reference price is a trimmed mean of the stored entries — the single highest and the
+  // single lowest price are set aside (so one outlier on either side doesn't skew it), and the rest is averaged
+  // plainly. With fewer than 3 prices nothing could be left after trimming, so they are all averaged.
+  function computeTrimmedAveragePrice(numericPrices) {
     if (!numericPrices.length) return null;
 
     const sorted = [...numericPrices].sort((a, b) => a - b);
-    const n = sorted.length;
+    const kept = sorted.length >= 3 ? sorted.slice(1, -1) : sorted;
 
-    let weightedSum = 0;
-    let weightTotal = 0;
-    sorted.forEach((price, index) => {
-      const weight = n - index;
-      weightedSum += price * weight;
-      weightTotal += weight;
-    });
-
-    return weightedSum / weightTotal;
+    return kept.reduce((sum, price) => sum + price, 0) / kept.length;
   }
 
   function getBidTag() {
@@ -2224,16 +2214,7 @@ const MY_USERNAME = "xxx";
 
     const entry = `${price}-${tag}`;
 
-    if (prices.length < MAX_STORED_PRICES) {
-      prices.push(entry);
-    } else {
-      const highestEntry = prices.reduce((max, current) =>
-        parseInt(current, 10) > parseInt(max, 10) ? current : max,
-      );
-      if (price < parseInt(highestEntry, 10)) {
-        prices[prices.indexOf(highestEntry)] = entry;
-      }
-    }
+    prices.push(entry);
 
     localStorage.setItem(
       getBspObservedStorageKey(cardName),
@@ -2538,13 +2519,13 @@ const MY_USERNAME = "xxx";
 
   // ============================================================
   // Feature BSP (cont'd): on a bid page, flag the card name (h1.flex-1, given "display: contents") as "EXCELLENT" when
-  // the current price (input.min-w-0) is below 80% of the weighted average of that card's stored sold prices
-  // (computeWeightedAveragePrice: out of N prices, the lowest weighs N, the second-lowest N-1, ... the highest
-  // weighs 1, so a single high outlier pulls the reference up less than a plain average would), "agréable" when
+  // the current price (input.min-w-0) is below 80% of the trimmed average of that card's stored sold prices
+  // (computeTrimmedAveragePrice: the highest and the lowest price are left out, so a single outlier on either side
+  // doesn't skew it), "agréable" when
   // it's between 80% and 100% of that average, "tolérable" when it's between 100% and 120%, or "excessive" when it's
   // above 120%; unflag it as soon as none of those is true. Below 50% of that average, with at least 5 stored sold
-  // prices backing it — i.e. that card's cache is at its full MAX_STORED_PRICES capacity, so the average is
-  // actually meaningful — it's flagged "prix extraordinaire" instead of "EXCELLENT"; below 20%, with that same
+  // prices backing it, so the average is
+  // actually meaningful, it's flagged "prix extraordinaire" instead of "EXCELLENT"; below 20%, with that same
   // 5-entry restriction, and the price is at least LEGENDARY_MIN_DIFFERENCE below that average, it's flagged
   // "prix légendaire" instead (a smaller gap falls back to the lower tiers). When this bid's own price is
   // the only entry stored for that card (a cache no-hit that this bid's
@@ -2748,7 +2729,7 @@ const MY_USERNAME = "xxx";
         return;
       }
 
-      referenceValue = computeWeightedAveragePrice(
+      referenceValue = computeTrimmedAveragePrice(
         stored.map((entry) => parseInt(entry, 10)),
       );
     }
@@ -2921,7 +2902,7 @@ const MY_USERNAME = "xxx";
   // Feature BSP (cont'd): on the user's own profile (/profile), dump every card's stored sold prices into a grid,
   // inserted as a sibling right after div.grid; each entry gets a "✕" button to clear its stored data. Next to
   // "Vider le cache", an import/export pill copies/restores every "observed-"/"eval-" localStorage entry as JSON.
-  // Entries are sorted by descending "Objectif" (weighted average price); entries with no computable average sort last.
+  // Entries are sorted by descending "Objectif" (trimmed average price); entries with no computable average sort last.
   // ============================================================
   function collectStoredBidPrices() {
     // Snapshot the keys first: migrating a legacy key below removes it
@@ -3194,7 +3175,8 @@ const MY_USERNAME = "xxx";
 
     const titlePrecision = document.createElement("span");
     titlePrecision.className = "wm-bsp-dump-title-precision";
-    titlePrecision.textContent = "(max 5, on garde les moins chères)";
+    titlePrecision.textContent =
+      "(toutes les ventes, moyenne sans la plus haute ni la plus basse)";
     title.appendChild(titlePrecision);
 
     dump.appendChild(title);
@@ -3203,9 +3185,9 @@ const MY_USERNAME = "xxx";
 
     const entriesWithAverage = entries.map(([cardName, prices]) => {
       const numericPrices = prices.map((entry) => parseInt(entry, 10));
-      const weightedAverage = computeWeightedAveragePrice(numericPrices);
+      const trimmedAverage = computeTrimmedAveragePrice(numericPrices);
       const average =
-        weightedAverage !== null ? Math.round(weightedAverage) : null;
+        trimmedAverage !== null ? Math.round(trimmedAverage) : null;
       return { cardName, prices, average };
     });
 
@@ -3427,6 +3409,11 @@ const MY_USERNAME = "xxx";
         align-items: flex-end;
         margin-left: auto;
         font-size: .75em;
+      }
+      .wm-bsp-dump-prices-list {
+        max-width: 18rem;
+        text-align: right;
+        overflow-wrap: anywhere;
       }
     `);
 
