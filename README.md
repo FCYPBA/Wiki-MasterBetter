@@ -74,6 +74,7 @@ Je ne liste que celles qui change quelque chose de significatif pour l'utilisate
 - **Aller directement à une page** : Une fois le catalogue chargé, cliquer sur l'indicateur « Page X / Y » le remplace par un champ numérique ; Entrée mène à la page saisie en enchaînant les boutons précédent/suivant du site, Échap annule
 - **Effacer la recherche** : Un bouton ✕ dans le champ de recherche de la collection vide son contenu
 - **Modale d'étiquetage en masse retravaillée** : La modale d'application/retrait d'étiquette est plus large et affiche ses étiquettes en grille au lieu d'une colonne étroite ; la modale de retrait trie les filtres par ordre décroissant
+- **Gestion des étiquettes plus spacieuse** : La modale « Gérer les étiquettes » occupe jusqu'à 90 % de la largeur de l'écran, pour lire et modifier sans peine les noms d'étiquettes très longs
 
 ### 🔄 Échanges
 
@@ -95,6 +96,7 @@ Je ne liste que celles qui change quelque chose de significatif pour l'utilisate
   - Les prix enregistrés sont listés dans une grille sur votre propre profil
   - Un bouton Exporter/Importer permet de télécharger ce cache (prix de vente, estimations et joueurs suivis) en fichier CSV, puis de le recharger sur un autre navigateur ou appareil
 - **Mes plus grosses ventes et achats** : Les 40 plus grosses ventes et les 40 plus gros achats sont mémorisés (depuis les pages d'enchère et les onglets « Historique » et « Gagnées » du marché) ; deux boutons sur votre profil les listent dans une modale, la première mise en avant par une lueur dorée, un ✕ retire une entrée du cache
+- **Cartes possédées estompées** : Sur le marché et dans la collection globale, les cartes que vous possédez déjà s'affichent en faible visibilité pour ne pas distraire le regard ; elles reprennent leur pleine opacité au survol
 
 ### 📦 Catalogue
 
