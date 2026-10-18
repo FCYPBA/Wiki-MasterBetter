@@ -108,6 +108,7 @@ Je ne liste que celles qui change quelque chose de significatif pour l'utilisate
 - **Description des joueurs** : Un bouton « Description » sur le profil des autres joueurs permet de noter en quelques mots (max. 128 caractères) ; la description s'affiche à côté de leur pseudo sur leur profil et sur la page des amis
 - **Accès rapide aux profils depuis la liste de souhaits** : Sur la collection globale, cliquer sur le nom d'un ami propriétaire d'une carte ouvre son profil
 - **Suivre des joueurs** : Un bouton « Suivre » en forme d'œil sur le profil des joueurs. Un petit œil rouge s'affiche alors à côté de son pseudo sur les pages d'enchère, qu'il soit vendeur ou enchérisseur ; la liste des joueurs suivis s'affiche sur votre profil, avec un ✕ pour ne plus suivre
+- **Membres de la guilde repérés par un bouclier** : En ouvrant l'onglet « Membres » de la page Guilde, le script charge tout seul la liste complète (« Afficher plus ») et la mémorise, en retirant ceux qui sont partis. Un petit bouclier bleu s'affiche ensuite à côté du pseudo des membres partout où il apparaît seul (profils, historique des échanges, pages d'enchère, collection globale…) ; le survoler affiche la description que vous lui avez donnée. Dans la liste des membres, la description remplace le bouclier, sous le pseudo
 
 ### 🏆 Succès
 
