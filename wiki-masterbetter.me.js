@@ -3865,6 +3865,10 @@ const MY_USERNAME = "xxx";
       id: "feature-glm",
       label: "Icône 🛡️ pour les membres de ma guilde",
     },
+    {
+      id: "rule-42",
+      label: "Total estimé des cartes d'un échange reçu",
+    },
   ];
 
   function readFeatureFlags() {
@@ -8173,6 +8177,86 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Rule 42: on /trades, in the "Reçues" tab (the button.border-[var(--color-accent)] carrying the active class),
+  // each trade's two sides ("{partner} offre" and "En échange de": div.flex-1 holding a p.text-xs header then a
+  // div.flex-wrap.gap-1 of one span[title="{card name}"] per card) get a total of their cards' estimates (Feature
+  // ETS, "eval-{name}") in a div.wm-trade-total placed right after the header (a sibling, not a child, since the
+  // site's framework owns the header's content). It also says how many cards there are, and how many of them have
+  // no known estimate (missing or "?") and so count for nothing in the total.
+  // ============================================================
+  function updateTradeTotals() {
+    if (!window.location.pathname.startsWith("/trades")) return;
+
+    const activeTab = document.querySelector(
+      "button.border-\\[var\\(--color-accent\\)\\]",
+    );
+    const onReceived =
+      activeTab?.textContent
+        .trim()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase() === "recues";
+
+    if (!onReceived) {
+      document.querySelectorAll(".wm-trade-total").forEach((el) => el.remove());
+      return;
+    }
+
+    document
+      .querySelectorAll("div.flex-1 > div.flex-wrap.gap-1")
+      .forEach((chips) => {
+        const side = chips.parentElement;
+        const header = side.querySelector(":scope > p.text-xs");
+        if (!header) return;
+
+        const names = Array.from(chips.querySelectorAll("span[title]")).map(
+          (chip) => chip.getAttribute("title"),
+        );
+        if (names.length === 0) return;
+
+        let total = 0;
+        let unknown = 0;
+        names.forEach((name) => {
+          const value = getCardEvalValueByName(name);
+          if (value === null) unknown++;
+          else total += value;
+        });
+
+        let text = `≈ ${Math.round(total).toLocaleString("fr-FR")} · ${names.length} carte${names.length > 1 ? "s" : ""}`;
+        if (unknown > 0) text += ` · ${unknown} sans estimation`;
+
+        let el = side.querySelector(":scope > .wm-trade-total");
+        if (!el) {
+          el = document.createElement("div");
+          el.className = "wm-trade-total";
+          header.after(el);
+        }
+        if (el.textContent !== text) el.textContent = text;
+      });
+  }
+
+  function watchTradeTotals() {
+    GM_addStyle(`
+      .wm-trade-total {
+        margin-bottom: 0.25rem;
+        font-size: 0.8rem;
+        font-weight: 600;
+        color: var(--color-accent);
+      }
+    `);
+
+    updateTradeTotals();
+
+    const observer = new MutationObserver(() => updateTradeTotals());
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["class"],
+    });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   function main() {
@@ -8252,6 +8336,7 @@ const MY_USERNAME = "xxx";
     run("rule-40", watchTagManagerModalWidth);
     run("rule-41", watchOwnedCardsDimming);
     run("feature-glm", watchGuildMembers);
+    run("rule-42", watchTradeTotals);
 
     watchFeatureConfigButton();
     watchTutorialButton();
