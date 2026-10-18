@@ -8093,7 +8093,10 @@ const MY_USERNAME = "xxx";
     document.querySelectorAll(".wm-guild-badge").forEach((badge) => {
       const name = badge.dataset.wmGuildName;
       const stillThere = Array.from(badge.parentElement?.children ?? []).some(
-        (child) => child !== badge && child.textContent.trim() === name,
+        (child) =>
+          child !== badge &&
+          child.children.length === 0 &&
+          getGuildMemberName(child, members) === name,
       );
       if (
         !members.has(name) ||
@@ -8166,13 +8169,20 @@ const MY_USERNAME = "xxx";
       }
     `);
 
+    // At most one pass per frame: the pages can mutate by the hundreds while rendering a long list
+    let scheduled = false;
     const update = () => {
+      scheduled = false;
       recordGuildMembers();
       decorateGuildMembers();
     };
     update();
 
-    const observer = new MutationObserver(update);
+    const observer = new MutationObserver(() => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(update);
+    });
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
