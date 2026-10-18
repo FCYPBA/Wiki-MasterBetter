@@ -3861,6 +3861,10 @@ const MY_USERNAME = "xxx";
       id: "rule-41",
       label: "Atténuer les cartes déjà possédées (marché et liste de souhaits)",
     },
+    {
+      id: "feature-glm",
+      label: "Icône 🛡️ pour les membres de ma guilde",
+    },
   ];
 
   function readFeatureFlags() {
@@ -4265,6 +4269,10 @@ const MY_USERNAME = "xxx";
     {
       title: "Décrire un joueur",
       text: "Sur le profil d'un autre joueur, le bouton « Description » ouvre une modale où noter en max. 128 caractères ce qu'il cherche ou propose. Entrée enregistre, un texte vide efface la description. Elle s'affiche à côté de son pseudo sur son profil et sur la page des amis, et reste dans votre navigateur.",
+    },
+    {
+      title: "Les membres de ma guilde",
+      text: "Ouvrez l'onglet « Membres » de la page Guilde (le script charge tout seul les membres suivants) pour que le script mémorise vos membres : un petit bouclier bleu apparaît ensuite à côté de leur pseudo partout sur le site. Survolez le pseudo ou le bouclier pour voir la description que vous lui avez donnée.",
     },
   ];
 
@@ -7942,6 +7950,173 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Feature GLM: a small shield icon identifies the members of your guild wherever their name is displayed. The
+  // member list is learnt from /guild: its "Membres (N)" tab (third button of the tab bar,
+  // div.overflow-x-auto > button, active when it has the "bg-[var(--color-accent)]" class) lists the members as
+  // a[href^="/profile/"][href*="from=guild"] > ... p.truncate, loaded 50 at a time through an "Afficher plus (50/N)" button
+  // that the script clicks by itself until the list is complete, so names are
+  // accumulated in localStorage under GUILD_MEMBERS_KEY (a JSON array). Once as many rows are displayed as the
+  // tab's counter says, the stored list is replaced by exactly those rows, which drops members who have left.
+  // That list is not part of the cache export (visiting the tab rebuilds it).
+  //
+  // Feature GLM (cont'd): on every page, each leaf element (p, span, a, h1...) whose whole text is a member's name
+  // gets a span.wm-guild-badge sibling right after it (the site's framework owns the name's content). Hovering the
+  // name or the icon shows the member's personal description (Feature UDS, "desc-{username}") when there is one,
+  // else "Membre de la guilde". Names embedded in a longer sentence (notifications) are not decorated. Badges of
+  // people who are no longer members, or whose name is gone, are removed.
+  // ============================================================
+  const GUILD_MEMBERS_KEY = "wm-guild-members";
+  const GUILD_BADGE_SVG =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"></path></svg>';
+  const GUILD_NAME_SELECTOR = "p, span, a, h1, h2, h3, h4, strong, b, li, div";
+
+  let guildMoreClickedAt = -1;
+  let guildMembersRaw = null;
+  let guildMembersSet = new Set();
+
+  function readGuildMembers() {
+    let raw = null;
+    try {
+      raw = localStorage.getItem(GUILD_MEMBERS_KEY);
+    } catch {
+      return guildMembersSet;
+    }
+    if (raw === guildMembersRaw) return guildMembersSet;
+
+    guildMembersRaw = raw;
+    try {
+      const parsed = JSON.parse(raw ?? "[]");
+      guildMembersSet = new Set(
+        Array.isArray(parsed)
+          ? parsed.filter((u) => typeof u === "string")
+          : [],
+      );
+    } catch {
+      guildMembersSet = new Set();
+    }
+    return guildMembersSet;
+  }
+
+  function recordGuildMembers() {
+    if (!window.location.pathname.startsWith("/guild")) return;
+
+    const membersTab = Array.from(
+      document.querySelectorAll("div.overflow-x-auto > button"),
+    ).find((btn) => btn.textContent.trim().startsWith("Membres"));
+    if (!membersTab?.classList.contains("bg-[var(--color-accent)]")) return;
+
+    const names = new Set();
+    document
+      .querySelectorAll('a[href^="/profile/"][href*="from=guild"] p.truncate')
+      .forEach((p) => {
+        const name = p.textContent.trim();
+        if (name) names.add(name);
+      });
+    if (names.size === 0) return;
+
+    // Load the next batch, once per batch actually displayed
+    const moreBtn = Array.from(document.querySelectorAll("button")).find(
+      (btn) => btn.textContent.trim().startsWith("Afficher plus"),
+    );
+    if (moreBtn && !moreBtn.disabled && guildMoreClickedAt !== names.size) {
+      guildMoreClickedAt = names.size;
+      moreBtn.click();
+    }
+
+    const total = Number(membersTab.textContent.match(/\((\d+)\)/)?.[1]);
+    const stored = readGuildMembers();
+    const next =
+      Number.isFinite(total) && names.size >= total
+        ? names
+        : new Set([...stored, ...names]);
+
+    if (next.size === stored.size && [...next].every((n) => stored.has(n)))
+      return;
+    try {
+      localStorage.setItem(GUILD_MEMBERS_KEY, JSON.stringify([...next]));
+    } catch {
+      // Storage blocked or full: the list stays as it was
+    }
+  }
+
+  function guildBadgeText(name) {
+    return readUserDescription(name) || "Membre de la guilde";
+  }
+
+  function decorateGuildMembers() {
+    const members = readGuildMembers();
+
+    // Badges whose user left the guild, or whose name element is gone
+    document.querySelectorAll(".wm-guild-badge").forEach((badge) => {
+      const name = badge.dataset.wmGuildName;
+      const stillThere = Array.from(badge.parentElement?.children ?? []).some(
+        (child) => child !== badge && child.textContent.trim() === name,
+      );
+      if (!members.has(name) || !stillThere) badge.remove();
+    });
+    document.querySelectorAll("[data-wm-guild-title]").forEach((el) => {
+      if (members.has(el.textContent.trim())) return;
+      el.removeAttribute("title");
+      delete el.dataset.wmGuildTitle;
+    });
+    if (members.size === 0) return;
+
+    document.querySelectorAll(GUILD_NAME_SELECTOR).forEach((el) => {
+      if (el.children.length > 0 || el.classList.contains("wm-guild-badge"))
+        return;
+      const name = el.textContent.trim();
+      if (!members.has(name) || !el.parentElement) return;
+
+      const text = guildBadgeText(name);
+      el.title = text;
+      el.dataset.wmGuildTitle = "1";
+
+      const existing = Array.from(el.parentElement.children).find(
+        (child) =>
+          child.classList.contains("wm-guild-badge") &&
+          child.dataset.wmGuildName === name,
+      );
+      if (existing) {
+        existing.title = text;
+        return;
+      }
+
+      const badge = document.createElement("span");
+      badge.className = "wm-guild-badge";
+      badge.dataset.wmGuildName = name;
+      badge.title = text;
+      badge.innerHTML = GUILD_BADGE_SVG;
+      el.after(badge);
+    });
+  }
+
+  function watchGuildMembers() {
+    GM_addStyle(`
+      .wm-guild-badge {
+        display: inline-flex;
+        flex-shrink: 0;
+        vertical-align: middle;
+        margin-left: 0.25rem;
+        color: #38bdf8;
+        cursor: help;
+      }
+      .wm-guild-badge svg {
+        width: 1em;
+        height: 1em;
+      }
+    `);
+
+    const update = () => {
+      recordGuildMembers();
+      decorateGuildMembers();
+    };
+    update();
+
+    const observer = new MutationObserver(update);
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   function main() {
@@ -8020,6 +8195,7 @@ const MY_USERNAME = "xxx";
     run("rule-39", watchAchievementProgressBars);
     run("rule-40", watchTagManagerModalWidth);
     run("rule-41", watchOwnedCardsDimming);
+    run("feature-glm", watchGuildMembers);
 
     watchFeatureConfigButton();
     watchTutorialButton();
