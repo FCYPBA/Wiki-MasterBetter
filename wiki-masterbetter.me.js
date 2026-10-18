@@ -7927,7 +7927,7 @@ const MY_USERNAME = "xxx";
   function watchOwnedCardsDimming() {
     GM_addStyle(`
       .wm-owned-dimmed {
-        opacity: 0.25;
+        opacity: 0.05;
         transition: opacity 0.2s ease;
       }
       .wm-owned-dimmed:hover {
