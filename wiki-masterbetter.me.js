@@ -2164,10 +2164,10 @@ const MY_USERNAME = "xxx";
     return match?.[1]?.split("-")[1] ?? null;
   }
 
-  // The seller's username: on a bid page, the <span> inside p.text-sm.mt-1 (right after "Mis en vente par").
+  // The seller's username: on a bid page, the link (a.hover:underline, escaped in the selector) inside the paragraph right after "Mis en vente par".
   function getBidPageSellerUsername() {
     return (
-      document.querySelector("p a.hover:underline")?.textContent.trim() ?? null
+      document.querySelector("p a.hover\\:underline")?.textContent.trim() ?? null
     );
   }
 
