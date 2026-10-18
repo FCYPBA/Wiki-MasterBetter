@@ -3857,6 +3857,10 @@ const MY_USERNAME = "xxx";
       id: "rule-40",
       label: "Modale de gestion des étiquettes élargie (90 % de l'écran)",
     },
+    {
+      id: "rule-41",
+      label: "Atténuer les cartes déjà possédées (marché et liste de souhaits)",
+    },
   ];
 
   function readFeatureFlags() {
@@ -7892,6 +7896,52 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Rule 41: on /marketplace and /global-collection, every card already owned by the viewer is dimmed so the eye
+  // goes to the ones still worth looking at. Ownership is read off the "Possédée" tag (span.bg-emerald-600\/90) a
+  // card carries (Rule 25 relies on the same tag): on /marketplace the card is its closest
+  // div[id^="marketplace-auction-"], on /global-collection its direct child of the card list (div.gap-3.justify-center).
+  // The card gets the "wm-owned-dimmed" class, which CSS turns into a low opacity that comes back on hover. The
+  // class is only ever added, never removed, and re-checked on every DOM mutation since both pages repopulate
+  // their lists as filters change.
+  // ============================================================
+  function dimOwnedCards() {
+    const path = window.location.pathname;
+    const onMarketplace = path.startsWith("/marketplace");
+    const onGlobalCollection = path.startsWith("/global-collection");
+    if (!onMarketplace && !onGlobalCollection) return;
+
+    document.querySelectorAll("span.bg-emerald-600\\/90").forEach((tag) => {
+      let card = null;
+      if (onMarketplace) {
+        card = tag.closest('div[id^="marketplace-auction-"]');
+      } else {
+        const list = tag.closest("div.gap-3.justify-center");
+        card = list
+          ? Array.from(list.children).find((child) => child.contains(tag))
+          : null;
+      }
+      if (card) card.classList.add("wm-owned-dimmed");
+    });
+  }
+
+  function watchOwnedCardsDimming() {
+    GM_addStyle(`
+      .wm-owned-dimmed {
+        opacity: 0.25;
+        transition: opacity 0.2s ease;
+      }
+      .wm-owned-dimmed:hover {
+        opacity: 1;
+      }
+    `);
+
+    dimOwnedCards();
+
+    const observer = new MutationObserver(() => dimOwnedCards());
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   function main() {
@@ -7969,6 +8019,7 @@ const MY_USERNAME = "xxx";
     run("feature-uds", watchUserDescriptions);
     run("rule-39", watchAchievementProgressBars);
     run("rule-40", watchTagManagerModalWidth);
+    run("rule-41", watchOwnedCardsDimming);
 
     watchFeatureConfigButton();
     watchTutorialButton();
