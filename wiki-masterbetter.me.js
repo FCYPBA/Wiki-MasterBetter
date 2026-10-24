@@ -3762,7 +3762,11 @@ const MY_USERNAME = "xxx";
     },
     {
       id: "rule-24",
-      label: "Ajuster la taille de la liste d'étiquettes et la trier par usage",
+      label: "Agrandir la liste d'étiquettes",
+    },
+    {
+      id: "rule-24b",
+      label: "Trier la liste d'étiquettes par usage",
     },
     {
       id: "rule-25",
@@ -6016,9 +6020,11 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Rule 24 (enlarge) and Rule 24b (sort) are two independent flags sharing one observer (watchUserTagListSizing).
   // Rule 24: on /collection, whenever ul.rounded-xl (a card's tag list) enters the DOM, give it
   // "width: auto; max-height: 80vh" so it sizes to its content instead of whatever fixed width it inherits, and
-  // stops overflowing the viewport once a card has a lot of tags. Each tag's usage count loads in asynchronously
+  // stops overflowing the viewport once a card has a lot of tags.
+  // Rule 24b: sort the list by usage. Each tag's usage count loads in asynchronously
   // after the list itself renders, appended to its name in span > span.inline-flex > span.min-w-0.truncate as
   // "{tag name} ({amount})" — that middle span.inline-flex (the tag's colored pill) is what distinguishes an
   // actual tag <li> from the list's two non-tag entries ("Toutes les étiquettes" first, "Gérer les étiquettes..."
@@ -6073,15 +6079,17 @@ const MY_USERNAME = "xxx";
     anchor.remove();
   }
 
-  function styleUserTagList() {
+  function styleUserTagList(flags) {
     if (!window.location.pathname.startsWith("/collection")) return;
 
     fixTruncateLineHeight();
 
     document.querySelectorAll("ul.rounded-xl").forEach((el) => {
-      el.style.width = "auto";
-      el.style.maxHeight = "80vh";
-      sortUserTagListByCount(el);
+      if (flags["rule-24"]) {
+        el.style.width = "auto";
+        el.style.maxHeight = "80vh";
+      }
+      if (flags["rule-24b"]) sortUserTagListByCount(el);
 
       el.querySelectorAll("span.truncate").forEach((textEl) => {
         textEl.style.lineHeight = "initial";
@@ -6089,10 +6097,10 @@ const MY_USERNAME = "xxx";
     });
   }
 
-  function watchUserTagListSizing() {
-    styleUserTagList();
+  function watchUserTagListSizing(flags) {
+    styleUserTagList(flags);
 
-    const observer = new MutationObserver(() => styleUserTagList());
+    const observer = new MutationObserver(() => styleUserTagList(flags));
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
@@ -9274,7 +9282,9 @@ const MY_USERNAME = "xxx";
     run("rule-22", watchSpinnerAndAuctionNotFoundCentering);
     run("rule-23", watchFaviconReplacement);
     run("feature-fis", watchFadeInUpInlineStyleCleanup);
-    run("rule-24", watchUserTagListSizing);
+    if (flags["rule-24"] || flags["rule-24b"]) {
+      watchUserTagListSizing(flags);
+    }
     run("rule-25", watchWishlistOwnedCardCount);
     run("feature-cnc", watchCardModalNameCopyButton);
     run("rule-26", watchTradesHistoryGrid);
