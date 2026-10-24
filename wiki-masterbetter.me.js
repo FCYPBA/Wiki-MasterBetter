@@ -11,6 +11,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_notification
+// @require      https://cdn.jsdelivr.net/npm/html-to-image@1.11.11/dist/html-to-image.js
 // ==/UserScript==
 //! Regarde Naïm, c'est comme ça qu'on vibe-claude.
 
@@ -3856,6 +3857,14 @@ const MY_USERNAME = "xxx";
       id: "rule-42",
       label: "Total estimé des cartes d'un échange reçu",
     },
+    {
+      id: "feature-mtg",
+      label: "Étiquetage en masse des cartes d'après des termes de recherche",
+    },
+    {
+      id: "feature-ccl",
+      label: "Copier une carte comme image dans le presse-papiers",
+    },
   ];
 
   function readFeatureFlags() {
@@ -4084,6 +4093,7 @@ const MY_USERNAME = "xxx";
         background-color: var(--color-surface-light);
         color: var(--color-foreground);
         padding: 1rem;
+        max-height: 90vh;
       }
       .wm-settings-header {
         display: flex;
@@ -4142,6 +4152,7 @@ const MY_USERNAME = "xxx";
         grid-template-columns: repeat(3, 1fr);
         gap: 0.75rem 0.5rem;
         overflow-y: auto;
+        min-height: 0;
         padding-right: 0.25rem;
       }
       .wm-settings-item {
@@ -4265,6 +4276,14 @@ const MY_USERNAME = "xxx";
       title: "Les membres de ma guilde",
       text: "Ouvrez l'onglet « Membres » de la page Guilde (le script charge tout seul les membres suivants) pour que le script mémorise vos membres : un petit bouclier bleu apparaît ensuite à côté de leur pseudo partout sur le site. Survolez le pseudo ou le bouclier pour voir la description que vous lui avez donnée.",
     },
+    {
+      title: "Étiqueter sa collection en masse",
+      text: "Dans « Gérer les étiquettes », un champ sous chaque étiquette accepte des termes de recherche séparés par des virgules. Le bouton « Étiquetage en masse » de la collection cherche alors chaque terme et applique l'étiquette aux cartes qui n'en ont pas encore. Gardez l'onglet actif pendant toute l'opération.",
+    },
+    {
+      title: "Partager une carte en image",
+      text: "Survolez une carte : un bouton 📷 apparaît en haut de celle-ci. Un clic copie la carte (illustration, texte, statistiques) comme image dans le presse-papiers, prête à être collée dans une conversation.",
+    },
   ];
 
   function buildTutorialModal() {
@@ -4374,6 +4393,7 @@ const MY_USERNAME = "xxx";
         flex-direction: column;
         gap: 0.6rem;
         overflow-y: auto;
+        min-height: 0;
         padding-right: 0.25rem;
       }
       .wm-tutorial-item {
@@ -8254,6 +8274,944 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Feature MTG: mass-tag the untagged cards of /collection from per-label search terms.
+  //
+  // Terms editor: every label row of the tag manager modal ("Gérer les étiquettes", Rule 40's wm-tag-manager-modal)
+  // gets a text field holding that label's search terms, separated by commas ("louvre, versailles, panthéon"). They
+  // are stored in localStorage under "tag-terms-{label name}" (emptying the field removes the entry). A renamed
+  // label's terms follow it: when the row's name no longer matches the one its field was built for, the stored
+  // value moves to the new key.
+  //
+  // Run: a "Étiquetage en masse 🏷️" button is appended to the filter bar of /collection (div.flex-wrap.gap-2, like
+  // Feature EBC's). A small modal first lists every label that has terms, each with a checkbox (all checked) so the
+  // run can be limited to some of them; "Lancer (N)" starts it. The same rows carry ▲/▼ buttons to set the order
+  // labels are processed in (a card matching several labels gets the first one): it is saved in localStorage under
+  // "tag-run-order" (a JSON array of label names; labels missing from it come last, alphabetically; a renamed label
+  // keeps its place). It then sets the site's tag filter
+  // (button[aria-label="Filtrer par étiquette"]) to its "Sans étiquette" entry, then for each label and each term
+  //   1. types the term in the search field (native setter + "input" event, as Rule 28 does) and waits for the grid
+  //      to settle (the site refreshes on every keystroke and shows a div.animate-spin while loading),
+  //   2. repeats on the first page until the grid is empty: re-enters the select mode (the "Sélectionner" /
+  //      "Quitter la sélection" button, which also drops any previous selection), selects the cards that carry no
+  //      tag yet (same test as Feature SAT: no div.flex-wrap.shrink-0), presses the bulk bar's "Étiqueter" button
+  //      (div.bottom-4) to open the "Appliquer une étiquette" modal and picks the label. Tagged cards leave the filtered grid, so there is no paging.
+  // Only untagged cards are ever selected, so a card matching several labels keeps the first one it got. The run
+  // aborts if the selection holds more cards than were clicked (a leftover selection would tag unrelated cards), or
+  // if the grid is unchanged after tagging. Every failure is reported with what the script found instead.
+  // The button turns into a stop button while running; the filter, search field and select mode are reset at the end.
+  // A recap panel then lists, label by label, every card that was tagged as a grid of portraits with their names
+  // (also shown when the run was stopped or failed, with the error on top). It is docked on the right and leaves the
+  // page usable, so several cards can be reviewed in a row: clicking a portrait types the card's name in the search
+  // field, which brings the card up in the grid to be re-tagged. Only its "✕" closes it.
+  // Same as Feature EBC, keep the tab active during the run: background tabs get their timers throttled.
+  // ============================================================
+  const MASS_TAG_TERMS_PREFIX = "tag-terms-";
+  const MASS_TAG_ORDER_KEY = "tag-run-order";
+  const MASS_TAG_BUTTON_LABEL = "Étiquetage en masse 🏷️";
+  const massTagState = { running: false, stop: false };
+
+  function parseMassTagTerms(raw) {
+    return (raw ?? "")
+      .split(",")
+      .map((term) => term.trim())
+      .filter(Boolean);
+  }
+
+  function getTagManagerRowName(row) {
+    return (
+      row.querySelector("span.truncate.font-semibold")?.textContent.trim() ||
+      null
+    );
+  }
+
+  function insertMassTagTermsInputs() {
+    document
+      .querySelectorAll(".wm-tag-manager-modal div.rounded-xl.border")
+      .forEach((row) => {
+        const name = getTagManagerRowName(row);
+        if (!name) return; // the row is being renamed: its name field replaced the label
+
+        const existing = row.querySelector(":scope > .wm-mass-tag-terms");
+        if (existing) {
+          const previousName = existing.dataset.wmTagName;
+          if (previousName && previousName !== name) {
+            const moved = localStorage.getItem(
+              MASS_TAG_TERMS_PREFIX + previousName,
+            );
+            if (moved !== null) {
+              localStorage.setItem(MASS_TAG_TERMS_PREFIX + name, moved);
+              localStorage.removeItem(MASS_TAG_TERMS_PREFIX + previousName);
+            }
+            writeMassTagOrder(
+              readMassTagOrder().map((entry) =>
+                entry === previousName ? name : entry,
+              ),
+            );
+            existing.dataset.wmTagName = name;
+          }
+          return;
+        }
+
+        const input = document.createElement("input");
+        input.type = "text";
+        input.className = "wm-mass-tag-terms";
+        input.placeholder =
+          "Termes de recherche pour l'étiquetage en masse, séparés par des virgules";
+        input.dataset.wmTagName = name;
+        input.value = localStorage.getItem(MASS_TAG_TERMS_PREFIX + name) ?? "";
+
+        input.addEventListener("input", () => {
+          const key = MASS_TAG_TERMS_PREFIX + input.dataset.wmTagName;
+          if (input.value.trim()) localStorage.setItem(key, input.value);
+          else localStorage.removeItem(key);
+        });
+
+        row.appendChild(input);
+      });
+  }
+
+  function readMassTagEntries() {
+    const entries = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key?.startsWith(MASS_TAG_TERMS_PREFIX)) continue;
+
+      const terms = parseMassTagTerms(localStorage.getItem(key));
+      if (terms.length) {
+        entries.push({ name: key.slice(MASS_TAG_TERMS_PREFIX.length), terms });
+      }
+    }
+    // Saved run order first; labels it doesn't know yet (new, or never reordered) follow alphabetically
+    const order = readMassTagOrder();
+    const rank = (name) => {
+      const index = order.indexOf(name);
+      return index === -1 ? order.length : index;
+    };
+    return entries.sort(
+      (a, b) => rank(a.name) - rank(b.name) || a.name.localeCompare(b.name),
+    );
+  }
+
+  function readMassTagOrder() {
+    try {
+      const order = JSON.parse(localStorage.getItem(MASS_TAG_ORDER_KEY) ?? "[]");
+      return Array.isArray(order) ? order : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function writeMassTagOrder(names) {
+    localStorage.setItem(MASS_TAG_ORDER_KEY, JSON.stringify(names));
+  }
+
+  const massTagSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function massTagWaitUntil(condition, timeout = 8000, interval = 100) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      if (condition()) return true;
+      await massTagSleep(interval);
+    }
+    return condition();
+  }
+
+  async function massTagWaitForIdle() {
+    await massTagSleep(500);
+    await massTagWaitUntil(
+      () => !document.querySelector("div.animate-spin"),
+      15000,
+    );
+    await massTagSleep(200);
+  }
+
+  function findButtonByText(predicate, root = document) {
+    return Array.from(root.querySelectorAll("button")).find((btn) =>
+      predicate(btn.textContent.trim()),
+    );
+  }
+
+  const normalizeButtonText = (text) => text.replace(/\s+/g, " ").trim();
+  const isSelectButton = (text) =>
+    /^s[ée]lectionner$/i.test(normalizeButtonText(text));
+  const isQuitSelectButton = (text) =>
+    /^quitter la s[ée]lection$/i.test(normalizeButtonText(text));
+
+  // Returns an error message, or null once the select mode has been (re-)entered
+  // The site sometimes renders neither toggle for a while (loading, re-render), so each attempt waits for one of
+  // them, then the whole thing is retried after the page settles. Still in select mode after the attempts: carry on
+  // (the selection check in massTagSelectUntaggedCards guards against a leftover selection).
+  async function massTagResetSelectMode() {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      findButtonByText(isQuitSelectButton)?.click();
+      await massTagSleep(250);
+
+      let enter = null;
+      await massTagWaitUntil(() => {
+        enter = findButtonByText(isSelectButton);
+        return !!enter;
+      }, 3000);
+      if (enter) {
+        enter.click();
+        massTagLog("select mode entered");
+        await massTagSleep(250);
+        return null;
+      }
+
+      massTagLog(`« Sélectionner » missing (attempt ${attempt + 1})`);
+      await massTagWaitForIdle();
+    }
+
+    if (findButtonByText(isQuitSelectButton)) return null;
+
+    const main = document.querySelector("main") ?? document;
+    return `bouton « Sélectionner » introuvable (boutons : ${describeButtons(main).slice(0, 600)})`;
+  }
+
+  function countSelectedCards() {
+    return document.querySelectorAll("div.relative.isolate div.ring-4").length;
+  }
+
+  // Cards already selected (select mode kept after a failed reset) are left alone: clicking them would deselect.
+  // "targets" is how many untagged cards the grid holds; "selected" how many cards are selected afterwards.
+  // "cards" lists ({ name, image }) the untagged cards that ended up selected (what the bulk action is about to tag).
+  async function massTagSelectUntaggedCards() {
+    const untagged = Array.from(
+      document.querySelectorAll("div.hover\\:scale-105"),
+    ).filter((card) => !card.querySelector("div.flex-wrap.shrink-0"));
+    const isSelected = (card) =>
+      !!card.closest("div.relative.isolate")?.querySelector("div.ring-4");
+
+    untagged.forEach((card) => {
+      if (isSelected(card)) return;
+
+      card.querySelector("img.scale-\\[1\\.8\\]")?.click();
+    });
+    await massTagSleep(300);
+
+    // The card's portrait is the image inside its top block (the other image is the rarity background)
+    const cards = untagged.filter(isSelected).map((card) => ({
+      name: card.querySelector("h3")?.textContent.trim() ?? "?",
+      image: card.querySelector("div.h-\\[45\\%\\] img")?.src ?? null,
+    }));
+    return { targets: untagged.length, selected: countSelectedCards(), cards };
+  }
+
+  const describeButtons = (root) =>
+    Array.from(root.querySelectorAll("button"))
+      .map((btn) => `« ${btn.textContent.trim().slice(0, 40)} »`)
+      .join(", ") || "aucun";
+
+  // Returns an error message (listing what was found, to ease diagnosing a site change), or null on success
+  // Console trace of the run (SVGs stripped from the HTML dumps), to diagnose a change in the site's markup
+  function massTagLog(step, element) {
+    const html = element?.outerHTML.replace(/<svg[\s\S]*?<\/svg>/g, "<svg/>");
+    console.log(`[WMB-MTG] ${step}`, html ?? "");
+  }
+
+  async function massTagApplyLabel(name) {
+    const popover = await waitForElement("div.bottom-4", 4000);
+    massTagLog("bulk bar (div.bottom-4)", popover);
+    if (!popover) return "barre d'actions en masse (div.bottom-4) introuvable";
+
+    const openBtn = findButtonByText(
+      (text) => /^étiqueter$/i.test(normalizeButtonText(text)),
+      popover,
+    );
+    if (!openBtn)
+      return `bouton d'étiquetage introuvable dans la barre (boutons : ${describeButtons(popover)})`;
+    massTagLog(`clicking « ${openBtn.textContent.trim()} »`);
+    openBtn.click();
+
+    const list = await waitForElement(".wm-multi-tag-list, div.max-h-64", 4000);
+    massTagLog("tag list", list?.closest("div.fixed") ?? list);
+    if (!list)
+      return `liste des étiquettes introuvable après clic sur « ${openBtn.textContent.trim()} »`;
+
+    const tagBtn = Array.from(list.querySelectorAll(":scope > button")).find(
+      (btn) => {
+        const text = btn.textContent.trim();
+        return (
+          text === name ||
+          (text.startsWith(name) &&
+            /^\s*\(?\d+\)?\s*$/.test(text.slice(name.length)))
+        );
+      },
+    );
+    if (!tagBtn) {
+      const found = describeButtons(list);
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+      );
+      await massTagSleep(300);
+      return `étiquette « ${name} » introuvable dans la modale (trouvées : ${found})`;
+    }
+
+    massTagLog(`clicking tag « ${tagBtn.textContent.trim()} »`);
+    tagBtn.click();
+    const closed = await massTagWaitUntil(() => !list.isConnected, 8000);
+    massTagLog(`modal closed: ${closed}`);
+    await massTagWaitForIdle();
+    return null;
+  }
+
+  // Picks an entry of the tag filter's listbox (button[aria-label="Filtrer par étiquette"]) whose text matches
+  // the predicate; returns an error message, or null on success
+  async function massTagPickTagFilter(predicate) {
+    const trigger = document.querySelector(
+      'button[aria-label="Filtrer par étiquette"]',
+    );
+    if (!trigger) return "filtre d'étiquette introuvable";
+
+    trigger.click();
+    const listbox = await waitForElement('ul[role="listbox"]', 3000);
+    if (!listbox) return "liste du filtre d'étiquette introuvable";
+
+    const option = Array.from(listbox.querySelectorAll("li button")).find(
+      (btn) => predicate(btn.textContent.trim()),
+    );
+    if (!option) {
+      const found = describeButtons(listbox);
+      trigger.click();
+      return `option du filtre d'étiquette introuvable (options : ${found})`;
+    }
+
+    option.click();
+    await massTagWaitForIdle();
+    return null;
+  }
+
+  function getGridCardNames() {
+    return Array.from(document.querySelectorAll("div.hover\\:scale-105 h3"))
+      .map((h3) => h3.textContent.trim())
+      .join("|");
+  }
+
+  // Returns an error message, or null when the term was fully processed (or the run was stopped). Every card
+  // tagged is added to recap (label name -> Map of card name -> portrait URL, or null).
+  async function massTagProcessTerm(name, term, recap) {
+    const input = document.querySelector('input[placeholder^="Rechercher"]');
+    if (!input) return "champ de recherche introuvable";
+
+    massTagLog(`searching « ${term} » for ${name}`);
+    NATIVE_INPUT_VALUE_SETTER.call(input, term);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await massTagWaitForIdle();
+
+    // The "Sans étiquette" filter is on: every card tagged below leaves the grid, so the run stays on the first page
+    // until it is empty (no cards left to select) rather than paging forward
+    for (let round = 0; round < 1000 && !massTagState.stop; round++) {
+      // An empty grid (no match, or everything already tagged) has no select button: this term is done
+      if (!document.querySelector("div.hover\\:scale-105")) {
+        massTagLog(`"${term}": grid empty, done`);
+        break;
+      }
+
+      const selectModeError = await massTagResetSelectMode();
+      if (selectModeError) return selectModeError;
+
+      const namesBefore = getGridCardNames();
+      const { targets, selected, cards } = await massTagSelectUntaggedCards();
+      massTagLog(`"${term}" -> ${name}: ${targets} untagged, ${selected} selected`);
+      if (targets === 0) break;
+      if (selected > targets)
+        return "sélection résiduelle détectée, arrêt par sécurité";
+
+      const error = await massTagApplyLabel(name);
+      if (error) return error;
+
+      if (!recap.has(name)) recap.set(name, new Map());
+      cards.forEach(({ name: cardName, image }) =>
+        recap.get(name).set(cardName, image),
+      );
+
+      if (getGridCardNames() === namesBefore)
+        return "les cartes étiquetées sont restées dans la grille, arrêt par sécurité";
+    }
+    return null;
+  }
+
+  async function runMassTagging(btn) {
+    const available = readMassTagEntries();
+    if (!available.length) {
+      window.alert(
+        "Aucun terme défini. Ajoutez-en dans « Gérer les étiquettes » (champ sous chaque étiquette).",
+      );
+      return;
+    }
+
+    const entries = await pickMassTagEntries(available);
+    if (!entries?.length) return;
+
+    massTagLog(`run started: ${entries.map(({ name }) => name).join(", ")}`);
+    massTagState.running = true;
+    massTagState.stop = false;
+    btn.textContent = "⏹ Arrêter l'étiquetage";
+
+    const recap = new Map();
+    let error = await massTagPickTagFilter((text) => /^sans\s/i.test(text));
+    if (!error) {
+      outer: for (const { name, terms } of entries) {
+        for (const term of terms) {
+          if (massTagState.stop) break outer;
+
+          btn.title = `${name} : « ${term} »`;
+          error = await massTagProcessTerm(name, term, recap);
+          if (error) break outer;
+        }
+      }
+      await massTagPickTagFilter((text) => /^toutes/i.test(text));
+    }
+
+    const input = document.querySelector('input[placeholder^="Rechercher"]');
+    if (input) clearCollectionSearchInput(input);
+    await massTagWaitForIdle();
+    findButtonByText(isQuitSelectButton)?.click();
+
+    massTagState.running = false;
+    btn.textContent = MASS_TAG_BUTTON_LABEL;
+    btn.title = "";
+    showMassTagRecap(recap, error);
+  }
+
+  // Modal shell shared by the run's picker and recap: closed by its "✕", a click outside it, or Escape (caught
+  // before the site's own Escape handling, Feature CME). onClose runs whichever way it closed.
+  // A docked modal is a side panel that leaves the page behind interactive: only its "✕" closes it (Escape is left
+  // to the site, and there is no click-outside).
+  function createMassTagModal(title, onClose = () => {}, docked = false) {
+    document.querySelector(".wm-mass-tag-recap")?.remove();
+
+    const overlay = document.createElement("div");
+    overlay.className = docked
+      ? "wm-mass-tag-recap wm-mass-tag-docked"
+      : "wm-mass-tag-recap";
+
+    const panel = document.createElement("div");
+    panel.className = "wm-mass-tag-recap-panel";
+
+    const close = () => {
+      document.removeEventListener("keydown", onKeyDown, true);
+      overlay.remove();
+      onClose();
+    };
+    const onKeyDown = (event) => {
+      if (event.key !== "Escape") return;
+      event.stopPropagation();
+      close();
+    };
+    if (!docked) {
+      document.addEventListener("keydown", onKeyDown, true);
+      overlay.addEventListener("click", (event) => {
+        if (event.target === overlay) close();
+      });
+    }
+
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "wm-mass-tag-recap-close";
+    closeBtn.textContent = "✕";
+    closeBtn.addEventListener("click", close);
+
+    const heading = document.createElement("h2");
+    heading.textContent = title;
+    panel.append(closeBtn, heading);
+
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+    return { panel, close };
+  }
+
+  // Lists every label with terms, each with a checkbox (all checked); resolves with the checked entries, or null
+  // when cancelled
+  function pickMassTagEntries(entries) {
+    return new Promise((resolve) => {
+      let result = null;
+      const { panel, close } = createMassTagModal(
+        "Étiquetage en masse : étiquettes à traiter",
+        () => resolve(result),
+      );
+
+      const hint = document.createElement("p");
+      hint.className = "wm-mass-tag-picker-hint";
+      hint.textContent =
+        "Seules les cartes sans étiquette sont étiquetées : une carte qui correspond à plusieurs étiquettes reçoit la première de la liste. Réordonnez avec ▲ ▼ (l'ordre est mémorisé).";
+      panel.appendChild(hint);
+
+      // Checked state travels with its entry when the rows are reordered
+      const items = entries.map((entry) => ({ entry, checked: true }));
+      const rows = document.createElement("div");
+      panel.appendChild(rows);
+
+      const actions = document.createElement("div");
+      actions.className = "wm-mass-tag-picker-actions";
+
+      const toggleAllBtn = document.createElement("button");
+      toggleAllBtn.type = "button";
+      toggleAllBtn.textContent = "Tout cocher / décocher";
+
+      const startBtn = document.createElement("button");
+      startBtn.type = "button";
+      startBtn.className = "wm-mass-tag-btn";
+
+      const move = (index, delta) => {
+        const target = index + delta;
+        if (target < 0 || target >= items.length) return;
+
+        [items[index], items[target]] = [items[target], items[index]];
+        writeMassTagOrder(items.map(({ entry }) => entry.name));
+        render();
+      };
+
+      const render = () => {
+        rows.replaceChildren();
+        items.forEach((item, index) => {
+          const row = document.createElement("div");
+          row.className = "wm-mass-tag-picker-row";
+
+          const label = document.createElement("label");
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.checked = item.checked;
+          checkbox.addEventListener("change", () => {
+            item.checked = checkbox.checked;
+            refresh();
+          });
+          const nameEl = document.createElement("strong");
+          nameEl.textContent = item.entry.name;
+          label.append(checkbox, nameEl, ` : ${item.entry.terms.join(", ")}`);
+
+          const up = document.createElement("button");
+          up.type = "button";
+          up.textContent = "▲";
+          up.title = "Traiter plus tôt";
+          up.disabled = index === 0;
+          up.addEventListener("click", () => move(index, -1));
+
+          const down = document.createElement("button");
+          down.type = "button";
+          down.textContent = "▼";
+          down.title = "Traiter plus tard";
+          down.disabled = index === items.length - 1;
+          down.addEventListener("click", () => move(index, 1));
+
+          row.append(label, up, down);
+          rows.appendChild(row);
+        });
+        refresh();
+      };
+
+      const refresh = () => {
+        const count = items.filter(({ checked }) => checked).length;
+        startBtn.disabled = count === 0;
+        startBtn.textContent = `Lancer (${count})`;
+      };
+
+      toggleAllBtn.addEventListener("click", () => {
+        const check = items.some(({ checked }) => !checked);
+        items.forEach((item) => (item.checked = check));
+        render();
+      });
+      startBtn.addEventListener("click", () => {
+        result = items.filter(({ checked }) => checked).map(({ entry }) => entry);
+        close();
+      });
+
+      actions.append(toggleAllBtn, startBtn);
+      panel.appendChild(actions);
+      render();
+    });
+  }
+
+  function showMassTagRecap(recap, error) {
+    const total = Array.from(recap.values()).reduce(
+      (sum, cards) => sum + cards.size,
+      0,
+    );
+    const { panel } = createMassTagModal(
+      `Étiquetage en masse : ${total} carte${total > 1 ? "s" : ""} étiquetée${total > 1 ? "s" : ""}`,
+      undefined,
+      true,
+    );
+
+    const hint = document.createElement("p");
+    hint.className = "wm-mass-tag-picker-hint";
+    hint.textContent =
+      "Cliquez sur une carte pour la chercher dans la collection et la reclasser.";
+    panel.appendChild(hint);
+
+    if (error) {
+      const errorEl = document.createElement("p");
+      errorEl.className = "wm-mass-tag-recap-error";
+      errorEl.textContent = `Étiquetage interrompu : ${error}`;
+      panel.appendChild(errorEl);
+    }
+
+    recap.forEach((cards, name) => {
+      const heading = document.createElement("h3");
+      heading.textContent = `${name} (${cards.size})`;
+      const grid = document.createElement("div");
+      grid.className = "wm-mass-tag-recap-grid";
+      Array.from(cards)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .forEach(([cardName, image]) => {
+          const tile = document.createElement("figure");
+          tile.title = `${cardName} : cliquer pour la chercher dans la collection`;
+          tile.addEventListener("click", () => {
+            const input = document.querySelector(
+              'input[placeholder^="Rechercher"]',
+            );
+            if (!input) return;
+
+            NATIVE_INPUT_VALUE_SETTER.call(input, cardName);
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            panel
+              .querySelectorAll("figure.wm-mass-tag-recap-current")
+              .forEach((other) =>
+                other.classList.remove("wm-mass-tag-recap-current"),
+              );
+            tile.classList.add("wm-mass-tag-recap-current");
+          });
+          if (image) {
+            const img = document.createElement("img");
+            img.src = image;
+            img.alt = cardName;
+            img.loading = "lazy";
+            tile.appendChild(img);
+          }
+          const caption = document.createElement("figcaption");
+          caption.textContent = cardName;
+          tile.appendChild(caption);
+          grid.appendChild(tile);
+        });
+      panel.append(heading, grid);
+    });
+  }
+
+  function insertMassTagButton() {
+    if (!window.location.pathname.startsWith("/collection")) return;
+
+    const filterBar = document.querySelector("div.flex-wrap.gap-2");
+    if (!filterBar || filterBar.querySelector(":scope > .wm-mass-tag-btn"))
+      return;
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "wm-mass-tag-btn";
+    btn.textContent = MASS_TAG_BUTTON_LABEL;
+    btn.addEventListener("click", () => {
+      if (massTagState.running) {
+        massTagState.stop = true;
+        btn.textContent = "Arrêt en cours…";
+        return;
+      }
+      runMassTagging(btn);
+    });
+    filterBar.appendChild(btn);
+  }
+
+  function watchMassTagging() {
+    GM_addStyle(`
+      .wm-mass-tag-terms {
+        width: 100%;
+        margin-top: 0.5rem;
+        padding: 0.375rem 0.75rem;
+        border-radius: 0.5rem;
+        border: 1px solid var(--color-border);
+        background: var(--color-background);
+        color: var(--color-foreground);
+        font-size: 0.75rem;
+      }
+      .wm-mass-tag-btn {
+        border: none;
+        border-radius: 0.5rem;
+        padding: 0.25rem 0.5rem;
+        background: #1d4ed8;
+        opacity: 0.6;
+        color: #fff;
+        font-size: 0.75rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background-color 0.2s ease, opacity 0.2s ease;
+      }
+      .wm-mass-tag-btn:hover {
+        background: #2563eb;
+        opacity: 1;
+      }
+      .wm-mass-tag-recap {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.6);
+      }
+      .wm-mass-tag-recap-panel {
+        position: relative;
+        width: min(40rem, 92vw);
+        max-height: 80vh;
+        overflow-y: auto;
+        padding: 1.25rem 1.5rem;
+        border-radius: 0.75rem;
+        border: 1px solid var(--color-border);
+        background: var(--color-background);
+        color: var(--color-foreground);
+      }
+      .wm-mass-tag-recap-panel h2 {
+        font-size: 1.125rem;
+        font-weight: 700;
+        padding-right: 2rem;
+      }
+      .wm-mass-tag-recap-panel h3 {
+        margin-top: 1rem;
+        font-size: 0.875rem;
+        font-weight: 700;
+      }
+      .wm-mass-tag-recap-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr));
+        gap: 0.5rem;
+        margin-top: 0.5rem;
+      }
+      .wm-mass-tag-docked {
+        justify-content: flex-end;
+        align-items: stretch;
+        padding: 1rem;
+        background: none;
+        pointer-events: none;
+      }
+      .wm-mass-tag-docked .wm-mass-tag-recap-panel {
+        width: min(26rem, 40vw);
+        max-height: none;
+        pointer-events: auto;
+        box-shadow: 0 0 24px rgba(0, 0, 0, 0.5);
+      }
+      .wm-mass-tag-recap-grid figure {
+        margin: 0;
+        text-align: center;
+        cursor: pointer;
+        border-radius: 0.5rem;
+        outline: 2px solid transparent;
+      }
+      .wm-mass-tag-recap-grid figure:hover,
+      .wm-mass-tag-recap-grid figure.wm-mass-tag-recap-current {
+        outline-color: var(--color-accent);
+      }
+      .wm-mass-tag-recap-grid img {
+        width: 100%;
+        aspect-ratio: 3 / 4;
+        object-fit: cover;
+        border-radius: 0.5rem;
+        background: var(--color-surface-light);
+      }
+      .wm-mass-tag-recap-grid figcaption {
+        margin-top: 0.15rem;
+        font-size: 0.65rem;
+        line-height: 1.2;
+        overflow: hidden;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+      }
+      .wm-mass-tag-picker-hint {
+        margin-top: 0.5rem;
+        font-size: 0.75rem;
+        opacity: 0.6;
+      }
+      .wm-mass-tag-picker-row {
+        display: flex;
+        align-items: baseline;
+        gap: 0.5rem;
+        margin-top: 0.5rem;
+        font-size: 0.8rem;
+      }
+      .wm-mass-tag-picker-row label {
+        flex: 1;
+        display: flex;
+        align-items: baseline;
+        gap: 0.5rem;
+        cursor: pointer;
+      }
+      .wm-mass-tag-picker-row button {
+        background: none;
+        border: none;
+        cursor: pointer;
+        font-size: 0.7rem;
+        opacity: 0.6;
+        color: inherit;
+      }
+      .wm-mass-tag-picker-row button:hover:not(:disabled) {
+        opacity: 1;
+      }
+      .wm-mass-tag-picker-row button:disabled {
+        cursor: default;
+        opacity: 0.15;
+      }
+      .wm-mass-tag-picker-actions {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-top: 1rem;
+        font-size: 0.75rem;
+      }
+      .wm-mass-tag-picker-actions button:not(.wm-mass-tag-btn) {
+        background: none;
+        border: none;
+        cursor: pointer;
+        opacity: 0.7;
+        text-decoration: underline;
+        color: inherit;
+      }
+      .wm-mass-tag-btn:disabled {
+        cursor: default;
+        opacity: 0.3;
+      }
+      .wm-mass-tag-recap-error {
+        margin-top: 0.5rem;
+        color: #f87171;
+        font-size: 0.8rem;
+      }
+      .wm-mass-tag-recap-close {
+        position: absolute;
+        top: 0.75rem;
+        right: 0.75rem;
+        background: none;
+        border: none;
+        cursor: pointer;
+        opacity: 0.6;
+        color: inherit;
+      }
+      .wm-mass-tag-recap-close:hover {
+        opacity: 1;
+      }
+    `);
+
+    const update = () => {
+      insertMassTagTermsInputs();
+      insertMassTagButton();
+    };
+    update();
+
+    const observer = new MutationObserver(update);
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // ============================================================
+  // Feature CCL: hovering a card (div.w-72 with an h-[420px] class — the card face used in grids, pulls and modals)
+  // shows a single floating 📷 button at the top center of that card. Clicking it renders the card to a PNG (via
+  // the html-to-image library, @require'd in the header; 2x pixel ratio, hover scale removed) and puts it in the
+  // clipboard through the async Clipboard API, so it can be pasted as an image. The button lives on <body>, outside
+  // the card, so it is never part of the capture. The icon briefly turns into ⏳ while rendering, then ✅ (or ❌).
+  // Wikipedia thumbnails are fetched with CORS (the site marks them crossorigin="anonymous"); if one can't be
+  // loaded, html-to-image just leaves it blank.
+  // ============================================================
+  function watchCardImageCopyButton() {
+    GM_addStyle(`
+      .wm-copy-card-image {
+        position: fixed;
+        z-index: 2147483000;
+        display: none;
+        transform: translateX(-50%);
+        padding: 2px 8px;
+        border: none;
+        border-radius: 6px;
+        background: rgba(0, 0, 0, 0.65);
+        color: #fff;
+        font-size: 1rem;
+        cursor: pointer;
+      }
+      .wm-copy-card-image:hover {
+        background: rgba(0, 0, 0, 0.85);
+      }
+    `);
+
+    // The card face is recognized by its rarity background image (/rarity/*.webp), which is a direct child of the
+    // card's root element whatever its size (grid, pulls and modal cards don't share the same width classes)
+    const findCard = (el) => {
+      let node = el.closest ? el : el.parentElement;
+      while (node && node !== document.body) {
+        if (node.querySelector(':scope > img[src*="/rarity/"]')) return node;
+        node = node.parentElement;
+      }
+      return null;
+    };
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "wm-copy-card-image";
+    btn.textContent = "📷";
+    btn.title = "Copier la carte comme image";
+    // Re-attached on demand: the site's own rendering may drop nodes it doesn't know from <body>
+    const ensureAttached = () => {
+      if (!btn.isConnected) document.body.append(btn);
+    };
+    ensureAttached();
+
+    let currentCard = null;
+    const hide = () => {
+      btn.style.display = "none";
+      currentCard = null;
+    };
+    const place = (card) => {
+      const rect = card.getBoundingClientRect();
+      btn.style.left = `${rect.left + rect.width / 2}px`;
+      btn.style.top = `${rect.top + 6}px`;
+      btn.style.display = "block";
+      currentCard = card;
+    };
+
+    document.addEventListener("mouseover", (event) => {
+      if (event.target === btn) return;
+      ensureAttached();
+      const card = findCard(event.target);
+      if (card) place(card);
+      else if (currentCard) hide();
+    }, true);
+    window.addEventListener("scroll", hide, true);
+
+    const flash = (icon) => {
+      btn.textContent = icon;
+      setTimeout(() => {
+        btn.textContent = "📷";
+      }, 1200);
+    };
+
+    btn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const card = currentCard;
+      if (!card || typeof htmlToImage === "undefined" || !navigator.clipboard?.write) {
+        flash("❌");
+        return;
+      }
+
+      btn.textContent = "⏳";
+      // The blob is handed over as a promise so the clipboard write happens inside the click's user gesture
+      // html-to-image logs one console error per cross-origin stylesheet it can't read while embedding fonts:
+      // harmless noise, filtered out (only that message, only during the capture)
+      const originalConsoleError = console.error;
+      console.error = (...args) => {
+        if (String(args[0]).includes("Error while reading CSS rules")) return;
+        originalConsoleError.apply(console, args);
+      };
+      const blobPromise = htmlToImage
+        .toBlob(card, {
+          pixelRatio: 2,
+          style: { transform: "none", margin: "0" },
+        })
+        .finally(() => {
+          console.error = originalConsoleError;
+        });
+      navigator.clipboard
+        .write([new ClipboardItem({ "image/png": blobPromise })])
+        .then(() => flash("✅"))
+        .catch((error) => {
+          console.error("[WMB-CCL]", error);
+          flash("❌");
+        });
+    });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   function main() {
@@ -8262,6 +9220,14 @@ const MY_USERNAME = "xxx";
       if (flags[id]) fn();
     };
 
+    // Run first and isolated: a failure in any other feature must not prevent the card image button
+    run("feature-ccl", () => {
+      try {
+        watchCardImageCopyButton();
+      } catch (error) {
+        console.error("[WMB-CCL]", error);
+      }
+    });
     run("rule-1a", applyCardFrameMaxHeight);
     run("rule-1b", watchShrinkButtons);
     run("rule-2", watchAccentSiblings);
@@ -8334,6 +9300,7 @@ const MY_USERNAME = "xxx";
     run("rule-41", watchOwnedCardsDimming);
     run("feature-glm", watchGuildMembers);
     run("rule-42", watchTradeTotals);
+    run("feature-mtg", watchMassTagging);
 
     watchFeatureConfigButton();
     watchTutorialButton();
