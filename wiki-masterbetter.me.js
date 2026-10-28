@@ -8307,6 +8307,8 @@ const MY_USERNAME = "xxx";
   // Only untagged cards are ever selected, so a card matching several labels keeps the first one it got. The run
   // aborts if the selection holds more cards than were clicked (a leftover selection would tag unrelated cards), or
   // if the grid is unchanged after tagging. Every failure is reported with what the script found instead.
+  // Transfer: the tag manager modal also gets "Exporter les termes" / "Importer des termes" links under its title,
+  // to save the terms and the run order to a JSON file and load them on another computer (see exportMassTagSettings).
   // The button turns into a stop button while running; the filter, search field and select mode are reset at the end.
   // A recap panel then lists, label by label, every card that was tagged as a grid of portraits with their names
   // (also shown when the run was stopped or failed, with the error on top). It is docked on the right and leaves the
@@ -8333,7 +8335,120 @@ const MY_USERNAME = "xxx";
     );
   }
 
+  // Export / import of the terms and the run order, to carry them to another computer (same account: the labels
+  // exist there too). Exported as a JSON file { version, order, terms: { label: "t1, t2" } }; importing replaces the
+  // terms of the labels in the file (other labels are left alone) and takes its order for them.
+  function exportMassTagSettings() {
+    const terms = {};
+    readMassTagEntries().forEach(({ name }) => {
+      terms[name] = localStorage.getItem(MASS_TAG_TERMS_PREFIX + name);
+    });
+    const data = {
+      version: 1,
+      order: readMassTagEntries().map(({ name }) => name),
+      terms,
+    };
+
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(
+      new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }),
+    );
+    link.download = "wmb-etiquetage-en-masse.json";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  }
+
+  // Returns the number of labels imported; throws on a file that isn't an export
+  function importMassTagSettings(text) {
+    const data = JSON.parse(text);
+    if (!data || typeof data.terms !== "object" || data.terms === null)
+      throw new Error("format inconnu");
+
+    let count = 0;
+    Object.entries(data.terms).forEach(([name, value]) => {
+      if (typeof value !== "string") return;
+
+      if (value.trim()) {
+        localStorage.setItem(MASS_TAG_TERMS_PREFIX + name, value);
+        count++;
+      }
+    });
+    if (Array.isArray(data.order)) {
+      const imported = data.order.filter((name) => typeof name === "string");
+      writeMassTagOrder([
+        ...imported,
+        ...readMassTagOrder().filter((name) => !imported.includes(name)),
+      ]);
+    }
+
+    // Refresh the fields already built for the rows of the open modal
+    document.querySelectorAll(".wm-mass-tag-terms").forEach((input) => {
+      input.value =
+        localStorage.getItem(MASS_TAG_TERMS_PREFIX + input.dataset.wmTagName) ??
+        "";
+    });
+    return count;
+  }
+
+  function insertMassTagIoBar() {
+    document.querySelectorAll(".wm-tag-manager-modal h2").forEach((heading) => {
+      const modal = heading.closest(".wm-tag-manager-modal");
+      if (modal.querySelector(".wm-mass-tag-io")) return;
+
+      const bar = document.createElement("div");
+      bar.className = "wm-mass-tag-io";
+
+      const makeButton = (text, title, onClick) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = text;
+        btn.title = title;
+        btn.addEventListener("click", onClick);
+        return btn;
+      };
+
+      const fileInput = document.createElement("input");
+      fileInput.type = "file";
+      fileInput.accept = "application/json,.json";
+      fileInput.hidden = true;
+      fileInput.addEventListener("change", async () => {
+        const file = fileInput.files[0];
+        fileInput.value = "";
+        if (!file) return;
+
+        try {
+          const count = importMassTagSettings(await file.text());
+          window.alert(`${count} étiquette${count > 1 ? "s" : ""} importée${count > 1 ? "s" : ""}.`);
+        } catch (error) {
+          window.alert(`Import impossible : ${error.message}`);
+        }
+      });
+
+      bar.append(
+        makeButton(
+          "⬇ Exporter les termes",
+          "Enregistre les termes et l'ordre de traitement dans un fichier, pour les importer sur un autre ordinateur",
+          () => {
+            if (!readMassTagEntries().length) {
+              window.alert("Aucun terme à exporter.");
+              return;
+            }
+            exportMassTagSettings();
+          },
+        ),
+        makeButton(
+          "⬆ Importer des termes",
+          "Charge un fichier exporté : remplace les termes des étiquettes qu'il contient",
+          () => fileInput.click(),
+        ),
+        fileInput,
+      );
+      heading.insertAdjacentElement("afterend", bar);
+    });
+  }
+
   function insertMassTagTermsInputs() {
+    insertMassTagIoBar();
     document
       .querySelectorAll(".wm-tag-manager-modal div.rounded-xl.border")
       .forEach((row) => {
@@ -8963,6 +9078,23 @@ const MY_USERNAME = "xxx";
         background: var(--color-background);
         color: var(--color-foreground);
         font-size: 0.75rem;
+      }
+      .wm-mass-tag-io {
+        display: flex;
+        gap: 0.75rem;
+        margin: 0.5rem 0;
+        font-size: 0.75rem;
+      }
+      .wm-mass-tag-io button {
+        background: none;
+        border: none;
+        cursor: pointer;
+        opacity: 0.7;
+        text-decoration: underline;
+        color: inherit;
+      }
+      .wm-mass-tag-io button:hover {
+        opacity: 1;
       }
       .wm-mass-tag-btn {
         border: none;
