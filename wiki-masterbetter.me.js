@@ -8293,7 +8293,8 @@ const MY_USERNAME = "xxx";
   // Run: a "Étiquetage en masse 🏷️" button is appended to the filter bar of /collection (div.flex-wrap.gap-2, like
   // Feature EBC's). A small modal first lists every label that has terms, each with a checkbox (all checked) so the
   // run can be limited to some of them; "Lancer (N)" starts it. The same rows carry ▲/▼ buttons to set the order
-  // labels are processed in (a card matching several labels gets the first one): it is saved in localStorage under
+  // labels are processed in (a card matching several labels gets the first one). Rows are compact (drag handle,
+  // rank, checkbox, name, "N termes" whose tooltip lists the terms) and reordered by drag and drop: it is saved in localStorage under
   // "tag-run-order" (a JSON array of label names; labels missing from it come last, alphabetically; a renamed label
   // keeps its place). It then sets the site's tag filter
   // (button[aria-label="Filtrer par étiquette"]) to its "Sans étiquette" entry, then for each label and each term
@@ -8306,6 +8307,8 @@ const MY_USERNAME = "xxx";
   // Only untagged cards are ever selected, so a card matching several labels keeps the first one it got. The run
   // aborts if the selection holds more cards than were clicked (a leftover selection would tag unrelated cards), or
   // if the grid is unchanged after tagging. Every failure is reported with what the script found instead.
+  // Transfer: the tag manager modal also gets "Exporter les termes" / "Importer des termes" links under its title,
+  // to save the terms and the run order to a JSON file and load them on another computer (see exportMassTagSettings).
   // The button turns into a stop button while running; the filter, search field and select mode are reset at the end.
   // A recap panel then lists, label by label, every card that was tagged as a grid of portraits with their names
   // (also shown when the run was stopped or failed, with the error on top). It is docked on the right and leaves the
@@ -8332,7 +8335,120 @@ const MY_USERNAME = "xxx";
     );
   }
 
+  // Export / import of the terms and the run order, to carry them to another computer (same account: the labels
+  // exist there too). Exported as a JSON file { version, order, terms: { label: "t1, t2" } }; importing replaces the
+  // terms of the labels in the file (other labels are left alone) and takes its order for them.
+  function exportMassTagSettings() {
+    const terms = {};
+    readMassTagEntries().forEach(({ name }) => {
+      terms[name] = localStorage.getItem(MASS_TAG_TERMS_PREFIX + name);
+    });
+    const data = {
+      version: 1,
+      order: readMassTagEntries().map(({ name }) => name),
+      terms,
+    };
+
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(
+      new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }),
+    );
+    link.download = "wmb-etiquetage-en-masse.json";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  }
+
+  // Returns the number of labels imported; throws on a file that isn't an export
+  function importMassTagSettings(text) {
+    const data = JSON.parse(text);
+    if (!data || typeof data.terms !== "object" || data.terms === null)
+      throw new Error("format inconnu");
+
+    let count = 0;
+    Object.entries(data.terms).forEach(([name, value]) => {
+      if (typeof value !== "string") return;
+
+      if (value.trim()) {
+        localStorage.setItem(MASS_TAG_TERMS_PREFIX + name, value);
+        count++;
+      }
+    });
+    if (Array.isArray(data.order)) {
+      const imported = data.order.filter((name) => typeof name === "string");
+      writeMassTagOrder([
+        ...imported,
+        ...readMassTagOrder().filter((name) => !imported.includes(name)),
+      ]);
+    }
+
+    // Refresh the fields already built for the rows of the open modal
+    document.querySelectorAll(".wm-mass-tag-terms").forEach((input) => {
+      input.value =
+        localStorage.getItem(MASS_TAG_TERMS_PREFIX + input.dataset.wmTagName) ??
+        "";
+    });
+    return count;
+  }
+
+  function insertMassTagIoBar() {
+    document.querySelectorAll(".wm-tag-manager-modal h2").forEach((heading) => {
+      const modal = heading.closest(".wm-tag-manager-modal");
+      if (modal.querySelector(".wm-mass-tag-io")) return;
+
+      const bar = document.createElement("div");
+      bar.className = "wm-mass-tag-io";
+
+      const makeButton = (text, title, onClick) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = text;
+        btn.title = title;
+        btn.addEventListener("click", onClick);
+        return btn;
+      };
+
+      const fileInput = document.createElement("input");
+      fileInput.type = "file";
+      fileInput.accept = "application/json,.json";
+      fileInput.hidden = true;
+      fileInput.addEventListener("change", async () => {
+        const file = fileInput.files[0];
+        fileInput.value = "";
+        if (!file) return;
+
+        try {
+          const count = importMassTagSettings(await file.text());
+          window.alert(`${count} étiquette${count > 1 ? "s" : ""} importée${count > 1 ? "s" : ""}.`);
+        } catch (error) {
+          window.alert(`Import impossible : ${error.message}`);
+        }
+      });
+
+      bar.append(
+        makeButton(
+          "⬇ Exporter les termes",
+          "Enregistre les termes et l'ordre de traitement dans un fichier, pour les importer sur un autre ordinateur",
+          () => {
+            if (!readMassTagEntries().length) {
+              window.alert("Aucun terme à exporter.");
+              return;
+            }
+            exportMassTagSettings();
+          },
+        ),
+        makeButton(
+          "⬆ Importer des termes",
+          "Charge un fichier exporté : remplace les termes des étiquettes qu'il contient",
+          () => fileInput.click(),
+        ),
+        fileInput,
+      );
+      heading.insertAdjacentElement("afterend", bar);
+    });
+  }
+
   function insertMassTagTermsInputs() {
+    insertMassTagIoBar();
     document
       .querySelectorAll(".wm-tag-manager-modal div.rounded-xl.border")
       .forEach((row) => {
@@ -8742,7 +8858,7 @@ const MY_USERNAME = "xxx";
       const hint = document.createElement("p");
       hint.className = "wm-mass-tag-picker-hint";
       hint.textContent =
-        "Seules les cartes sans étiquette sont étiquetées : une carte qui correspond à plusieurs étiquettes reçoit la première de la liste. Réordonnez avec ▲ ▼ (l'ordre est mémorisé).";
+        "Seules les cartes sans étiquette sont étiquetées : une carte qui correspond à plusieurs étiquettes reçoit la première de la liste. Glissez-déposez les lignes pour les réordonner (l'ordre est mémorisé) ; survolez « N termes » pour voir les termes.";
       panel.appendChild(hint);
 
       // Checked state travels with its entry when the rows are reordered
@@ -8761,13 +8877,23 @@ const MY_USERNAME = "xxx";
       startBtn.type = "button";
       startBtn.className = "wm-mass-tag-btn";
 
-      const move = (index, delta) => {
-        const target = index + delta;
-        if (target < 0 || target >= items.length) return;
+      // Moves the dragged item before (or after) the one it was dropped on
+      let dragged = null;
+      const drop = (target, after) => {
+        if (!dragged || dragged === target) return;
 
-        [items[index], items[target]] = [items[target], items[index]];
+        items.splice(items.indexOf(dragged), 1);
+        items.splice(items.indexOf(target) + (after ? 1 : 0), 0, dragged);
         writeMassTagOrder(items.map(({ entry }) => entry.name));
         render();
+      };
+      const clearDropMarks = () =>
+        rows
+          .querySelectorAll(".wm-drop-before, .wm-drop-after")
+          .forEach((el) => el.classList.remove("wm-drop-before", "wm-drop-after"));
+      const isAfter = (event, row) => {
+        const rect = row.getBoundingClientRect();
+        return event.clientY > rect.top + rect.height / 2;
       };
 
       const render = () => {
@@ -8775,6 +8901,39 @@ const MY_USERNAME = "xxx";
         items.forEach((item, index) => {
           const row = document.createElement("div");
           row.className = "wm-mass-tag-picker-row";
+          row.draggable = true;
+
+          row.addEventListener("dragstart", (event) => {
+            dragged = item;
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", item.entry.name);
+            row.classList.add("wm-dragging");
+          });
+          row.addEventListener("dragend", () => {
+            dragged = null;
+            row.classList.remove("wm-dragging");
+            clearDropMarks();
+          });
+          row.addEventListener("dragover", (event) => {
+            if (!dragged) return;
+
+            event.preventDefault();
+            clearDropMarks();
+            row.classList.add(isAfter(event, row) ? "wm-drop-after" : "wm-drop-before");
+          });
+          row.addEventListener("drop", (event) => {
+            event.preventDefault();
+            drop(item, isAfter(event, row));
+          });
+
+          const handle = document.createElement("span");
+          handle.className = "wm-mass-tag-picker-handle";
+          handle.textContent = "⠿";
+          handle.title = "Glisser pour réordonner : une carte reçoit la première étiquette de la liste";
+
+          const rank = document.createElement("span");
+          rank.className = "wm-mass-tag-picker-rank";
+          rank.textContent = index + 1;
 
           const label = document.createElement("label");
           const checkbox = document.createElement("input");
@@ -8786,23 +8945,14 @@ const MY_USERNAME = "xxx";
           });
           const nameEl = document.createElement("strong");
           nameEl.textContent = item.entry.name;
-          label.append(checkbox, nameEl, ` : ${item.entry.terms.join(", ")}`);
+          label.append(checkbox, nameEl);
 
-          const up = document.createElement("button");
-          up.type = "button";
-          up.textContent = "▲";
-          up.title = "Traiter plus tôt";
-          up.disabled = index === 0;
-          up.addEventListener("click", () => move(index, -1));
+          const count = document.createElement("span");
+          count.className = "wm-mass-tag-picker-count";
+          count.textContent = `${item.entry.terms.length} terme${item.entry.terms.length > 1 ? "s" : ""}`;
+          count.title = item.entry.terms.join("\n");
 
-          const down = document.createElement("button");
-          down.type = "button";
-          down.textContent = "▼";
-          down.title = "Traiter plus tard";
-          down.disabled = index === items.length - 1;
-          down.addEventListener("click", () => move(index, 1));
-
-          row.append(label, up, down);
+          row.append(handle, rank, label, count);
           rows.appendChild(row);
         });
         refresh();
@@ -8929,6 +9079,23 @@ const MY_USERNAME = "xxx";
         color: var(--color-foreground);
         font-size: 0.75rem;
       }
+      .wm-mass-tag-io {
+        display: flex;
+        gap: 0.75rem;
+        margin: 0.5rem 0;
+        font-size: 0.75rem;
+      }
+      .wm-mass-tag-io button {
+        background: none;
+        border: none;
+        cursor: pointer;
+        opacity: 0.7;
+        text-decoration: underline;
+        color: inherit;
+      }
+      .wm-mass-tag-io button:hover {
+        opacity: 1;
+      }
       .wm-mass-tag-btn {
         border: none;
         border-radius: 0.5rem;
@@ -9028,32 +9195,51 @@ const MY_USERNAME = "xxx";
       }
       .wm-mass-tag-picker-row {
         display: flex;
-        align-items: baseline;
+        align-items: center;
         gap: 0.5rem;
-        margin-top: 0.5rem;
+        margin-top: 0.25rem;
+        padding: 0.3rem 0.5rem;
+        border-radius: 0.5rem;
+        border: 1px solid var(--color-border);
+        border-top-width: 2px;
+        border-bottom-width: 2px;
         font-size: 0.8rem;
+      }
+      .wm-mass-tag-picker-row.wm-dragging {
+        opacity: 0.4;
+      }
+      .wm-mass-tag-picker-row.wm-drop-before {
+        border-top-color: var(--color-accent);
+      }
+      .wm-mass-tag-picker-row.wm-drop-after {
+        border-bottom-color: var(--color-accent);
       }
       .wm-mass-tag-picker-row label {
         flex: 1;
         display: flex;
-        align-items: baseline;
+        align-items: center;
         gap: 0.5rem;
         cursor: pointer;
       }
-      .wm-mass-tag-picker-row button {
-        background: none;
-        border: none;
-        cursor: pointer;
-        font-size: 0.7rem;
-        opacity: 0.6;
-        color: inherit;
+      .wm-mass-tag-picker-handle {
+        cursor: grab;
+        opacity: 0.5;
+        user-select: none;
       }
-      .wm-mass-tag-picker-row button:hover:not(:disabled) {
+      .wm-mass-tag-picker-row:hover .wm-mass-tag-picker-handle {
         opacity: 1;
       }
-      .wm-mass-tag-picker-row button:disabled {
-        cursor: default;
-        opacity: 0.15;
+      .wm-mass-tag-picker-rank {
+        min-width: 1.25rem;
+        text-align: right;
+        font-size: 0.7rem;
+        opacity: 0.5;
+      }
+      .wm-mass-tag-picker-count {
+        font-size: 0.7rem;
+        opacity: 0.6;
+        cursor: help;
+        text-decoration: underline dotted;
       }
       .wm-mass-tag-picker-actions {
         display: flex;
