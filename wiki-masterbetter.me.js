@@ -3506,8 +3506,21 @@ const MY_USERNAME = "xxx";
   // card's cached eval price (Feature ETS, keyed "eval-{name}") to its rarity tag (div.top-2.left-2), as
   // "{rarity} ({eval})". The eval value is reformatted first: above 1000,
   // it's abbreviated to "{X,X} K" (French decimal comma); otherwise it's shown as stored — low values included —
-  // as well as the "?" placeholder for a card with no recorded sales.
+  // as well as the "?" placeholder for a card with no recorded sales. While at it, the card's base rarity (the
+  // tag's text before our appendix) is saved under "wm-rarity-{name}" — only for cards that have an estimate, and
+  // only ever as seen on /collection — so that Feature EVL can show it; nothing else records it, hence a card
+  // only gets one once its page of the collection has been displayed (Feature EBC's "Estimation complète" walks
+  // them all). Not part of the cache export.
   // ============================================================
+  const RARITY_KEY_PREFIX = "wm-rarity-";
+
+  function recordCardRarity(cardName, rarity) {
+    if (!rarity) return;
+
+    const key = `${RARITY_KEY_PREFIX}${cardName}`;
+    if (localStorage.getItem(key) !== rarity) localStorage.setItem(key, rarity);
+  }
+
   function formatEvalValue(rawValue) {
     const num = parseFloat(rawValue.replace(/\s/g, "").replace(",", "."));
     if (Number.isNaN(num)) return rawValue;
@@ -3537,6 +3550,7 @@ const MY_USERNAME = "xxx";
       const baseRarity =
         rarityEl.dataset.wmBaseRarity ?? rarityEl.textContent.trim();
       rarityEl.dataset.wmBaseRarity = baseRarity;
+      recordCardRarity(cardName, baseRarity);
 
       const appendixText = ` (${formatEvalValue(evalValue)})`;
       let appendix = rarityEl.querySelector(":scope > .wm-eval-appendix");
@@ -3869,6 +3883,10 @@ const MY_USERNAME = "xxx";
     {
       id: "feature-ccl",
       label: "Copier une carte comme image dans le presse-papiers",
+    },
+    {
+      id: "feature-evl",
+      label: "Panneau « Estimations » : liste de toutes les cartes estimées",
     },
   ];
 
@@ -4288,6 +4306,10 @@ const MY_USERNAME = "xxx";
     {
       title: "Partager une carte en image",
       text: "Survolez une carte : un bouton 📷 apparaît en haut de celle-ci. Un clic copie la carte (illustration, texte, statistiques) comme image dans le presse-papiers, prête à être collée dans une conversation.",
+    },
+    {
+      title: "Lister toutes vos estimations",
+      text: "Sur la collection, l'onglet « Estimations » collé au menu de gauche ouvre un panneau coulissant listant toutes les cartes estimées, de la plus chère à la moins chère, par pages de 100, avec leur rareté (et sa couleur) quand elle est connue. Les boutons L, UR, SR, R, PC, C en haut du panneau filtrent la liste par rareté. La loupe d'une ligne lance la recherche de cette carte dans la collection, et la corbeille la retire du cache (carte vendue ou échangée), avec un bouton « Annuler » juste après. Estimez votre collection pour remplir la liste.",
     },
   ];
 
@@ -9670,6 +9692,619 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Feature EVL: on /collection, a drawer sliding in from the left lists every card whose estimate is cached
+  // (Feature ETS, keyed "eval-{name}", "?" placeholders left out) from the most to the least valuable, 100 per
+  // page, with a pager. The drawer (aside.wm-est-drawer) is inserted as a flex sibling right after the sidebar,
+  // before <main>, so opening it pushes the page to the right instead of covering it. Its always-visible gutter
+  // (button.wm-est-gutter: icon and a vertical label) toggles it; the panel itself is clipped by a wrapper whose
+  // width is animated (the panel keeps its own fixed width, so its content doesn't reflow during the slide). Each
+  // row shows rank, card name, rarity when Feature ETS saved one ("wm-rarity-{name}") and the estimate, plus a 🔍
+  // button that types the card's name in the collection's search field (same call as Feature MTG's recap panel).
+  // Cards are tinted with their rarity's own colour (the site's --color-rarity-{code} variables, the same ones as
+  // its collection filter), and a row of rarity chips under the header (L, UR, SR, R, PC, C — in the site's own
+  // order) filters the list down to one rarity, a second click on the active chip clearing it. The chips use their
+  // own classes, deliberately not the site's "flex-wrap gap-2" ones, which other features use to find the
+  // collection's own filter bar. A card whose rarity is unknown (never seen on /collection) has no tint and is
+  // hidden by any active filter. The filter is kept in memory only. A 🗑 button on each row removes that card
+  // from the cache — for a card that was sold or traded: its "eval-{name}" estimate and its saved rarity are
+  // deleted, the row leaves the list (the following ones move up) and the stale estimate tag is taken off the
+  // matching card of the collection grid. A bar under the header then offers an "Annuler" button that puts back
+  // the last removed card (until another one is removed or the drawer is closed). The header has a refresh
+  // button: the list is built when the drawer opens or the page changes, not live. The
+  // open/closed state is remembered in localStorage ("wm-estimations-drawer-open"). The drawer only exists on
+  // /collection (removed anywhere else) and on desktop widths (hidden below 768px, where the site stacks its
+  // layout vertically). Its position is re-checked on every DOM mutation, in case the site re-renders its layout.
+  // ============================================================
+  const EVL_PAGE_SIZE = 100;
+  const EVL_OPEN_KEY = "wm-estimations-drawer-open";
+  const EVL_RARITIES = ["L", "UR", "SR", "R", "PC", "C"];
+  let evlPage = 1;
+  let evlCurrentCardName = null;
+  let evlRarityFilter = null;
+  let evlLastRemoved = null;
+
+  // The card's rarity as one of EVL_RARITIES, or null when unknown / not one of them
+  function getRarityCode(rarity) {
+    const code = (rarity ?? "").trim().toUpperCase();
+    return EVL_RARITIES.includes(code) ? code : null;
+  }
+
+  function getRarityColor(code) {
+    return `var(--color-rarity-${code.toLowerCase()})`;
+  }
+
+  // Every cached estimate that is a genuine number, most valuable first (ties by name, so pages stay stable)
+  function collectAllEvals() {
+    const entries = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key || !key.startsWith(EVAL_KEY_PREFIX)) continue;
+
+      const cardName = key.slice(EVAL_KEY_PREFIX.length);
+      const value = getCardEvalValueByName(cardName);
+      if (value !== null) {
+        entries.push({
+          cardName,
+          value,
+          rarity: localStorage.getItem(`${RARITY_KEY_PREFIX}${cardName}`),
+        });
+      }
+    }
+
+    return entries.sort(
+      (a, b) => b.value - a.value || a.cardName.localeCompare(b.cardName, "fr"),
+    );
+  }
+
+  // Deletes a card's cached estimate and rarity, returning what was there so that it can be put back
+  function removeCardFromCache(cardName) {
+    const evalKey = `${EVAL_KEY_PREFIX}${cardName}`;
+    const rarityKey = `${RARITY_KEY_PREFIX}${cardName}`;
+    const removed = {
+      cardName,
+      value: localStorage.getItem(evalKey),
+      rarity: localStorage.getItem(rarityKey),
+    };
+
+    localStorage.removeItem(evalKey);
+    localStorage.removeItem(rarityKey);
+
+    // The estimate shown on the card's rarity tag would otherwise stay until the grid is re-rendered
+    getAllCollectionCards()?.forEach((card) => {
+      if (getCardName(card) !== cardName) return;
+      card
+        .querySelector("div.top-2.left-2 > .wm-eval-appendix")
+        ?.remove();
+    });
+
+    return removed;
+  }
+
+  function restoreCardToCache({ cardName, value, rarity }) {
+    if (value !== null) {
+      localStorage.setItem(`${EVAL_KEY_PREFIX}${cardName}`, value);
+    }
+    if (rarity !== null) {
+      localStorage.setItem(`${RARITY_KEY_PREFIX}${cardName}`, rarity);
+    }
+    appendEvalToRarityTags();
+  }
+
+  function searchCollectionForCard(cardName) {
+    const input = document.querySelector('input[placeholder^="Rechercher"]');
+    if (!input) return false;
+
+    NATIVE_INPUT_VALUE_SETTER.call(input, cardName);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  }
+
+  function buildEstimationsPager(page, pageCount, onChange) {
+    const pager = document.createElement("div");
+    pager.className = "wm-est-pager";
+
+    const makeButton = (label, target, title) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "wm-est-page-btn";
+      btn.textContent = label;
+      btn.title = title;
+      btn.disabled = target < 1 || target > pageCount || target === page;
+      btn.addEventListener("click", () => onChange(target));
+      return btn;
+    };
+
+    const indicator = document.createElement("span");
+    indicator.className = "wm-est-page-indicator";
+    indicator.textContent = `Page ${page} / ${pageCount}`;
+
+    pager.append(
+      makeButton("«", 1, "Première page"),
+      makeButton("‹", page - 1, "Page précédente"),
+      indicator,
+      makeButton("›", page + 1, "Page suivante"),
+      makeButton("»", pageCount, "Dernière page"),
+    );
+    return pager;
+  }
+
+  function setEstimationsDrawerOpen(drawer, open) {
+    drawer.dataset.open = String(open);
+    drawer
+      .querySelector(".wm-est-gutter")
+      ?.setAttribute("aria-expanded", String(open));
+    localStorage.setItem(EVL_OPEN_KEY, String(open));
+    if (!open) evlLastRemoved = null;
+    if (open) renderEstimationsPanel(drawer);
+  }
+
+  function renderEstimationsPanel(drawer) {
+    const panel = drawer.querySelector(".wm-est-panel");
+    panel.replaceChildren();
+
+    const allEntries = collectAllEvals();
+    const entries = evlRarityFilter
+      ? allEntries.filter(
+          (entry) => getRarityCode(entry.rarity) === evlRarityFilter,
+        )
+      : allEntries;
+    const pageCount = Math.max(1, Math.ceil(entries.length / EVL_PAGE_SIZE));
+    evlPage = Math.min(Math.max(1, evlPage), pageCount);
+
+    const header = document.createElement("div");
+    header.className = "wm-est-header";
+
+    const titleBlock = document.createElement("div");
+    const title = document.createElement("h2");
+    title.className = "wm-est-title";
+    title.textContent = "Estimations";
+    const summary = document.createElement("p");
+    summary.className = "wm-est-summary";
+    summary.textContent =
+      entries.length === 0
+        ? "Aucune carte estimée"
+        : `${entries.length.toLocaleString("fr-FR")} carte${entries.length > 1 ? "s" : ""}${evlRarityFilter ? ` ${evlRarityFilter}` : ""}, de la plus à la moins chère`;
+    titleBlock.append(title, summary);
+
+    const refreshBtn = document.createElement("button");
+    refreshBtn.type = "button";
+    refreshBtn.className = "wm-est-icon-btn";
+    refreshBtn.textContent = "↻";
+    refreshBtn.title = "Actualiser la liste";
+    refreshBtn.addEventListener("click", () => renderEstimationsPanel(drawer));
+
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "wm-est-icon-btn";
+    closeBtn.textContent = "✕";
+    closeBtn.title = "Fermer";
+    closeBtn.addEventListener("click", () =>
+      setEstimationsDrawerOpen(drawer, false),
+    );
+
+    header.append(titleBlock, refreshBtn, closeBtn);
+    panel.appendChild(header);
+
+    if (evlLastRemoved) {
+      const undoBar = document.createElement("div");
+      undoBar.className = "wm-est-undo";
+      const undoText = document.createElement("span");
+      undoText.textContent = `« ${evlLastRemoved.cardName} » retirée du cache.`;
+      const undoBtn = document.createElement("button");
+      undoBtn.type = "button";
+      undoBtn.className = "wm-est-undo-btn";
+      undoBtn.textContent = "Annuler";
+      undoBtn.addEventListener("click", () => {
+        restoreCardToCache(evlLastRemoved);
+        evlLastRemoved = null;
+        renderEstimationsPanel(drawer);
+      });
+      undoBar.append(undoText, undoBtn);
+      panel.appendChild(undoBar);
+    }
+
+    if (allEntries.length > 0) {
+      const filterBar = document.createElement("div");
+      filterBar.className = "wm-est-filter-bar";
+      EVL_RARITIES.forEach((code) => {
+        const count = allEntries.filter(
+          (entry) => getRarityCode(entry.rarity) === code,
+        ).length;
+
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "wm-est-chip";
+        chip.classList.toggle("wm-est-chip-active", evlRarityFilter === code);
+        chip.textContent = code;
+        chip.title = `${count} carte${count > 1 ? "s" : ""} ${code} (rareté connue uniquement pour les cartes déjà affichées dans la collection)`;
+        // Same colour recipe as the site's own rarity filter: the variable's hex colour, once as is and once
+        // with a "30" alpha suffix as background
+        chip.style.backgroundColor = `${getRarityColor(code)}30`;
+        chip.style.color = getRarityColor(code);
+        chip.addEventListener("click", () => {
+          evlRarityFilter = evlRarityFilter === code ? null : code;
+          evlPage = 1;
+          renderEstimationsPanel(drawer);
+        });
+        filterBar.appendChild(chip);
+      });
+      panel.appendChild(filterBar);
+    }
+
+    const list = document.createElement("div");
+    list.className = "wm-est-list";
+
+    if (entries.length === 0) {
+      const hint = document.createElement("p");
+      hint.className = "wm-est-empty";
+      hint.textContent =
+        allEntries.length === 0
+          ? "Lancez une estimation depuis cette page : les valeurs trouvées apparaîtront ici."
+          : "Aucune carte de cette rareté. Elle n'est connue que pour les cartes déjà affichées dans la collection.";
+      list.appendChild(hint);
+    }
+
+    const offset = (evlPage - 1) * EVL_PAGE_SIZE;
+    entries.slice(offset, offset + EVL_PAGE_SIZE).forEach((entry, index) => {
+      const row = document.createElement("div");
+      row.className = "wm-est-row";
+      if (entry.cardName === evlCurrentCardName) {
+        row.classList.add("wm-est-row-current");
+      }
+
+      const rank = document.createElement("span");
+      rank.className = "wm-est-rank";
+      rank.textContent = String(offset + index + 1);
+
+      const name = document.createElement("span");
+      name.className = "wm-est-name";
+      name.textContent = entry.cardName;
+      name.title = entry.cardName;
+
+      const rarity = document.createElement("span");
+      rarity.className = "wm-est-rarity";
+      rarity.textContent = entry.rarity ?? "";
+
+      const rarityCode = getRarityCode(entry.rarity);
+      if (rarityCode) {
+        name.style.color = getRarityColor(rarityCode);
+        rarity.style.color = getRarityColor(rarityCode);
+      }
+
+      const value = document.createElement("span");
+      value.className = "wm-est-value";
+      value.textContent = entry.value.toLocaleString("fr-FR", {
+        maximumFractionDigits: 2,
+      });
+
+      const searchBtn = document.createElement("button");
+      searchBtn.type = "button";
+      searchBtn.className = "wm-est-icon-btn";
+      searchBtn.textContent = "🔍";
+      searchBtn.title = `Chercher « ${entry.cardName} » dans la collection`;
+      searchBtn.addEventListener("click", () => {
+        if (!searchCollectionForCard(entry.cardName)) return;
+
+        evlCurrentCardName = entry.cardName;
+        list
+          .querySelectorAll(".wm-est-row-current")
+          .forEach((other) => other.classList.remove("wm-est-row-current"));
+        row.classList.add("wm-est-row-current");
+      });
+
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "wm-est-icon-btn wm-est-remove-btn";
+      removeBtn.textContent = "🗑";
+      removeBtn.title = `Retirer « ${entry.cardName} » du cache (carte vendue ou échangée)`;
+      removeBtn.addEventListener("click", () => {
+        evlLastRemoved = removeCardFromCache(entry.cardName);
+        if (evlCurrentCardName === entry.cardName) evlCurrentCardName = null;
+        renderEstimationsPanel(drawer);
+      });
+
+      row.append(rank, name, rarity, value, searchBtn, removeBtn);
+      list.appendChild(row);
+    });
+    panel.appendChild(list);
+
+    if (entries.length > 0) {
+      panel.appendChild(
+        buildEstimationsPager(evlPage, pageCount, (target) => {
+          evlPage = target;
+          renderEstimationsPanel(drawer);
+        }),
+      );
+    }
+  }
+
+  function buildEstimationsDrawer() {
+    const drawer = document.createElement("aside");
+    drawer.className = "wm-est-drawer";
+    drawer.setAttribute("aria-label", "Estimations");
+
+    const gutter = document.createElement("button");
+    gutter.type = "button";
+    gutter.className = "wm-est-gutter";
+    gutter.title = "Estimations de vos cartes (Wiki-MasterBetter)";
+    gutter.setAttribute("aria-expanded", "false");
+    gutter.innerHTML =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 6h11"></path><path d="M10 12h11"></path><path d="M10 18h11"></path><path d="M4 6h1v4"></path><path d="M4 10h2"></path><path d="M6 18H4c0-1 2-2 2-3s-1-1.5-2-1"></path></svg>';
+    const gutterLabel = document.createElement("span");
+    gutterLabel.className = "wm-est-gutter-label";
+    gutterLabel.textContent = "Estimations";
+    gutter.appendChild(gutterLabel);
+    gutter.addEventListener("click", () =>
+      setEstimationsDrawerOpen(drawer, drawer.dataset.open !== "true"),
+    );
+
+    const clip = document.createElement("div");
+    clip.className = "wm-est-clip";
+    const panel = document.createElement("div");
+    panel.className = "wm-est-panel";
+    clip.appendChild(panel);
+
+    drawer.append(gutter, clip);
+    setEstimationsDrawerOpen(drawer, localStorage.getItem(EVL_OPEN_KEY) === "true");
+    return drawer;
+  }
+
+  function syncEstimationsDrawer() {
+    const nav = document.querySelector("nav h1")?.closest("nav");
+    const existing = document.querySelector(".wm-est-drawer");
+
+    if (!window.location.pathname.startsWith("/collection") || !nav) {
+      existing?.remove();
+      return;
+    }
+
+    const drawer = existing ?? buildEstimationsDrawer();
+    // Only moved when out of place, to not feed the observer
+    if (drawer.previousElementSibling !== nav) nav.after(drawer);
+  }
+
+  function watchEstimationsDrawer() {
+    GM_addStyle(`
+      .wm-est-drawer {
+        display: flex;
+        flex-shrink: 0;
+        min-height: 0;
+        border-right: 1px solid var(--color-border);
+        background: var(--color-surface);
+      }
+      .wm-est-drawer ~ main {
+        min-width: 0;
+      }
+      @media (max-width: 767px) {
+        .wm-est-drawer {
+          display: none;
+        }
+      }
+      .wm-est-gutter {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.75rem;
+        width: 2.25rem;
+        padding: 1rem 0;
+        border: none;
+        background: transparent;
+        color: var(--color-foreground);
+        opacity: 0.6;
+        cursor: pointer;
+        transition: background-color 0.2s ease, opacity 0.2s ease, color 0.2s ease;
+      }
+      .wm-est-gutter:hover {
+        opacity: 1;
+        background: var(--color-surface-light);
+      }
+      .wm-est-drawer[data-open="true"] .wm-est-gutter {
+        opacity: 1;
+        color: var(--color-accent);
+      }
+      .wm-est-gutter-label {
+        writing-mode: vertical-rl;
+        font-size: 0.75rem;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .wm-est-clip {
+        width: 0;
+        overflow: hidden;
+        border-left: 0 solid var(--color-border);
+        transition: width 0.25s ease;
+      }
+      .wm-est-drawer[data-open="true"] .wm-est-clip {
+        width: 32rem;
+        border-left-width: 1px;
+      }
+      .wm-est-panel {
+        display: flex;
+        flex-direction: column;
+        width: 32rem;
+        height: 100%;
+      }
+      .wm-est-header {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.25rem;
+        padding: 1rem 1rem 0.75rem;
+        border-bottom: 1px solid var(--color-border);
+      }
+      .wm-est-header > :first-child {
+        flex: 1;
+        min-width: 0;
+      }
+      .wm-est-title {
+        font-family: var(--font-heading);
+        font-size: 1.25rem;
+        font-weight: 700;
+      }
+      .wm-est-summary,
+      .wm-est-empty {
+        font-size: 0.8rem;
+        opacity: 0.5;
+      }
+      .wm-est-empty {
+        padding: 1.5rem 1rem;
+        text-align: center;
+      }
+      .wm-est-filter-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        padding: 0.625rem 1rem;
+        border-bottom: 1px solid var(--color-border);
+      }
+      .wm-est-chip {
+        padding: 0.25rem 0.75rem;
+        border: none;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        opacity: 0.5;
+        cursor: pointer;
+        transition: opacity 0.2s ease;
+      }
+      .wm-est-chip:hover {
+        opacity: 0.8;
+      }
+      .wm-est-chip.wm-est-chip-active {
+        opacity: 1;
+        outline: 1px solid currentColor;
+      }
+      .wm-est-list {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        padding: 0 0.5rem;
+      }
+      .wm-est-row {
+        display: grid;
+        grid-template-columns: 2.25rem minmax(0, 1fr) 5.5rem 4.25rem 1.75rem 1.75rem;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.375rem 0.5rem;
+        border-bottom: 1px solid var(--color-border);
+        font-size: 0.85rem;
+      }
+      .wm-est-row-current {
+        background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+      }
+      .wm-est-rank {
+        opacity: 0.5;
+        font-variant-numeric: tabular-nums;
+      }
+      .wm-est-name,
+      .wm-est-rarity {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .wm-est-rarity {
+        font-size: 0.75rem;
+        opacity: 0.7;
+      }
+      .wm-est-value {
+        text-align: right;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        color: var(--color-accent);
+      }
+      .wm-est-icon-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 1.75rem;
+        height: 1.75rem;
+        border: none;
+        border-radius: 0.375rem;
+        background: transparent;
+        color: inherit;
+        font-size: 0.85rem;
+        opacity: 0.6;
+        cursor: pointer;
+        transition: background-color 0.2s ease, opacity 0.2s ease;
+      }
+      .wm-est-icon-btn:hover {
+        opacity: 1;
+        background: var(--color-surface-light);
+      }
+      .wm-est-remove-btn:hover {
+        color: #ef4444;
+      }
+      .wm-est-undo {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+        padding: 0.5rem 1rem;
+        border-bottom: 1px solid var(--color-border);
+        background: color-mix(in srgb, #ef4444 12%, transparent);
+        font-size: 0.8rem;
+      }
+      .wm-est-undo > span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .wm-est-undo-btn {
+        flex-shrink: 0;
+        padding: 0.125rem 0.625rem;
+        border: 1px solid currentColor;
+        border-radius: 9999px;
+        background: transparent;
+        color: inherit;
+        font-size: 0.75rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .wm-est-undo-btn:hover {
+        background: var(--color-surface-light);
+      }
+      .wm-est-pager {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.375rem;
+        padding: 0.625rem 1rem;
+        border-top: 1px solid var(--color-border);
+      }
+      .wm-est-page-btn {
+        min-width: 2rem;
+        padding: 0.25rem 0.5rem;
+        border-radius: 0.5rem;
+        border: 1px solid var(--color-border);
+        background: transparent;
+        color: inherit;
+        font-size: 0.85rem;
+        cursor: pointer;
+        transition: background-color 0.2s ease, opacity 0.2s ease;
+      }
+      .wm-est-page-btn:hover:not(:disabled) {
+        background: var(--color-surface-light);
+      }
+      .wm-est-page-btn:disabled {
+        opacity: 0.35;
+        cursor: default;
+      }
+      .wm-est-page-indicator {
+        min-width: 6rem;
+        text-align: center;
+        font-size: 0.8rem;
+        font-variant-numeric: tabular-nums;
+        opacity: 0.7;
+      }
+    `);
+
+    syncEstimationsDrawer();
+
+    const observer = new MutationObserver(() => syncEstimationsDrawer());
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   function main() {
@@ -9762,6 +10397,7 @@ const MY_USERNAME = "xxx";
     run("feature-glm", watchGuildMembers);
     run("rule-42", watchTradeTotals);
     run("feature-mtg", watchMassTagging);
+    run("feature-evl", watchEstimationsDrawer);
 
     watchFeatureConfigButton();
     watchTutorialButton();
