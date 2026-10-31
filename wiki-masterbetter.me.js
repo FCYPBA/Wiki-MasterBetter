@@ -11,6 +11,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_notification
+// @grant        unsafeWindow
 // @require      https://cdn.jsdelivr.net/npm/html-to-image@1.11.11/dist/html-to-image.js
 // ==/UserScript==
 //! Regarde Naïm, c'est comme ça qu'on vibe-claude.
@@ -3463,6 +3464,11 @@ const MY_USERNAME = "xxx";
 
     if (!cardName || !value) return;
 
+    // Feature EBC's rate-limit watch: right after the API answered "automation_limit", the modal can only be
+    // showing an empty estimate — not a genuine "Aucune vente" — so the "?" placeholder must not be recorded.
+    if (value === UNKNOWN_EVAL_VALUE && wasAutomationLimitedSince(Date.now() - 5000))
+      return;
+
     const key = `eval-${cardName}`;
     const existingValue = localStorage.getItem(key);
     if (existingValue === value) return;
@@ -3498,18 +3504,13 @@ const MY_USERNAME = "xxx";
   // ============================================================
   // Feature ETS (cont'd): on /collection, whenever the cards grid (div.gap-3.justify-center) changes, append each
   // card's cached eval price (Feature ETS, keyed "eval-{name}") to its rarity tag (div.top-2.left-2), as
-  // "{rarity} ({eval})". The eval value is reformatted first: below 15, it's replaced outright with "💩"; above
-  // 1000, it's abbreviated to "{X,X} K" (French decimal comma); otherwise it's shown as stored, including the "?"
-  // placeholder for a card with no recorded sales.
+  // "{rarity} ({eval})". The eval value is reformatted first: above 1000,
+  // it's abbreviated to "{X,X} K" (French decimal comma); otherwise it's shown as stored — low values included —
+  // as well as the "?" placeholder for a card with no recorded sales.
   // ============================================================
-  const WORTHLESS_THRESHOLD = 10;
   function formatEvalValue(rawValue) {
     const num = parseFloat(rawValue.replace(/\s/g, "").replace(",", "."));
     if (Number.isNaN(num)) return rawValue;
-
-    if (num < WORTHLESS_THRESHOLD) {
-      return "💩";
-    }
 
     if (num > 1000) {
       return `${(num / 1000).toFixed(1).replace(".", ",")} K`;
@@ -4262,7 +4263,7 @@ const MY_USERNAME = "xxx";
     },
     {
       title: "Estimer toute une collection d'un coup",
-      text: "Dans votre collection, le bouton rouge « Estimation en masse » évalue les cartes sans estimation de la page, puis passe à la page suivante et recommence, jusqu'à la dernière. Le bouton « Arrêter la reconnaissance » interrompt le processus à n'importe quel moment. Laissez l'onglet actif et la fenêtre non réduite pendant toute la durée : en arrière-plan ou minimisée, le navigateur ralentit les temporisations dont cette fonctionnalité dépend, ce qui la rend peu fiable.",
+      text: "Dans votre collection, le bouton rouge « Estimation en masse » évalue les cartes sans estimation de la page, puis passe à la page suivante et recommence, jusqu'à la dernière. Le bouton « Arrêter la reconnaissance » interrompt le processus à n'importe quel moment. Laissez l'onglet actif et la fenêtre non réduite pendant toute la durée : en arrière-plan ou minimisée, le navigateur ralentit les temporisations dont cette fonctionnalité dépend, ce qui la rend peu fiable. Si le site refuse des requêtes parce qu'elles vont trop vite, le processus se met en pause quelques secondes (compte à rebours sur le bouton) puis reprend plus lentement ; une carte toujours refusée est laissée de côté 15 minutes, et le bouton « Réessayer les cartes limitées » ne traite qu'elles.",
     },
     {
       title: "Voir les estimations les plus élevées",
@@ -5216,7 +5217,112 @@ const MY_USERNAME = "xxx";
   // stretches the time a slow card's evaluation needs to land. evaluateCollectionCards never skips a card on
   // timeout: it closes the modal (Escape) and re-clicks the card's quick action, waiting again, until a value is
   // recorded or the run is stopped.
+  //
+  // Feature EBC (cont'd): rate limit. The site's API answers HTTP 403 with a JSON body whose "code" is
+  // "automation_limit" when estimates are requested too fast. watchAutomationLimit hooks fetch/XHR to catch it
+  // (automationLimitHitAt). During a run, a hit makes evaluateCollectionCards close the modal, pause (cooldown
+  // growing 5s -> 60s over consecutive hits, shown on the button) and retry the same card; it also slows the
+  // whole run down (state.pacingMs, a pause after every card, which decays after a streak of successes). A card
+  // still limited after AUTOMATION_LIMIT_MAX_RETRIES retries is not estimated: it is flagged in localStorage
+  // ("wm-eval-limited-{name}" = timestamp — deliberately NOT under "eval-", which would pollute the cache
+  // export and the Top 40) and skipped by the "missing estimate" passes for AUTOMATION_LIMIT_SKIP_MS. A fifth
+  // button, "Réessayer les cartes limitées (N)", only re-evaluates the flagged cards of the current page,
+  // whatever their age; a successful estimate clears the flag.
   // ============================================================
+  let automationLimitHitAt = 0;
+  const AUTOMATION_LIMIT_CODE = "automation_limit";
+  const AUTOMATION_LIMIT_MAX_RETRIES = 1;
+  const AUTOMATION_LIMIT_SKIP_MS = 15 * 60 * 1000;
+  const AUTOMATION_LIMIT_KEY_PREFIX = "wm-eval-limited-";
+  const AUTOMATION_LIMIT_COOLDOWN_BASE_MS = 5000;
+  const AUTOMATION_LIMIT_COOLDOWN_MAX_MS = 60000;
+  const AUTOMATION_LIMIT_PACING_MIN_MS = 1500;
+  const AUTOMATION_LIMIT_PACING_MAX_MS = 15000;
+  const AUTOMATION_LIMIT_PACING_DECAY_EVERY = 10;
+
+  function wasAutomationLimitedSince(timestamp) {
+    return automationLimitHitAt >= timestamp;
+  }
+
+  function noteAutomationLimit(body) {
+    if (body && body.code === AUTOMATION_LIMIT_CODE) {
+      automationLimitHitAt = Date.now();
+      console.warn("[WMB-EBC] automation_limit reached");
+    }
+  }
+
+  function watchAutomationLimit() {
+    // The page's own window, not the userscript sandbox's: the site's requests go through the former
+    const page = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+
+    try {
+      const originalFetch = page.fetch;
+      if (typeof originalFetch === "function") {
+        page.fetch = function (...args) {
+          const promise = originalFetch.apply(this, args);
+          promise
+            .then((response) => {
+              if (response.ok) return;
+              return response
+                .clone()
+                .json()
+                .then(noteAutomationLimit);
+            })
+            .catch(() => {});
+          return promise;
+        };
+      }
+
+      const xhrProto = page.XMLHttpRequest?.prototype;
+      const originalSend = xhrProto?.send;
+      if (typeof originalSend === "function") {
+        xhrProto.send = function (...args) {
+          this.addEventListener("load", () => {
+            if (this.status < 400) return;
+            try {
+              noteAutomationLimit(
+                this.responseType === "json"
+                  ? this.response
+                  : JSON.parse(this.responseText),
+              );
+            } catch {
+              // Not JSON: not the limit we are looking for
+            }
+          });
+          return originalSend.apply(this, args);
+        };
+      }
+    } catch (error) {
+      console.error("[WMB-EBC]", error);
+    }
+  }
+
+  function getCardLimitedAt(cardName) {
+    const raw = localStorage.getItem(`${AUTOMATION_LIMIT_KEY_PREFIX}${cardName}`);
+    const timestamp = raw === null ? NaN : parseInt(raw, 10);
+    return Number.isNaN(timestamp) ? null : timestamp;
+  }
+
+  function isCardRecentlyLimited(cardName) {
+    const limitedAt = getCardLimitedAt(cardName);
+    return limitedAt !== null && Date.now() - limitedAt < AUTOMATION_LIMIT_SKIP_MS;
+  }
+
+  function markCardLimited(cardName) {
+    localStorage.setItem(
+      `${AUTOMATION_LIMIT_KEY_PREFIX}${cardName}`,
+      String(Date.now()),
+    );
+  }
+
+  function clearCardLimited(cardName) {
+    localStorage.removeItem(`${AUTOMATION_LIMIT_KEY_PREFIX}${cardName}`);
+  }
+
+  function getCardName(card) {
+    return card.querySelector("h3")?.textContent.trim();
+  }
+
   function getAllCollectionCards() {
     const grid = document.querySelector("div.gap-3.justify-center");
     if (!grid) return null;
@@ -5224,6 +5330,8 @@ const MY_USERNAME = "xxx";
     return Array.from(grid.children);
   }
 
+  // Cards still missing an estimate, minus those that hit the API's rate limit less than
+  // AUTOMATION_LIMIT_SKIP_MS ago (they are left for the "Réessayer les cartes limitées" button)
   function getUnevaluatedCollectionCards() {
     const cards = getAllCollectionCards();
     if (cards === null) return null;
@@ -5232,6 +5340,9 @@ const MY_USERNAME = "xxx";
       const rarityEl = card.querySelector("div.top-2.left-2");
       if (!rarityEl) return false;
 
+      const cardName = getCardName(card);
+      if (cardName && isCardRecentlyLimited(cardName)) return false;
+
       const appendix = rarityEl.querySelector(":scope > .wm-eval-appendix");
       if (!appendix) return true;
 
@@ -5239,10 +5350,24 @@ const MY_USERNAME = "xxx";
     });
   }
 
+  // Cards of the page flagged by the rate limit and still without a genuine estimate, whatever the flag's age
+  function getLimitedCollectionCards() {
+    const cards = getAllCollectionCards();
+    if (cards === null) return null;
+
+    return cards.filter((card) => {
+      const cardName = getCardName(card);
+      if (!cardName || getCardLimitedAt(cardName) === null) return false;
+
+      const value = localStorage.getItem(`eval-${cardName}`);
+      return value === null || value === UNKNOWN_EVAL_VALUE;
+    });
+  }
+
   // Resolves true once a fresh value lands under "eval-{cardName}" (the
   // caller must have cleared that key beforehand so a stale value already
   // present can't be mistaken for a freshly recorded one), or false if
-  // stopped/timed out first
+  // stopped/timed out/rate-limited first (the caller tells the latter apart with wasAutomationLimitedSince)
   function waitForCardEvaluation(
     cardName,
     state,
@@ -5252,7 +5377,7 @@ const MY_USERNAME = "xxx";
     return new Promise((resolve) => {
       const start = Date.now();
       const check = () => {
-        if (state.stopped) {
+        if (state.stopped || wasAutomationLimitedSince(start)) {
           resolve(false);
           return;
         }
@@ -5310,19 +5435,58 @@ const MY_USERNAME = "xxx";
     btn.textContent = label;
   }
 
+  function createEvaluationState() {
+    return { stopped: false, pacingMs: 0, limitStreak: 0, successStreak: 0 };
+  }
+
+  const pressEscape = () =>
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    );
+
+  // Sleeps up to `ms`, in slices so the stop button stays responsive; `onTick` gets the remaining milliseconds
+  async function interruptibleSleep(ms, state, onTick) {
+    const end = Date.now() + ms;
+    while (!state.stopped && Date.now() < end) {
+      onTick?.(end - Date.now());
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(250, Math.max(0, end - Date.now()))),
+      );
+    }
+  }
+
+  // Rate limit hit: the pause grows with the number of consecutive hits, and every following card is spaced out
+  // by an increasing pacing delay (which evaluateCollectionCards lets decay again after a streak of successes)
+  async function handleAutomationLimit(button, state) {
+    state.limitStreak++;
+    state.successStreak = 0;
+    state.pacingMs = Math.min(
+      Math.max(state.pacingMs * 2, AUTOMATION_LIMIT_PACING_MIN_MS),
+      AUTOMATION_LIMIT_PACING_MAX_MS,
+    );
+
+    const cooldown = Math.min(
+      AUTOMATION_LIMIT_COOLDOWN_BASE_MS * 2 ** (state.limitStreak - 1),
+      AUTOMATION_LIMIT_COOLDOWN_MAX_MS,
+    );
+    await interruptibleSleep(cooldown, state, (remaining) => {
+      button.textContent = `Limite atteinte, reprise dans ${Math.ceil(remaining / 1000)} s...`;
+    });
+  }
+
   // Feature EBC (cont'd): accepts an optional externally-owned state/stop-button instead of always creating its
   // own — used by the "Estimation en masse" button below to share a single stop button across a whole multi-page
   // run rather than spawning a new one for every page. The two original callers below don't pass one, so their
-  // own behavior is unchanged.
+  // own behavior is unchanged. See the rate limit paragraph above for the "automation_limit" handling.
   async function evaluateCollectionCards(button, cards, sharedState) {
-    const state = sharedState ?? { stopped: false };
+    const state = sharedState ?? createEvaluationState();
     const stopBtn = sharedState ? null : insertStopEvaluationButton(state);
 
     for (let i = 0; i < cards.length; i++) {
       if (state.stopped) break;
 
       const card = cards[i];
-      const cardName = card.querySelector("h3")?.textContent.trim();
+      const cardName = getCardName(card);
       const quickActionBtn = card.querySelector(".wm-quick-action");
       if (!cardName || !quickActionBtn) continue;
 
@@ -5330,30 +5494,74 @@ const MY_USERNAME = "xxx";
       const previousValue = localStorage.getItem(key);
       localStorage.removeItem(key);
 
-      button.textContent = `Évaluation... (${i + 1}/${cards.length})`;
-      quickActionBtn.click();
+      let limitedRetries = 0;
+      let limited = false;
+      let recorded = false;
+      let firstAttempt = true;
 
       // Never moves on before the market estimation lands: a timed-out attempt closes the modal and re-opens it
-      // rather than skipping the card, until a value is recorded or the run is stopped.
-      let recorded = await waitForCardEvaluation(cardName, state);
-      while (!recorded && !state.stopped) {
-        document.dispatchEvent(
-          new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
-        );
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        if (state.stopped) break;
+      // rather than skipping the card, until a value is recorded or the run is stopped. The one exception is a
+      // card the API keeps refusing with "automation_limit": it is flagged and left for later.
+      while (!state.stopped) {
+        button.textContent = `Évaluation... (${i + 1}/${cards.length})`;
+        const attemptStart = Date.now();
         quickActionBtn.click();
-        recorded = await waitForCardEvaluation(cardName, state, 20000);
+        recorded = await waitForCardEvaluation(
+          cardName,
+          state,
+          firstAttempt ? 8000 : 20000,
+        );
+        firstAttempt = false;
+        if (state.stopped) break;
+
+        if (wasAutomationLimitedSince(attemptStart)) {
+          // Whatever the modal recorded meanwhile is not a real estimate
+          localStorage.removeItem(key);
+          recorded = false;
+          pressEscape();
+
+          if (limitedRetries >= AUTOMATION_LIMIT_MAX_RETRIES) {
+            limited = true;
+            await handleAutomationLimit(button, state);
+            break;
+          }
+          limitedRetries++;
+          await handleAutomationLimit(button, state);
+          continue;
+        }
+
+        if (recorded) break;
+
+        pressEscape();
+        await new Promise((resolve) => setTimeout(resolve, 500));
       }
-      if (!recorded && previousValue !== null) {
+
+      if (recorded) {
+        state.limitStreak = 0;
+        state.successStreak++;
+        if (
+          state.pacingMs > 0 &&
+          state.successStreak % AUTOMATION_LIMIT_PACING_DECAY_EVERY === 0
+        ) {
+          state.pacingMs *= 0.75;
+          if (state.pacingMs < 500) state.pacingMs = 0;
+        }
+        clearCardLimited(cardName);
+      } else if (previousValue !== null) {
         localStorage.setItem(key, previousValue);
       }
 
-      document.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
-      );
+      if (limited && (previousValue === null || previousValue === UNKNOWN_EVAL_VALUE)) {
+        markCardLimited(cardName);
+      }
+
+      pressEscape();
 
       if (state.stopped) break;
+
+      if (state.pacingMs > 0) {
+        await interruptibleSleep(state.pacingMs, state);
+      }
     }
 
     stopBtn?.remove();
@@ -5366,6 +5574,28 @@ const MY_USERNAME = "xxx";
     button.disabled = false;
     otherButton.disabled = false;
     updateEvaluateUnratedButtonLabel(button);
+  }
+
+  function updateRetryLimitedButtonLabel(btn) {
+    if (!btn || btn.disabled) return;
+
+    const cards = getLimitedCollectionCards();
+    const count = cards?.length ?? 0;
+
+    // Nothing flagged on this page — no point offering the button at all.
+    btn.style.display = count === 0 ? "none" : "";
+
+    const label = `Réessayer les cartes limitées (${count})`;
+    if (btn.textContent !== label) btn.textContent = label;
+  }
+
+  // Re-evaluates the page's cards flagged by the API's rate limit, whatever the age of their flag
+  async function evaluateLimitedCollectionCards(button) {
+    const cards = getLimitedCollectionCards() ?? [];
+    await evaluateCollectionCards(button, cards);
+
+    button.disabled = false;
+    updateRetryLimitedButtonLabel(button);
   }
 
   async function reevaluateAllCollectionCards(button, otherButton) {
@@ -5430,7 +5660,7 @@ const MY_USERNAME = "xxx";
   }
 
   async function evaluateAllCollectionPages(button, otherButtons) {
-    const state = { stopped: false };
+    const state = createEvaluationState();
     const stopBtn = insertStopEvaluationButton(state);
 
     let page = 1;
@@ -5466,7 +5696,7 @@ const MY_USERNAME = "xxx";
   }
 
   // Reads a card's raw eval value straight from localStorage (not its
-  // formatted rarity-tag appendix, which loses precision to "💩"/"X K"),
+  // formatted rarity-tag appendix, which loses precision to "X K"),
   // returning null when it's missing or the "?" unknown marker
   function getCardEvalValueByName(cardName) {
     const raw = localStorage.getItem(`eval-${cardName}`);
@@ -5560,6 +5790,14 @@ const MY_USERNAME = "xxx";
         : "wm-eval-sort";
       sortBtn.textContent = "Ordonner la page par prix";
 
+      const retryLimitedBtn = document.createElement("button");
+      retryLimitedBtn.type = "button";
+      retryLimitedBtn.className = baseClass
+        ? `${baseClass} wm-eval-retry-limited`
+        : "wm-eval-retry-limited";
+      retryLimitedBtn.title =
+        "Cartes dont l'estimation a été refusée par la limite de requêtes du site (automation_limit)";
+
       const massBtn = document.createElement("button");
       massBtn.type = "button";
       massBtn.className = "ml-auto wm-eval-mass";
@@ -5570,8 +5808,10 @@ const MY_USERNAME = "xxx";
         reevaluateBtn.disabled = true;
         unratedBtn.disabled = true;
         massBtn.disabled = true;
+        retryLimitedBtn.disabled = true;
         reevaluateAllCollectionCards(reevaluateBtn, unratedBtn).then(() => {
           massBtn.disabled = false;
+          retryLimitedBtn.disabled = false;
         });
       });
 
@@ -5580,8 +5820,23 @@ const MY_USERNAME = "xxx";
         unratedBtn.disabled = true;
         reevaluateBtn.disabled = true;
         massBtn.disabled = true;
+        retryLimitedBtn.disabled = true;
         evaluateUnratedCollectionCards(unratedBtn, reevaluateBtn).then(() => {
           massBtn.disabled = false;
+          retryLimitedBtn.disabled = false;
+        });
+      });
+
+      retryLimitedBtn.addEventListener("click", () => {
+        if (retryLimitedBtn.disabled) return;
+        retryLimitedBtn.disabled = true;
+        unratedBtn.disabled = true;
+        reevaluateBtn.disabled = true;
+        massBtn.disabled = true;
+        evaluateLimitedCollectionCards(retryLimitedBtn).then(() => {
+          massBtn.disabled = false;
+          unratedBtn.disabled = false;
+          reevaluateBtn.disabled = false;
         });
       });
 
@@ -5594,16 +5849,25 @@ const MY_USERNAME = "xxx";
         massBtn.disabled = true;
         reevaluateBtn.disabled = true;
         unratedBtn.disabled = true;
-        evaluateAllCollectionPages(massBtn, [reevaluateBtn, unratedBtn]);
+        retryLimitedBtn.disabled = true;
+        evaluateAllCollectionPages(massBtn, [
+          reevaluateBtn,
+          unratedBtn,
+          retryLimitedBtn,
+        ]);
       });
 
       filterBar.appendChild(massBtn);
       filterBar.appendChild(reevaluateBtn);
       filterBar.appendChild(unratedBtn);
       filterBar.appendChild(sortBtn);
+      filterBar.appendChild(retryLimitedBtn);
     }
 
     updateEvaluateUnratedButtonLabel(unratedBtn);
+    updateRetryLimitedButtonLabel(
+      filterBar.querySelector(":scope > .wm-eval-retry-limited"),
+    );
     updateMassButtonLabel(filterBar.querySelector(":scope > .wm-eval-mass"));
 
     // The site's own rarity filter buttons (button.px-3.py-1.transition-colors) can be (re)inserted after ours —
@@ -9462,6 +9726,7 @@ const MY_USERNAME = "xxx";
     }
     run("rule-19", watchNotificationRewrites);
     run("feature-ebc", watchEvaluateUnratedButton);
+    run("feature-ebc", watchAutomationLimit);
     run("rule-20", watchCardModalListScroll);
     run("feature-gcp", watchGlobalCollectionFriendProfileLinks);
     run("rule-21", watchCardModalLegalMentions);
