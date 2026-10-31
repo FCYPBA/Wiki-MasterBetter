@@ -3504,18 +3504,13 @@ const MY_USERNAME = "xxx";
   // ============================================================
   // Feature ETS (cont'd): on /collection, whenever the cards grid (div.gap-3.justify-center) changes, append each
   // card's cached eval price (Feature ETS, keyed "eval-{name}") to its rarity tag (div.top-2.left-2), as
-  // "{rarity} ({eval})". The eval value is reformatted first: below 15, it's replaced outright with "💩"; above
-  // 1000, it's abbreviated to "{X,X} K" (French decimal comma); otherwise it's shown as stored, including the "?"
-  // placeholder for a card with no recorded sales.
+  // "{rarity} ({eval})". The eval value is reformatted first: above 1000,
+  // it's abbreviated to "{X,X} K" (French decimal comma); otherwise it's shown as stored — low values included —
+  // as well as the "?" placeholder for a card with no recorded sales.
   // ============================================================
-  const WORTHLESS_THRESHOLD = 10;
   function formatEvalValue(rawValue) {
     const num = parseFloat(rawValue.replace(/\s/g, "").replace(",", "."));
     if (Number.isNaN(num)) return rawValue;
-
-    if (num < WORTHLESS_THRESHOLD) {
-      return "💩";
-    }
 
     if (num > 1000) {
       return `${(num / 1000).toFixed(1).replace(".", ",")} K`;
@@ -5701,7 +5696,7 @@ const MY_USERNAME = "xxx";
   }
 
   // Reads a card's raw eval value straight from localStorage (not its
-  // formatted rarity-tag appendix, which loses precision to "💩"/"X K"),
+  // formatted rarity-tag appendix, which loses precision to "X K"),
   // returning null when it's missing or the "?" unknown marker
   function getCardEvalValueByName(cardName) {
     const raw = localStorage.getItem(`eval-${cardName}`);
