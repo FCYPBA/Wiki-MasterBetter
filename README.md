@@ -75,11 +75,16 @@ Je ne liste que celles qui change quelque chose de significatif pour l'utilisate
 - **Effacer la recherche** : Un bouton ✕ dans le champ de recherche de la collection vide son contenu
 - **Modale d'étiquetage en masse retravaillée** : La modale d'application/retrait d'étiquette est plus large et affiche ses étiquettes en grille au lieu d'une colonne étroite ; la modale de retrait trie les filtres par ordre décroissant
 - **Gestion des étiquettes plus spacieuse** : La modale « Gérer les étiquettes » occupe jusqu'à 90 % de la largeur de l'écran, pour lire et modifier sans peine les noms d'étiquettes très longs
+- **Étiquetage en masse par termes de recherche** : Dans « Gérer les étiquettes », chaque étiquette accepte des termes de recherche séparés par des virgules (exportables/importables en JSON). Le bouton « Étiquetage en masse 🏷️ » de la collection ouvre une modale pour choisir les étiquettes à traiter et leur ordre (par glisser-déposer, c'est lui qui départage une carte correspondant à plusieurs étiquettes), puis recherche chaque terme et étiquette les cartes qui n'en ont pas encore ; un panneau récapitulatif liste à la fin les cartes étiquetées
+  - ⚠️ Comme pour l'évaluation en masse, gardez l'onglet actif et la fenêtre non réduite pendant toute l'opération
+- **Panneau « Estimations »** : Sur `/collection`, un onglet collé au menu de gauche ouvre un panneau coulissant qui liste toutes les cartes estimées, de la plus chère à la moins chère (100 par page), avec leur rareté colorée. Des boutons L, UR, SR, R, PC, C filtrent par rareté, la loupe d'une ligne lance la recherche de la carte dans la collection et la corbeille la retire du cache (avec un bouton « Annuler »)
+- **Copier une carte en image** : Au survol d'une carte, un bouton 📷 la copie dans le presse-papiers sous forme d'image (illustration, texte, statistiques), prête à être collée dans une conversation
 
 ### 🔄 Échanges
 
 - **Historique en deux colonnes** : L'onglet « Historique » s'affiche en deux colonnes flexibles qui s'adaptent à la hauteur de chaque échange, plutôt qu'une seule liste
 - **Filtrer par partenaire** : Un champ de recherche au-dessus de l'historique filtre les échanges par nom de partenaire
+- **Total estimé d'un échange reçu** : Dans l'onglet « Reçues », chaque côté d'un échange affiche la somme des estimations de ses cartes, leur nombre et combien n'ont pas d'estimation
 
 ### 💰 Marché & Enchères
 
@@ -97,6 +102,10 @@ Je ne liste que celles qui change quelque chose de significatif pour l'utilisate
   - Un bouton Exporter/Importer permet de télécharger ce cache (prix de vente, estimations et joueurs suivis) en fichier CSV, puis de le recharger sur un autre navigateur ou appareil
 - **Mes plus grosses ventes et achats** : Les 40 plus grosses ventes et les 40 plus gros achats sont mémorisés (depuis les pages d'enchère et les onglets « Historique » et « Gagnées » du marché) ; deux boutons sur votre profil les listent dans une modale, la première mise en avant par une lueur dorée, un ✕ retire une entrée du cache
 - **Cartes possédées estompées** : Sur le marché et dans la collection globale, les cartes que vous possédez déjà s'affichent en faible visibilité pour ne pas distraire le regard ; elles reprennent leur pleine opacité au survol
+- **Archive des enchères en direct** : Un bouton 📦 en haut du menu de gauche ouvre une modale où saisir des termes de recherche (ex. : avion, bateau). Toutes les 5 minutes, les enchères correspondantes sont archivées dans le navigateur (IndexedDB, un identifiant = une seule entrée), puis, une fois terminées, leur résultat est relevé : prix final, nombre d'enchères et d'enchérisseurs différents, avec le nom et la rareté de la carte et le prix de départ. La modale affiche l'avancement et permet de lancer un passage immédiat, d'exporter l'archive en CSV ou JSON, ou de la vider
+  - ⚠️ Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois) ; rien n'est collecté navigateur fermé, ni si le navigateur met l'onglet en veille pour économiser la mémoire
+  - Les requêtes sont espacées et la collecte se met en pause quand le site limite le débit (limite de requêtes)
+  - Vider les données du site dans le navigateur supprime l'archive : pensez à l'exporter
 
 ### 📦 Catalogue
 
@@ -119,7 +128,7 @@ Je ne liste que celles qui change quelque chose de significatif pour l'utilisate
 
 1. Naviguez sur [wiki-masters.com](https://www.wiki-masters.com) comme d'habitude — chaque ajustement s'applique automatiquement
 2. La permission de notifications peut être demandée pour les fonctionnalités de notification push (paquets qui s'accumulent, enchère bientôt expirée)
-3. Certaines données (préférence de navbar repliée, regroupement des enchères, suivi des prix de vente) persistent d'une visite à l'autre via le stockage de Tampermonkey et `localStorage`
+3. Certaines données (préférence de navbar repliée, regroupement des enchères, suivi des prix de vente) persistent d'une visite à l'autre via le stockage de Tampermonkey, `localStorage` et, pour l'archive des enchères, `IndexedDB`
 4. Remplacez la valeur de `MY_USERNAME` dans le script par votre pseudo WikiMasters pour activer toutes les fonctionnalités liées aux ventes
 
 ---
