@@ -4317,7 +4317,7 @@ const MY_USERNAME = "xxx";
     },
     {
       title: "Archiver des enchères en direct",
-      text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau) : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON.",
+      text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau) : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée, avec le détail des mises. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON ; « Compacter » supprime le détail des mises des enchères de plus de 30 jours pour gagner de la place.",
     },
   ];
 
@@ -10320,11 +10320,27 @@ const MY_USERNAME = "xxx";
   // Storage: IndexedDB ("wmb-auction-archive", store "auctions", keyPath = the auction's UUID, so an auction is
   // only ever stored once, whatever the number of passes or terms that find it). localStorage is far too small
   // for this (about 5 MB) and GM_setValue rewrites a whole value at each change. Each record holds: id, terms
-  // (every term that found it), cardId, cardName (the card's wikipedia_title), rarity, startPrice (the
-  // listing's base amount), baseAmount, createdAt, endAt, firstSeenAt/lastSeenAt, state ("open" while its
-  // outcome is unknown, "done" once it is), nextCheckAt, checks, status (the API's: "active",
-  // "settled_sold"... or the script's own "unresolved" / "not_found"), finalPrice, bidCount, bidderCount,
-  // settledAt, resolvedAt. bidCount/bidderCount are read from the "bids" array of the auction's own API answer.
+  // (every term that found it), cardId, cardName (the card's wikipedia_title), rarity, isShiny, lang, atk, def,
+  // qScore, pageviews, sellerId/sellerName, startPrice (the listing's base amount), baseAmount, createdAt, endAt,
+  // firstSeenAt/lastSeenAt, state ("open" while its outcome is unknown, "done" once it is), nextCheckAt, checks,
+  // status (the API's: "active", "settled_sold"... or the script's own "unresolved" / "not_found"), and, once
+  // over: finalPrice, winnerId/winnerName, settledAt, resolvedAt, bidCount, bidderCount, firstBidAt, lastBidAt,
+  // bidders (the distinct bidders, [id, username]) and bids (every bid, oldest first, as [amount, index in
+  // bidders, time in ms]) — enough to study sniping, bidding wars or who bids on what. All of it comes from the
+  // auction's own API answer. "rich" says how complete a record is: 0 = result still to fetch, 1 = full, 2 =
+  // nothing more to get (compacted, or no result to fetch). It is indexed, as is "state".
+  //
+  // Size: a record weighs about 1.2 KB with its bids (mostly UUIDs and ISO dates), about 0.6 KB once compacted,
+  // so 4000 auctions a day amount to roughly 1.7 GB a year (0.9 compacted). Chrome allows an origin up to ~60%
+  // of the disk, Firefox less: the modal shows the space the site uses so it can be watched. The archive asks
+  // the browser for persistent storage (navigator.storage.persist) when terms are saved, so it isn't evicted when
+  // the disk runs low. "Compacter" (manual, irreversible, confirmed) drops the bids/bidders lists of the
+  // auctions resolved more than AAR_COMPACT_DAYS ago (and the bookkeeping fields, AAR_COMPACT_DROPPED_FIELDS)
+  // and keeps every aggregate. Exports read the store page by
+  // page (AAR_EXPORT_CHUNK) and assemble the file as a Blob, so they don't need the whole archive in memory.
+  // Database version 2 added the richer fields and the "rich" index: the records of version 1 are flagged 0 on
+  // upgrade, and aarBackfill re-fetches them in the background, newest first, AAR_BACKFILL_PER_TICK per pass,
+  // after the regular resolutions.
   //
   // Collection, in a loop that only ever runs in ONE tab (a Web Lock, "wmb-auction-archive-crawler": the other
   // tabs queue on it and take over when the leader tab closes). It needs a wiki-masters.com tab left open: a
@@ -10367,6 +10383,18 @@ const MY_USERNAME = "xxx";
   const AAR_RETRY_MAX_MS = 30 * 60 * 1000;
   const AAR_COOLDOWN_BASE_MS = 60 * 1000;
   const AAR_COOLDOWN_MAX_MS = 10 * 60 * 1000;
+  const AAR_DB_VERSION = 2;
+  const AAR_BACKFILL_PER_TICK = 60;
+  const AAR_COMPACT_DAYS = 30;
+  const AAR_EXPORT_CHUNK = 2000;
+  const AAR_COMPACT_DROPPED_FIELDS = [
+    "nextCheckAt",
+    "checks",
+    "lastSeenAt",
+    "baseAmount",
+    "sellerId",
+    "winnerId",
+  ];
 
   class AarRateLimitError extends Error {}
   class AarHttpError extends Error {
@@ -10463,12 +10491,30 @@ const MY_USERNAME = "xxx";
   function aarOpenDb() {
     if (!aarDbPromise) {
       aarDbPromise = new Promise((resolve, reject) => {
-        const request = indexedDB.open(AAR_DB_NAME, 1);
-        request.onupgradeneeded = () => {
-          const store = request.result.createObjectStore(AAR_STORE, {
-            keyPath: "id",
-          });
-          store.createIndex("state", "state");
+        const request = indexedDB.open(AAR_DB_NAME, AAR_DB_VERSION);
+        request.onupgradeneeded = (event) => {
+          let store;
+          if (event.oldVersion < 1) {
+            store = request.result.createObjectStore(AAR_STORE, {
+              keyPath: "id",
+            });
+            store.createIndex("state", "state");
+          } else {
+            store = request.transaction.objectStore(AAR_STORE);
+          }
+          if (event.oldVersion < 2) {
+            // "rich" tells how complete a record is: 0 = detail still to fetch, 1 = full (bids included),
+            // 2 = nothing more to get (compacted, or no result to fetch). Version 1 records only hold
+            // aggregates, so they all start at 0 and get completed in the background.
+            store.createIndex("rich", "rich");
+            const cursorRequest = store.openCursor();
+            cursorRequest.onsuccess = () => {
+              const cursor = cursorRequest.result;
+              if (!cursor) return;
+              cursor.update({ ...cursor.value, rich: 0 });
+              cursor.continue();
+            };
+          }
         };
         request.onsuccess = () => {
           const db = request.result;
@@ -10531,31 +10577,66 @@ const MY_USERNAME = "xxx";
 
   function aarCounts() {
     return aarRun("readonly", (store, out) => {
-      const counts = { total: 0, open: 0 };
+      const counts = { total: 0, open: 0, toComplete: 0 };
       const total = store.count();
       total.onsuccess = () => {
         counts.total = total.result;
         const open = store.index("state").count("open");
         open.onsuccess = () => {
           counts.open = open.result;
-          out(counts);
+          // Every open record is still rich 0: what remains are finished auctions to complete
+          const unrich = store.index("rich").count(0);
+          unrich.onsuccess = () => {
+            counts.toComplete = Math.max(0, unrich.result - counts.open);
+            out(counts);
+          };
         };
       };
     });
   }
 
-  function aarMapAll(map) {
-    return aarRun("readonly", (store, out) => {
-      const rows = [];
-      const request = store.openCursor();
+  // Reads the whole store by pages of AAR_EXPORT_CHUNK records, in separate transactions, so a very large
+  // archive never has to sit in memory at once
+  async function aarForEachPage(onPage) {
+    let lastKey = null;
+    for (;;) {
+      const page = await aarRun("readonly", (store, out) => {
+        const range =
+          lastKey === null ? null : IDBKeyRange.lowerBound(lastKey, true);
+        const request = store.getAll(range, AAR_EXPORT_CHUNK);
+        request.onsuccess = () => out(request.result);
+      });
+      if (page.length === 0) return;
+      await onPage(page);
+      if (page.length < AAR_EXPORT_CHUNK) return;
+      lastKey = page[page.length - 1].id;
+    }
+  }
+
+  // Drops the list of bids of the finished auctions resolved more than AAR_COMPACT_DAYS ago, keeping every
+  // aggregate (prices, bid and bidder counts, first/last bid time, seller, winner...)
+  function aarCompact() {
+    const limit = Date.now() - AAR_COMPACT_DAYS * 24 * 60 * 60 * 1000;
+    return aarRun("readwrite", (store, out) => {
+      let compacted = 0;
+      const request = store.index("rich").openCursor(IDBKeyRange.only(1));
       request.onsuccess = () => {
         const cursor = request.result;
-        if (cursor) {
-          rows.push(map(cursor.value));
-          cursor.continue();
-        } else {
-          out(rows);
+        if (!cursor) {
+          out(compacted);
+          return;
         }
+        const record = cursor.value;
+        if (record.state === "done" && (record.resolvedAt ?? 0) < limit) {
+          record.bids = null;
+          record.bidders = null;
+          record.rich = 2;
+          // Bookkeeping and ids that the names already stand for
+          AAR_COMPACT_DROPPED_FIELDS.forEach((field) => delete record[field]);
+          cursor.update(record);
+          compacted++;
+        }
+        cursor.continue();
       };
     });
   }
@@ -10601,6 +10682,14 @@ const MY_USERNAME = "xxx";
       cardId: item.card_id ?? null,
       cardName: item.card?.wikipedia_title ?? null,
       rarity: item.snapshot_rarity ?? item.card?.rarity ?? null,
+      isShiny: item.is_shiny ?? item.card?.is_shiny ?? false,
+      lang: item.card?.lang ?? null,
+      atk: item.snapshot_atk ?? item.card?.atk ?? null,
+      def: item.snapshot_def ?? item.card?.def ?? null,
+      qScore: item.card?.q_score ?? null,
+      pageviews: item.card?.pageviews ?? null,
+      sellerId: item.seller_id ?? null,
+      sellerName: item.seller?.username ?? null,
       startPrice: item.listing_base_amount ?? item.base_amount ?? null,
       baseAmount: item.base_amount ?? null,
       createdAt: item.created_at ?? null,
@@ -10613,8 +10702,15 @@ const MY_USERNAME = "xxx";
       finalPrice: null,
       bidCount: null,
       bidderCount: null,
+      bids: null,
+      bidders: null,
+      firstBidAt: null,
+      lastBidAt: null,
+      winnerId: null,
+      winnerName: null,
       settledAt: null,
       resolvedAt: null,
+      rich: 0,
     };
   }
 
@@ -10658,6 +10754,49 @@ const MY_USERNAME = "xxx";
     }
   }
 
+  // Fills a record from the detail answer of a finished auction. bids is stored compactly, oldest first, as
+  // [amount, index in bidders, time (ms)]; bidders is the list of [id, username] of the distinct bidders
+  function aarApplyResult(record, data) {
+    const auction = data.auction;
+    const bids = (Array.isArray(data.bids) ? data.bids : [])
+      .map((bid) => ({ ...bid, at: aarParseTime(bid.placed_at) }))
+      .sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+
+    const bidderIndex = new Map();
+    const bidders = [];
+    record.bids = bids.map((bid) => {
+      if (!bidderIndex.has(bid.bidder_id)) {
+        bidderIndex.set(bid.bidder_id, bidders.length);
+        bidders.push([bid.bidder_id, bid.bidder?.username ?? null]);
+      }
+      return [bid.amount, bidderIndex.get(bid.bidder_id), bid.at];
+    });
+    record.bidders = bidders;
+    record.bidCount = bids.length;
+    record.bidderCount = bidders.length;
+    record.firstBidAt = bids[0]?.at ?? null;
+    record.lastBidAt = bids[bids.length - 1]?.at ?? null;
+
+    record.startPrice =
+      auction.listing_base_amount ?? auction.base_amount ?? record.startPrice;
+    record.baseAmount = auction.base_amount ?? record.baseAmount;
+    record.cardName = auction.card?.wikipedia_title ?? record.cardName;
+    record.rarity = auction.snapshot_rarity ?? record.rarity;
+    record.isShiny = auction.is_shiny ?? record.isShiny ?? false;
+    record.lang = auction.card?.lang ?? record.lang ?? null;
+    record.atk = auction.snapshot_atk ?? record.atk ?? null;
+    record.def = auction.snapshot_def ?? record.def ?? null;
+    record.qScore = auction.card?.q_score ?? record.qScore ?? null;
+    record.pageviews = auction.card?.pageviews ?? record.pageviews ?? null;
+    record.sellerId = auction.seller_id ?? record.sellerId ?? null;
+    record.sellerName = auction.seller?.username ?? record.sellerName ?? null;
+    record.winnerId = auction.winner_id ?? null;
+    record.winnerName = auction.winner?.username ?? null;
+    record.finalPrice = auction.final_price ?? null;
+    record.settledAt = auction.settled_at ?? null;
+    record.rich = 1;
+  }
+
   async function aarResolveOne(record) {
     let data;
     try {
@@ -10670,6 +10809,7 @@ const MY_USERNAME = "xxx";
         record.state = "done";
         record.status = "not_found";
         record.resolvedAt = Date.now();
+        record.rich = 2;
       } else {
         record.nextCheckAt = Date.now() + AAR_RETRY_BASE_MS * record.checks;
       }
@@ -10680,7 +10820,6 @@ const MY_USERNAME = "xxx";
     const auction = data?.auction;
     if (!auction) throw new AarHttpError("unexpected answer");
 
-    const bids = Array.isArray(data.bids) ? data.bids : [];
     const now = Date.now();
     record.status = auction.status ?? record.status;
     record.endAt = auction.end_at ?? record.endAt;
@@ -10696,6 +10835,7 @@ const MY_USERNAME = "xxx";
           record.state = "done";
           record.status = "unresolved";
           record.resolvedAt = now;
+          record.rich = 2;
         } else {
           record.nextCheckAt =
             now +
@@ -10704,18 +10844,45 @@ const MY_USERNAME = "xxx";
       }
     } else {
       record.state = "done";
-      record.startPrice =
-        auction.listing_base_amount ?? auction.base_amount ?? record.startPrice;
-      record.baseAmount = auction.base_amount ?? record.baseAmount;
-      record.cardName = auction.card?.wikipedia_title ?? record.cardName;
-      record.rarity = auction.snapshot_rarity ?? record.rarity;
-      record.finalPrice = auction.final_price ?? null;
-      record.bidCount = bids.length;
-      record.bidderCount = new Set(bids.map((bid) => bid.bidder_id)).size;
-      record.settledAt = auction.settled_at ?? null;
+      aarApplyResult(record, data);
       record.resolvedAt = now;
     }
     await aarPutMany([record]);
+  }
+
+  // Completes the records archived before the bid details were kept (rich 0, finished), newest first and a few
+  // per pass. The auction's own page is still served after its end, so nothing is lost by waiting.
+  async function aarBackfill(deadline) {
+    const candidates = (
+      await aarRun("readonly", (store, out) => {
+        const request = store.index("rich").getAll(0);
+        request.onsuccess = () => out(request.result);
+      })
+    )
+      .filter((record) => record.state === "done")
+      .sort((a, b) => (b.resolvedAt ?? 0) - (a.resolvedAt ?? 0))
+      .slice(0, AAR_BACKFILL_PER_TICK);
+
+    for (const record of candidates) {
+      if (Date.now() > deadline) break;
+
+      let data = null;
+      try {
+        data = await aarFetchJson(`/api/marketplace/${record.id}`);
+      } catch (error) {
+        if (!(error instanceof AarHttpError) || error.status !== 404) {
+          throw error;
+        }
+      }
+
+      if (data?.auction && data.auction.status !== "active") {
+        aarApplyResult(record, data);
+      } else {
+        record.rich = 2;
+      }
+      await aarPutMany([record]);
+      await aarSleep(AAR_REQUEST_PACING_MS);
+    }
   }
 
   async function aarResolveDue(deadline) {
@@ -10730,6 +10897,7 @@ const MY_USERNAME = "xxx";
       await aarResolveOne(record);
       await aarSleep(AAR_REQUEST_PACING_MS);
     }
+    await aarBackfill(deadline);
   }
 
   // One pass: discovery then resolution. Never throws; resolves with the delay before the next pass
@@ -10790,22 +10958,52 @@ const MY_USERNAME = "xxx";
   }
 
   // ---- Export ----
+  // The CSV is the flat view for a spreadsheet; the JSON is the whole record, bids included
   const AAR_EXPORT_COLUMNS = [
     "id",
     "terms",
     "cardName",
     "rarity",
+    "isShiny",
+    "atk",
+    "def",
+    "qScore",
+    "pageviews",
     "startPrice",
     "finalPrice",
     "bidCount",
     "bidderCount",
+    "firstBidAt",
+    "lastBidAt",
+    "lastBidSecondsBeforeEnd",
     "status",
+    "createdAt",
     "endAt",
     "settledAt",
+    "sellerName",
+    "winnerName",
   ];
 
-  function aarDownload(text, filename, type) {
-    const blob = new Blob([text], { type });
+  function aarCsvValue(record, column) {
+    switch (column) {
+      case "terms":
+        return record.terms.join(" | ");
+      case "firstBidAt":
+      case "lastBidAt":
+        return record[column] ? new Date(record[column]).toISOString() : "";
+      case "lastBidSecondsBeforeEnd": {
+        const end = aarParseTime(record.endAt);
+        return record.lastBidAt && end !== null
+          ? Math.round((end - record.lastBidAt) / 1000)
+          : "";
+      }
+      default:
+        return record[column] ?? "";
+    }
+  }
+
+  function aarDownload(content, filename, type) {
+    const blob = new Blob([content], { type });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -10818,56 +11016,74 @@ const MY_USERNAME = "xxx";
 
   async function exportAuctionArchive(format) {
     const day = new Date().toISOString().slice(0, 10);
-    const rows = await aarMapAll((record) => record);
+    const isJson = format === "json";
 
-    if (format === "json") {
-      aarDownload(
-        JSON.stringify(rows, null, 1),
-        `wmb-archive-encheres-${day}.json`,
-        "application/json;charset=utf-8",
-      );
-    } else {
-      const lines = rows.map((record) =>
-        AAR_EXPORT_COLUMNS.map((column) =>
-          csvEscapeField(
-            column === "terms"
-              ? record.terms.join(" | ")
-              : (record[column] ?? ""),
-          ),
-        ).join(","),
-      );
-      aarDownload(
-        // The BOM makes spreadsheets read accented card names as UTF-8
-        `﻿${[AAR_EXPORT_COLUMNS.join(","), ...lines].join("\r\n")}`,
-        `wmb-archive-encheres-${day}.csv`,
-        "text/csv;charset=utf-8",
-      );
-    }
+    // The file is assembled page by page as a Blob (the browser may keep it on disk), never as one huge string.
+    // The CSV's BOM makes spreadsheets read accented card names as UTF-8.
+    let blob = new Blob([
+      isJson ? "[\n" : `\uFEFF${AAR_EXPORT_COLUMNS.join(",")}\r\n`,
+    ]);
+    let count = 0;
+    await aarForEachPage((page) => {
+      const text = page
+        .map((record) => {
+          if (isJson) return `${count++ ? ",\n" : ""}${JSON.stringify(record)}`;
+          count++;
+          return `${AAR_EXPORT_COLUMNS.map((column) =>
+            csvEscapeField(aarCsvValue(record, column)),
+          ).join(",")}\r\n`;
+        })
+        .join("");
+      blob = new Blob([blob, text]);
+    });
+    if (isJson) blob = new Blob([blob, "\n]\n"]);
+
+    aarDownload(
+      blob,
+      `wmb-archive-encheres-${day}.${isJson ? "json" : "csv"}`,
+      isJson ? "application/json;charset=utf-8" : "text/csv;charset=utf-8",
+    );
 
     GM_notification({
       title: "Wiki-Masters",
-      text: `${rows.length} enchère(s) exportée(s).`,
+      text: `${count} enchère(s) exportée(s).`,
       timeout: 4000,
     });
   }
 
   // ---- UI ----
+  function aarFormatBytes(bytes) {
+    if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} Go`;
+    return `${Math.max(1, Math.round(bytes / 1024 ** 2))} Mo`;
+  }
+
   function aarFormatTime(timestamp) {
     return timestamp ? new Date(timestamp).toLocaleTimeString("fr-FR") : "—";
   }
 
   async function aarRenderStatus(box, termsInput) {
     const status = aarReadStatus();
-    let counts = { total: 0, open: 0 };
+    let counts = { total: 0, open: 0, toComplete: 0 };
     try {
       counts = await aarCounts();
     } catch (error) {
       console.error("[WMB-AAR]", error);
     }
+    const storage = await navigator.storage?.estimate?.().catch(() => null);
 
     const lines = [
       `Enchères archivées : ${counts.total} (${counts.open} en attente de résultat, ${counts.total - counts.open} terminées)`,
     ];
+    if (counts.toComplete > 0) {
+      lines.push(
+        `Anciennes enchères dont le détail des mises reste à récupérer : ${counts.toComplete} (en arrière-plan, ${AAR_BACKFILL_PER_TICK} par passage)`,
+      );
+    }
+    if (storage?.usage) {
+      lines.push(
+        `Espace utilisé par le site dans le navigateur : ${aarFormatBytes(storage.usage)}${storage.quota ? ` sur ${aarFormatBytes(storage.quota)} disponibles` : ""}`,
+      );
+    }
     if (aarReadTerms().length === 0 && !termsInput.value.trim()) {
       lines.push("Aucun terme : saisissez-en un pour démarrer la collecte.");
     }
@@ -10965,6 +11181,8 @@ const MY_USERNAME = "xxx";
         JSON.stringify(aarParseTermsInput(termsInput.value)),
       );
       termsInput.value = aarReadTerms().join(", ");
+      // Asks the browser not to evict the archive when the disk runs low
+      navigator.storage?.persist?.().catch(() => {});
       aarWake();
       refresh();
     };
@@ -10984,6 +11202,22 @@ const MY_USERNAME = "xxx";
       makeButton("Exporter en JSON", () =>
         exportAuctionArchive("json").catch(console.error),
       ),
+      makeButton(`Compacter (> ${AAR_COMPACT_DAYS} j)`, async () => {
+        if (
+          !confirm(
+            `Supprimer la liste détaillée des mises des enchères terminées depuis plus de ${AAR_COMPACT_DAYS} jours ?\nLes prix, nombres de mises et d'enchérisseurs, et dates de première et dernière mise sont conservés.`,
+          )
+        ) {
+          return;
+        }
+        const compacted = await aarCompact();
+        GM_notification({
+          title: "Wiki-Masters",
+          text: `${compacted} enchère(s) compactée(s).`,
+          timeout: 4000,
+        });
+        refresh();
+      }),
       makeButton("Vider l'archive", async () => {
         if (!confirm("Supprimer toute l'archive des enchères ?")) return;
         await aarClear();
