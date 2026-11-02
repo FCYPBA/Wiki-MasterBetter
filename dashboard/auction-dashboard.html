@@ -83,6 +83,26 @@
     background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px;
     box-shadow: 0 8px 28px rgba(0,0,0,.18); display: grid; gap: 10px;
   }
+  details.tpop { position: relative; }
+  details.tpop summary { cursor: pointer; list-style: none; border: 1px solid var(--border); background: var(--surface); border-radius: 999px; padding: 3px 11px; font-size: 13px; }
+  details.tpop summary::after { content: " ▾"; color: var(--muted); }
+  details.tpop[open] summary { border-color: var(--s1); color: var(--s1); }
+  details.tpop[open] .tbox {
+    position: absolute; left: 0; top: 30px; z-index: 6; width: 22rem; max-width: 90vw;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px;
+    box-shadow: 0 8px 28px rgba(0,0,0,.18); display: grid; gap: 8px;
+  }
+  .tbox input[type="search"] { width: 100%; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border); background: transparent; }
+  .tbox .tquick { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tbox .tlist { max-height: 15rem; overflow: auto; display: grid; gap: 1px; }
+  .tbox .trow { display: grid; grid-template-columns: auto 1fr auto auto; gap: 8px; align-items: center; padding: 3px 4px; border-radius: 6px; font-size: 13px; }
+  .tbox .trow:hover { background: var(--wash); }
+  .tbox .trow .n { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .tbox .trow button.only { border: 0; background: none; color: var(--s1); cursor: pointer; font-size: 12px; padding: 0 2px; visibility: hidden; }
+  .tbox .trow:hover button.only, .tbox .trow:focus-within button.only { visibility: visible; }
+  .tbox .tnone { color: var(--muted); font-size: 13px; padding: 4px; }
+  .tbox [hidden], .btn[hidden] { display: none; }
+  .btn.small { padding: 2px 9px; font-size: 12.5px; border-radius: 999px; }
   .pbox label { display: grid; grid-template-columns: 1fr 5rem; gap: 8px; align-items: center; font-size: 13px; }
   .pbox input { width: 100%; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--border); background: transparent; text-align: right; }
 
@@ -1052,6 +1072,62 @@ $("#dlg").addEventListener("close", () => { hideTip(); $("#dlg").__draw = null; 
 /* =====================================================================
    Barre de filtres (une seule ligne, au-dessus de tout)
    ===================================================================== */
+/* Termes : quelques puces en ligne, ou une liste déroulante filtrable quand ils sont nombreux.
+   Dans les deux cas, « Tous les termes » réapparaît dès qu'une sélection partielle est active. */
+const TERMS_INLINE_MAX = 6;
+function termsGroup(group, chip, rerender) {
+  const all = state.terms, total = all.length;
+  const resetBtn = el("button", { class: "btn small", type: "button", text: "↺ Tous les termes", title: "Sélectionner tous les termes" });
+  const sync = () => { resetBtn.hidden = state.activeTerms.size === total; };
+  const setTerms = (next, partial) => { state.activeTerms = new Set(next); if (partial) { partial(); renderAll(); } else rerender(); };
+  const selectAll = () => setTerms(all, state.__refreshTerms);
+  resetBtn.addEventListener("click", selectAll);
+
+  if (total <= TERMS_INLINE_MAX) {
+    state.__refreshTerms = null;
+    sync();
+    return group("Termes", ...all.map((t) => chip(t, state.activeTerms.has(t), () => { state.activeTerms.has(t) ? state.activeTerms.delete(t) : state.activeTerms.add(t); rerender(); })), resetBtn);
+  }
+
+  const summary = el("summary");
+  const search = el("input", { type: "search", placeholder: `Filtrer parmi ${total} termes…`, "aria-label": "Filtrer les termes" });
+  const list = el("div", { class: "tlist" });
+  const rows = all.map((t) => {
+    const cb = el("input", { type: "checkbox" });
+    const only = el("button", { class: "only", type: "button", text: "seul", title: `Ne garder que « ${t} »` });
+    const row = el("label", { class: "trow" }, cb, el("span", { text: t }), el("span", { class: "n", text: fmtInt(state.termCounts.get(t) || 0) }), only);
+    cb.addEventListener("change", () => { cb.checked ? state.activeTerms.add(t) : state.activeTerms.delete(t); refresh(); renderAll(); });
+    only.addEventListener("click", (e) => { e.preventDefault(); state.activeTerms = new Set([t]); refresh(); renderAll(); });
+    return { t, cb, row };
+  });
+  const none = el("div", { class: "tnone", text: "Aucun terme ne correspond." });
+  const refresh = () => {
+    const n = state.activeTerms.size;
+    summary.textContent = n === total ? `Termes : tous (${total})` : n === 0 ? "Termes : aucun" : n <= 2 ? `Termes : ${[...state.activeTerms].join(", ")}` : `Termes : ${n} / ${total}`;
+    rows.forEach((r) => { r.cb.checked = state.activeTerms.has(r.t); });
+    sync();
+  };
+  const filter = () => {
+    const q = search.value.trim().toLowerCase();
+    let shown = 0;
+    rows.forEach((r) => { const ok = !q || r.t.toLowerCase().includes(q); r.row.hidden = !ok; if (ok) shown++; });
+    none.hidden = shown > 0;
+  };
+  search.addEventListener("input", filter);
+  rows.forEach((r) => list.append(r.row));
+  const quick = el("div", { class: "tquick" },
+    el("button", { class: "btn small", type: "button", text: "Tous", onclick: () => { state.activeTerms = new Set(all); refresh(); renderAll(); } }),
+    el("button", { class: "btn small", type: "button", text: "Aucun", onclick: () => { state.activeTerms = new Set(); refresh(); renderAll(); } }),
+    el("button", { class: "btn small", type: "button", text: "Inverser", onclick: () => { state.activeTerms = new Set(all.filter((t) => !state.activeTerms.has(t))); refresh(); renderAll(); } }),
+    el("button", { class: "btn small", type: "button", text: "Filtrés seulement", title: "Ne garder que les termes affichés par le filtre", onclick: () => { state.activeTerms = new Set(rows.filter((r) => !r.row.hidden).map((r) => r.t)); refresh(); renderAll(); } }),
+  );
+  none.hidden = true;
+  const det = el("details", { class: "tpop" }, summary, el("div", { class: "tbox" }, search, quick, list, none));
+  state.__refreshTerms = refresh;
+  refresh();
+  return group(null, det, resetBtn);
+}
+
 function buildFilters() {
   const f = $("#filters");
   f.replaceChildren();
@@ -1060,7 +1136,7 @@ function buildFilters() {
   const chip = (text, on, click) => el("button", { class: "chip", type: "button", "aria-pressed": String(on), text, onclick: click });
 
   f.append(group("Période", ...[["all", "Tout"], ["24h", "24 h"], ["7d", "7 j"], ["30d", "30 j"]].map(([v, t]) => chip(t, state.period === v, () => { state.period = v; rerender(); }))));
-  f.append(group("Termes", ...state.terms.map((t) => chip(t, state.activeTerms.has(t), () => { state.activeTerms.has(t) ? state.activeTerms.delete(t) : state.activeTerms.add(t); rerender(); }))));
+  f.append(termsGroup(group, chip, rerender));
   f.append(group("Rareté", ...RARITIES.map((r) => chip(r, state.rarities.has(r), () => { state.rarities.has(r) ? state.rarities.delete(r) : state.rarities.add(r); rerender(); }))));
   f.append(group("Shiny", ...[["all", "Toutes"], ["no", "Sans"], ["only", "Seulement"]].map(([v, t]) => chip(t, state.shiny === v, () => { state.shiny = v; rerender(); }))));
   f.append(group("Tendances", ...[["auto", "Auto"], ["hour", "Heure"], ["day", "Jour"]].map(([v, t]) => chip(t, state.bucket === v, () => { state.bucket = v; rerender(); }))));
@@ -1088,7 +1164,9 @@ function load(raw, name) {
   if (!Array.isArray(raw)) throw new Error("Le fichier n'est pas un export de l'archive (tableau JSON attendu).");
   state.recs = prepare(raw);
   state.groups = buildGroups(state.recs);
-  state.terms = [...new Set(raw.flatMap((r) => r.terms || []))].sort();
+  state.termCounts = new Map();
+  raw.forEach((r) => (r.terms || []).forEach((t) => state.termCounts.set(t, (state.termCounts.get(t) || 0) + 1)));
+  state.terms = [...state.termCounts.keys()].sort((a, b) => state.termCounts.get(b) - state.termCounts.get(a) || a.localeCompare(b));
   state.activeTerms = new Set(state.terms);
   state.fileName = name;
   const fins = state.recs.filter((r) => r.fin && r.end);
@@ -1133,6 +1211,9 @@ async function restore() {
 
 $("#pick").addEventListener("click", () => $("#file").click());
 $("#file").addEventListener("change", (e) => e.target.files[0] && loadFile(e.target.files[0]));
+/* Les menus déroulants (termes, paramètres) se referment au clic ailleurs ou sur Échap */
+document.addEventListener("click", (e) => document.querySelectorAll("details.tpop[open], details.params[open]").forEach((d) => { if (!d.contains(e.target)) d.open = false; }));
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") document.querySelectorAll("details.tpop[open], details.params[open]").forEach((d) => { d.open = false; }); });
 ["dragenter", "dragover"].forEach((t) => document.addEventListener(t, (e) => { e.preventDefault(); $("#drop").classList.add("over"); }));
 ["dragleave", "drop"].forEach((t) => document.addEventListener(t, (e) => { e.preventDefault(); $("#drop").classList.remove("over"); }));
 document.addEventListener("drop", (e) => { const f = e.dataTransfer?.files?.[0]; if (f) loadFile(f); });
