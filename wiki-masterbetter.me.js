@@ -3888,6 +3888,14 @@ const MY_USERNAME = "xxx";
       id: "feature-evl",
       label: "Panneau « Estimations » : liste de toutes les cartes estimées",
     },
+    {
+      id: "feature-aar",
+      label: "Archive en direct des enchères correspondant à des termes de recherche",
+    },
+    {
+      id: "feature-ach",
+      label: "Historique des prix de la carte (d'après l'archive) sur sa page d'enchère",
+    },
   ];
 
   function readFeatureFlags() {
@@ -4310,6 +4318,14 @@ const MY_USERNAME = "xxx";
     {
       title: "Lister toutes vos estimations",
       text: "Sur la collection, l'onglet « Estimations » collé au menu de gauche ouvre un panneau coulissant listant toutes les cartes estimées, de la plus chère à la moins chère, par pages de 100, avec leur rareté (et sa couleur) quand elle est connue. Les boutons L, UR, SR, R, PC, C en haut du panneau filtrent la liste par rareté. La loupe d'une ligne lance la recherche de cette carte dans la collection, et la corbeille la retire du cache (carte vendue ou échangée), avec un bouton « Annuler » juste après. Estimez votre collection pour remplir la liste.",
+    },
+    {
+      title: "Archiver des enchères en direct",
+      text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau) : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée, avec le détail des mises. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON ; « Compacter » supprime le détail des mises des enchères de plus de 30 jours pour gagner de la place.",
+    },
+    {
+      title: "Historique des prix d'une carte",
+      text: "Sur la page d'une enchère, un bloc « Historique de la carte (archive) » sous le panneau de mise trace les prix des ventes précédentes de la même carte (archivées par la fonctionnalité d'archive des enchères) : un point par vente, une ligne pointillée pour la médiane et, dès 4 ventes, une courbe de tendance lissée. Survolez un point pour voir sa date et son prix. Rien ne s'affiche tant que la carte n'a jamais été archivée.",
     },
   ];
 
@@ -10305,6 +10321,1497 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Feature AAR: live archive of the auctions matching search terms (e.g. "avion"). A "📦" button in the
+  // sidebar's toggle row opens a modal where the terms are set (comma-separated, kept in localStorage under
+  // "wm-auction-archive-terms") and the archive can be exported (CSV / JSON) or emptied.
+  //
+  // Storage: IndexedDB ("wmb-auction-archive", store "auctions", keyPath = the auction's UUID, so an auction is
+  // only ever stored once, whatever the number of passes or terms that find it). localStorage is far too small
+  // for this (about 5 MB) and GM_setValue rewrites a whole value at each change. Each record holds: id, terms
+  // (every term that found it), cardId, cardName (the card's wikipedia_title), rarity, isShiny, lang, atk, def,
+  // qScore, pageviews, sellerId/sellerName, startPrice (the listing's base amount), baseAmount, createdAt, endAt,
+  // firstSeenAt/lastSeenAt, state ("open" while its outcome is unknown, "done" once it is), nextCheckAt, checks,
+  // status (the API's: "active", "settled_sold"... or the script's own "unresolved" / "not_found"), and, once
+  // over: finalPrice, winnerId/winnerName, settledAt, resolvedAt, bidCount, bidderCount, firstBidAt, lastBidAt,
+  // bidders (the distinct bidders, [id, username]) and bids (every bid, oldest first, as [amount, index in
+  // bidders, time in ms]) — enough to study sniping, bidding wars or who bids on what. All of it comes from the
+  // auction's own API answer. "rich" says how complete a record is: 0 = result still to fetch, 1 = full, 2 =
+  // nothing more to get (compacted, or no result to fetch). It is indexed, as is "state".
+  //
+  // Size: a record weighs about 1.2 KB with its bids (mostly UUIDs and ISO dates), about 0.6 KB once compacted,
+  // so 4000 auctions a day amount to roughly 1.7 GB a year (0.9 compacted). Chrome allows an origin up to ~60%
+  // of the disk, Firefox less: the modal shows the space the site uses so it can be watched. The archive asks
+  // the browser for persistent storage (navigator.storage.persist) when terms are saved, so it isn't evicted when
+  // the disk runs low. "Compacter" (manual, irreversible, confirmed) drops the bids/bidders lists of the
+  // auctions resolved more than AAR_COMPACT_DAYS ago (and the bookkeeping fields, AAR_COMPACT_DROPPED_FIELDS)
+  // and keeps every aggregate. Exports read the store page by
+  // page (AAR_EXPORT_CHUNK) and assemble the file as a Blob, so they don't need the whole archive in memory.
+  // Database version 2 added the richer fields and the "rich" index: the records of version 1 are flagged 0 on
+  // upgrade, and aarBackfill re-fetches them in the background, newest first, AAR_BACKFILL_PER_TICK per pass,
+  // after the regular resolutions.
+  //
+  // Collection, in a loop that only ever runs in ONE tab (a Web Lock, "wmb-auction-archive-crawler": the other
+  // tabs queue on it and take over when the leader tab closes). It needs a wiki-masters.com tab left open: a
+  // closed tab, or one the browser discarded to save memory, collects nothing. Every 5 minutes it:
+  //   1. Discovers — for each term, pages through GET /api/marketplace?page=N&limit=50&sort=recent&q={term}
+  //      (newest first) and upserts every auction. It stops at the first page that holds nothing new for that
+  //      term, so a regular pass costs one request per term; the first pass of a new term walks the whole list
+  //      (AAR_MAX_PAGES at most). An auction already known has its end time refreshed (it may be extended).
+  //   2. Resolves — every auction whose end time is past (+ AAR_SETTLE_MARGIN_MS, the site settles a few seconds
+  //      after the end) is fetched once from GET /api/marketplace/{id}: final price, bid and bidder counts are
+  //      stored and the record becomes "done". An auction still "active" after its end is retried with a growing
+  //      delay (AAR_MAX_CHECKS then "unresolved"); one whose end was pushed back is rescheduled; a 404 three times
+  //      in a row becomes "not_found". The resolution phase has a time budget (AAR_RESOLVE_BUDGET_MS) so a long
+  //      backlog (tab closed for a day) never delays the next discovery pass for long.
+  // Requests are spaced by AAR_REQUEST_PACING_MS. On the API's "automation_limit" answer (see Feature EBC) the
+  // whole loop sleeps, 1 min doubling up to 10 min while it keeps happening. The pacing sleeps are always
+  // scheduled right after a network/IndexedDB event rather than chained from another timer, which keeps the
+  // browser's intensive throttling of background tabs (timers limited to once a minute) from stretching them.
+  // The last pass time, next pass time, rate-limit deadline and last error are mirrored in localStorage under
+  // "wm-auction-archive-status" for the modal. A page reload does not restart a pass early: the loop waits for
+  // 5 minutes after the last one started.
+  // ============================================================
+  const AAR_DB_NAME = "wmb-auction-archive";
+  const AAR_STORE = "auctions";
+  const AAR_TERMS_KEY = "wm-auction-archive-terms";
+  const AAR_STATUS_KEY = "wm-auction-archive-status";
+  const AAR_LOCK_NAME = "wmb-auction-archive-crawler";
+  const AAR_CHANNEL_NAME = "wmb-auction-archive";
+  const AAR_TICK_MS = 5 * 60 * 1000;
+  const AAR_IDLE_MS = 60 * 1000;
+  const AAR_MIN_GAP_MS = 30 * 1000;
+  const AAR_PAGE_SIZE = 50;
+  const AAR_MAX_PAGES = 100;
+  const AAR_REQUEST_PACING_MS = 1200;
+  const AAR_SETTLE_MARGIN_MS = 30 * 1000;
+  const AAR_RESOLVE_BUDGET_MS = 3 * 60 * 1000;
+  const AAR_MAX_CHECKS = 12;
+  const AAR_NOT_FOUND_MAX = 3;
+  const AAR_RETRY_BASE_MS = 30 * 1000;
+  const AAR_RETRY_MAX_MS = 30 * 60 * 1000;
+  const AAR_COOLDOWN_BASE_MS = 60 * 1000;
+  const AAR_COOLDOWN_MAX_MS = 10 * 60 * 1000;
+  const AAR_DB_VERSION = 3;
+  const AAR_BACKFILL_PER_TICK = 60;
+  const AAR_COMPACT_DAYS = 30;
+  const AAR_EXPORT_CHUNK = 2000;
+  const AAR_COMPACT_DROPPED_FIELDS = [
+    "nextCheckAt",
+    "checks",
+    "lastSeenAt",
+    "baseAmount",
+    "sellerId",
+    "winnerId",
+  ];
+
+  class AarRateLimitError extends Error {}
+  class AarHttpError extends Error {
+    constructor(status) {
+      super(`HTTP ${status}`);
+      this.status = status;
+    }
+  }
+
+  let aarDbPromise = null;
+  let aarWakeUp = null;
+  let aarRateLimitStreak = 0;
+
+  function aarSleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // Sleeps up to ms, or less if aarWakeUp() is called (terms just saved, "Scanner maintenant")
+  function aarWait(ms) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(done, ms);
+      function done() {
+        clearTimeout(timer);
+        aarWakeUp = null;
+        resolve();
+      }
+      aarWakeUp = done;
+    });
+  }
+
+  // Asks the leader tab (possibly this one) to start a pass now
+  function aarWake() {
+    aarWakeUp?.();
+    try {
+      const channel = new BroadcastChannel(AAR_CHANNEL_NAME);
+      channel.postMessage("wake");
+      channel.close();
+    } catch {
+      // BroadcastChannel unavailable: the next scheduled pass will do
+    }
+  }
+
+  // Dates come with microseconds ("...36.912623+00:00"), which not every engine parses: cut to milliseconds
+  function aarParseTime(iso) {
+    const time = Date.parse(String(iso ?? "").replace(/(\.\d{3})\d+/, "$1"));
+    return Number.isNaN(time) ? null : time;
+  }
+
+  // ---- Terms and status (localStorage) ----
+  function aarReadTerms() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(AAR_TERMS_KEY) ?? "[]");
+      return Array.isArray(parsed)
+        ? parsed.filter((term) => typeof term === "string" && term.trim())
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function aarParseTermsInput(text) {
+    const seen = new Set();
+    return text
+      .split(",")
+      .map((term) => term.trim())
+      .filter((term) => {
+        const key = term.toLowerCase();
+        if (!term || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  }
+
+  function aarReadStatus() {
+    try {
+      return JSON.parse(localStorage.getItem(AAR_STATUS_KEY) ?? "{}") ?? {};
+    } catch {
+      return {};
+    }
+  }
+
+  function aarSetStatus(patch) {
+    try {
+      localStorage.setItem(
+        AAR_STATUS_KEY,
+        JSON.stringify({ ...aarReadStatus(), ...patch }),
+      );
+    } catch {
+      // Status is informative only
+    }
+  }
+
+  // ---- IndexedDB ----
+  function aarOpenDb() {
+    if (!aarDbPromise) {
+      aarDbPromise = new Promise((resolve, reject) => {
+        const request = indexedDB.open(AAR_DB_NAME, AAR_DB_VERSION);
+        request.onupgradeneeded = (event) => {
+          let store;
+          if (event.oldVersion < 1) {
+            store = request.result.createObjectStore(AAR_STORE, {
+              keyPath: "id",
+            });
+            store.createIndex("state", "state");
+          } else {
+            store = request.transaction.objectStore(AAR_STORE);
+          }
+          if (event.oldVersion < 2) {
+            // "rich" tells how complete a record is: 0 = detail still to fetch, 1 = full (bids included),
+            // 2 = nothing more to get (compacted, or no result to fetch). Version 1 records only hold
+            // aggregates, so they all start at 0 and get completed in the background.
+            store.createIndex("rich", "rich");
+            const cursorRequest = store.openCursor();
+            cursorRequest.onsuccess = () => {
+              const cursor = cursorRequest.result;
+              if (!cursor) return;
+              cursor.update({ ...cursor.value, rich: 0 });
+              cursor.continue();
+            };
+          }
+          if (event.oldVersion < 3) {
+            // Feature ACH looks the finished auctions of one card up by name
+            store.createIndex("card", "cardName");
+          }
+        };
+        request.onsuccess = () => {
+          const db = request.result;
+          db.onversionchange = () => {
+            db.close();
+            aarDbPromise = null;
+          };
+          resolve(db);
+        };
+        request.onerror = () => {
+          aarDbPromise = null;
+          reject(request.error);
+        };
+      });
+    }
+    return aarDbPromise;
+  }
+
+  // Runs work(store, setResult) in one transaction; resolves with whatever was passed to setResult once the
+  // transaction has committed
+  async function aarRun(mode, work) {
+    const db = await aarOpenDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(AAR_STORE, mode);
+      let result;
+      tx.oncomplete = () => resolve(result);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error("transaction aborted"));
+      work(tx.objectStore(AAR_STORE), (value) => {
+        result = value;
+      });
+    });
+  }
+
+  function aarGetMany(ids) {
+    return aarRun("readonly", (store, out) => {
+      const records = new Array(ids.length);
+      ids.forEach((id, index) => {
+        const request = store.get(id);
+        request.onsuccess = () => {
+          records[index] = request.result;
+        };
+      });
+      out(records);
+    });
+  }
+
+  function aarPutMany(records) {
+    return aarRun("readwrite", (store) => {
+      records.forEach((record) => store.put(record));
+    });
+  }
+
+  function aarGetByState(state) {
+    return aarRun("readonly", (store, out) => {
+      const request = store.index("state").getAll(state);
+      request.onsuccess = () => out(request.result);
+    });
+  }
+
+  function aarCounts() {
+    return aarRun("readonly", (store, out) => {
+      const counts = { total: 0, open: 0, toComplete: 0 };
+      const total = store.count();
+      total.onsuccess = () => {
+        counts.total = total.result;
+        const open = store.index("state").count("open");
+        open.onsuccess = () => {
+          counts.open = open.result;
+          // Every open record is still rich 0: what remains are finished auctions to complete
+          const unrich = store.index("rich").count(0);
+          unrich.onsuccess = () => {
+            counts.toComplete = Math.max(0, unrich.result - counts.open);
+            out(counts);
+          };
+        };
+      };
+    });
+  }
+
+  // Reads the whole store by pages of AAR_EXPORT_CHUNK records, in separate transactions, so a very large
+  // archive never has to sit in memory at once
+  async function aarForEachPage(onPage) {
+    let lastKey = null;
+    for (;;) {
+      const page = await aarRun("readonly", (store, out) => {
+        const range =
+          lastKey === null ? null : IDBKeyRange.lowerBound(lastKey, true);
+        const request = store.getAll(range, AAR_EXPORT_CHUNK);
+        request.onsuccess = () => out(request.result);
+      });
+      if (page.length === 0) return;
+      await onPage(page);
+      if (page.length < AAR_EXPORT_CHUNK) return;
+      lastKey = page[page.length - 1].id;
+    }
+  }
+
+  // Drops the list of bids of the finished auctions resolved more than AAR_COMPACT_DAYS ago, keeping every
+  // aggregate (prices, bid and bidder counts, first/last bid time, seller, winner...)
+  function aarCompact() {
+    const limit = Date.now() - AAR_COMPACT_DAYS * 24 * 60 * 60 * 1000;
+    return aarRun("readwrite", (store, out) => {
+      let compacted = 0;
+      const request = store.index("rich").openCursor(IDBKeyRange.only(1));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) {
+          out(compacted);
+          return;
+        }
+        const record = cursor.value;
+        if (record.state === "done" && (record.resolvedAt ?? 0) < limit) {
+          record.bids = null;
+          record.bidders = null;
+          record.rich = 2;
+          // Bookkeeping and ids that the names already stand for
+          AAR_COMPACT_DROPPED_FIELDS.forEach((field) => delete record[field]);
+          cursor.update(record);
+          compacted++;
+        }
+        cursor.continue();
+      };
+    });
+  }
+
+  function aarClear() {
+    return aarRun("readwrite", (store) => {
+      store.clear();
+    });
+  }
+
+  // ---- API ----
+  // The page's own fetch (same origin, so the session cookies go along; no init object is passed, to stay clear
+  // of cross-compartment issues in Firefox)
+  async function aarFetchJson(path) {
+    const page = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+    const response = await page.fetch(path);
+    if (!response.ok) {
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {
+        // Not JSON
+      }
+      if (body?.code === AUTOMATION_LIMIT_CODE || response.status === 429) {
+        throw new AarRateLimitError();
+      }
+      throw new AarHttpError(response.status);
+    }
+    return response.json();
+  }
+
+  function aarNextCheckAfterEnd(endAt) {
+    const end = aarParseTime(endAt);
+    return (end ?? Date.now()) + AAR_SETTLE_MARGIN_MS;
+  }
+
+  function aarRecordFromListing(item, term, now) {
+    const status = item.status ?? "active";
+    return {
+      id: item.id,
+      state: "open",
+      terms: [term],
+      cardId: item.card_id ?? null,
+      cardName: item.card?.wikipedia_title ?? null,
+      rarity: item.snapshot_rarity ?? item.card?.rarity ?? null,
+      isShiny: item.is_shiny ?? item.card?.is_shiny ?? false,
+      lang: item.card?.lang ?? null,
+      atk: item.snapshot_atk ?? item.card?.atk ?? null,
+      def: item.snapshot_def ?? item.card?.def ?? null,
+      qScore: item.card?.q_score ?? null,
+      pageviews: item.card?.pageviews ?? null,
+      sellerId: item.seller_id ?? null,
+      sellerName: item.seller?.username ?? null,
+      startPrice: item.listing_base_amount ?? item.base_amount ?? null,
+      baseAmount: item.base_amount ?? null,
+      createdAt: item.created_at ?? null,
+      endAt: item.end_at ?? null,
+      firstSeenAt: now,
+      lastSeenAt: now,
+      nextCheckAt: status === "active" ? aarNextCheckAfterEnd(item.end_at) : now,
+      checks: 0,
+      status,
+      finalPrice: null,
+      bidCount: null,
+      bidderCount: null,
+      bids: null,
+      bidders: null,
+      firstBidAt: null,
+      lastBidAt: null,
+      winnerId: null,
+      winnerName: null,
+      settledAt: null,
+      resolvedAt: null,
+      rich: 0,
+    };
+  }
+
+  // An already-known auction: remembers the new term and, while it is still open, follows a changed end time
+  function aarMergeListing(record, item, term, now) {
+    if (!record.terms.includes(term)) record.terms.push(term);
+    if (record.state === "open") {
+      record.lastSeenAt = now;
+      if (item.end_at && item.end_at !== record.endAt) {
+        record.endAt = item.end_at;
+        record.nextCheckAt = aarNextCheckAfterEnd(item.end_at);
+      }
+    }
+    return record;
+  }
+
+  async function aarCrawlTerm(term) {
+    for (let page = 1; page <= AAR_MAX_PAGES; page++) {
+      const data = await aarFetchJson(
+        `/api/marketplace?page=${page}&limit=${AAR_PAGE_SIZE}&sort=recent&q=${encodeURIComponent(term)}`,
+      );
+      const items = Array.isArray(data?.auctions) ? data.auctions : [];
+      const now = Date.now();
+      const known = await aarGetMany(items.map((item) => item.id));
+
+      let newForTerm = 0;
+      const records = items.map((item, index) => {
+        const existing = known[index];
+        if (!existing) {
+          newForTerm++;
+          return aarRecordFromListing(item, term, now);
+        }
+        if (!existing.terms.includes(term)) newForTerm++;
+        return aarMergeListing(existing, item, term, now);
+      });
+      await aarPutMany(records);
+
+      // Newest first: a page with nothing new means everything after it is already archived
+      if (!data?.hasMore || items.length === 0 || newForTerm === 0) break;
+      await aarSleep(AAR_REQUEST_PACING_MS);
+    }
+  }
+
+  // Fills a record from the detail answer of a finished auction. bids is stored compactly, oldest first, as
+  // [amount, index in bidders, time (ms)]; bidders is the list of [id, username] of the distinct bidders
+  function aarApplyResult(record, data) {
+    const auction = data.auction;
+    const bids = (Array.isArray(data.bids) ? data.bids : [])
+      .map((bid) => ({ ...bid, at: aarParseTime(bid.placed_at) }))
+      .sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+
+    const bidderIndex = new Map();
+    const bidders = [];
+    record.bids = bids.map((bid) => {
+      if (!bidderIndex.has(bid.bidder_id)) {
+        bidderIndex.set(bid.bidder_id, bidders.length);
+        bidders.push([bid.bidder_id, bid.bidder?.username ?? null]);
+      }
+      return [bid.amount, bidderIndex.get(bid.bidder_id), bid.at];
+    });
+    record.bidders = bidders;
+    record.bidCount = bids.length;
+    record.bidderCount = bidders.length;
+    record.firstBidAt = bids[0]?.at ?? null;
+    record.lastBidAt = bids[bids.length - 1]?.at ?? null;
+
+    record.startPrice =
+      auction.listing_base_amount ?? auction.base_amount ?? record.startPrice;
+    record.baseAmount = auction.base_amount ?? record.baseAmount;
+    record.cardName = auction.card?.wikipedia_title ?? record.cardName;
+    record.rarity = auction.snapshot_rarity ?? record.rarity;
+    record.isShiny = auction.is_shiny ?? record.isShiny ?? false;
+    record.lang = auction.card?.lang ?? record.lang ?? null;
+    record.atk = auction.snapshot_atk ?? record.atk ?? null;
+    record.def = auction.snapshot_def ?? record.def ?? null;
+    record.qScore = auction.card?.q_score ?? record.qScore ?? null;
+    record.pageviews = auction.card?.pageviews ?? record.pageviews ?? null;
+    record.sellerId = auction.seller_id ?? record.sellerId ?? null;
+    record.sellerName = auction.seller?.username ?? record.sellerName ?? null;
+    record.winnerId = auction.winner_id ?? null;
+    record.winnerName = auction.winner?.username ?? null;
+    record.finalPrice = auction.final_price ?? null;
+    record.settledAt = auction.settled_at ?? null;
+    record.rich = 1;
+  }
+
+  async function aarResolveOne(record) {
+    let data;
+    try {
+      data = await aarFetchJson(`/api/marketplace/${record.id}`);
+    } catch (error) {
+      if (!(error instanceof AarHttpError) || error.status !== 404) throw error;
+
+      record.checks++;
+      if (record.checks >= AAR_NOT_FOUND_MAX) {
+        record.state = "done";
+        record.status = "not_found";
+        record.resolvedAt = Date.now();
+        record.rich = 2;
+      } else {
+        record.nextCheckAt = Date.now() + AAR_RETRY_BASE_MS * record.checks;
+      }
+      await aarPutMany([record]);
+      return;
+    }
+
+    const auction = data?.auction;
+    if (!auction) throw new AarHttpError("unexpected answer");
+
+    const now = Date.now();
+    record.status = auction.status ?? record.status;
+    record.endAt = auction.end_at ?? record.endAt;
+
+    if (auction.status === "active") {
+      const end = aarParseTime(record.endAt);
+      if (end !== null && end > now) {
+        // Not over yet (end time pushed back): wait for the new end
+        record.nextCheckAt = aarNextCheckAfterEnd(record.endAt);
+      } else {
+        record.checks++;
+        if (record.checks >= AAR_MAX_CHECKS) {
+          record.state = "done";
+          record.status = "unresolved";
+          record.resolvedAt = now;
+          record.rich = 2;
+        } else {
+          record.nextCheckAt =
+            now +
+            Math.min(AAR_RETRY_BASE_MS * 2 ** record.checks, AAR_RETRY_MAX_MS);
+        }
+      }
+    } else {
+      record.state = "done";
+      aarApplyResult(record, data);
+      record.resolvedAt = now;
+    }
+    await aarPutMany([record]);
+  }
+
+  // Completes the records archived before the bid details were kept (rich 0, finished), newest first and a few
+  // per pass. The auction's own page is still served after its end, so nothing is lost by waiting.
+  async function aarBackfill(deadline) {
+    const candidates = (
+      await aarRun("readonly", (store, out) => {
+        const request = store.index("rich").getAll(0);
+        request.onsuccess = () => out(request.result);
+      })
+    )
+      .filter((record) => record.state === "done")
+      .sort((a, b) => (b.resolvedAt ?? 0) - (a.resolvedAt ?? 0))
+      .slice(0, AAR_BACKFILL_PER_TICK);
+
+    for (const record of candidates) {
+      if (Date.now() > deadline) break;
+
+      let data = null;
+      try {
+        data = await aarFetchJson(`/api/marketplace/${record.id}`);
+      } catch (error) {
+        if (!(error instanceof AarHttpError) || error.status !== 404) {
+          throw error;
+        }
+      }
+
+      if (data?.auction && data.auction.status !== "active") {
+        aarApplyResult(record, data);
+      } else {
+        record.rich = 2;
+      }
+      await aarPutMany([record]);
+      await aarSleep(AAR_REQUEST_PACING_MS);
+    }
+  }
+
+  async function aarResolveDue(deadline) {
+    const open = await aarGetByState("open");
+    const now = Date.now();
+    const due = open
+      .filter((record) => record.nextCheckAt <= now)
+      .sort((a, b) => a.nextCheckAt - b.nextCheckAt);
+
+    for (const record of due) {
+      if (Date.now() > deadline) break;
+      await aarResolveOne(record);
+      await aarSleep(AAR_REQUEST_PACING_MS);
+    }
+    await aarBackfill(deadline);
+  }
+
+  // One pass: discovery then resolution. Never throws; resolves with the delay before the next pass
+  async function aarTick() {
+    const started = Date.now();
+    aarSetStatus({ lastTickStartedAt: started, phase: "running" });
+
+    try {
+      const terms = aarReadTerms();
+      for (const term of terms) {
+        await aarCrawlTerm(term);
+        await aarSleep(AAR_REQUEST_PACING_MS);
+      }
+      await aarResolveDue(started + AAR_RESOLVE_BUDGET_MS);
+
+      aarRateLimitStreak = 0;
+      aarSetStatus({ lastError: null, rateLimitedUntil: null });
+
+      const counts = await aarCounts();
+      if (terms.length === 0 && counts.open === 0) return AAR_IDLE_MS;
+      return Math.max(AAR_MIN_GAP_MS, AAR_TICK_MS - (Date.now() - started));
+    } catch (error) {
+      if (error instanceof AarRateLimitError) {
+        aarRateLimitStreak++;
+        const cooldown = Math.min(
+          AAR_COOLDOWN_BASE_MS * 2 ** (aarRateLimitStreak - 1),
+          AAR_COOLDOWN_MAX_MS,
+        );
+        console.warn("[WMB-AAR] automation_limit reached, pausing", cooldown);
+        aarSetStatus({
+          lastError: "Limite de requêtes du site atteinte",
+          rateLimitedUntil: Date.now() + cooldown,
+        });
+        return cooldown;
+      }
+      console.error("[WMB-AAR]", error);
+      aarSetStatus({ lastError: String(error?.message ?? error) });
+      return Math.max(AAR_MIN_GAP_MS, AAR_TICK_MS - (Date.now() - started));
+    }
+  }
+
+  async function aarRunLoop() {
+    // A reload must not trigger an early pass
+    const status = aarReadStatus();
+    const firstDelay = Math.max(
+      (status.lastTickStartedAt ?? 0) + AAR_TICK_MS - Date.now(),
+      (status.rateLimitedUntil ?? 0) - Date.now(),
+      0,
+    );
+    aarSetStatus({ nextTickAt: Date.now() + firstDelay, phase: "idle" });
+    await aarWait(firstDelay);
+
+    for (;;) {
+      const delay = await aarTick();
+      aarSetStatus({ nextTickAt: Date.now() + delay, phase: "idle" });
+      await aarWait(delay);
+    }
+  }
+
+  // ---- Export ----
+  // The CSV is the flat view for a spreadsheet; the JSON is the whole record, bids included
+  const AAR_EXPORT_COLUMNS = [
+    "id",
+    "terms",
+    "cardName",
+    "rarity",
+    "isShiny",
+    "atk",
+    "def",
+    "qScore",
+    "pageviews",
+    "startPrice",
+    "finalPrice",
+    "bidCount",
+    "bidderCount",
+    "firstBidAt",
+    "lastBidAt",
+    "lastBidSecondsBeforeEnd",
+    "status",
+    "createdAt",
+    "endAt",
+    "settledAt",
+    "sellerName",
+    "winnerName",
+  ];
+
+  function aarCsvValue(record, column) {
+    switch (column) {
+      case "terms":
+        return record.terms.join(" | ");
+      case "firstBidAt":
+      case "lastBidAt":
+        return record[column] ? new Date(record[column]).toISOString() : "";
+      case "lastBidSecondsBeforeEnd": {
+        const end = aarParseTime(record.endAt);
+        return record.lastBidAt && end !== null
+          ? Math.round((end - record.lastBidAt) / 1000)
+          : "";
+      }
+      default:
+        return record[column] ?? "";
+    }
+  }
+
+  function aarDownload(content, filename, type) {
+    const blob = new Blob([content], { type });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function exportAuctionArchive(format) {
+    const day = new Date().toISOString().slice(0, 10);
+    const isJson = format === "json";
+
+    // The file is assembled page by page as a Blob (the browser may keep it on disk), never as one huge string.
+    // The CSV's BOM makes spreadsheets read accented card names as UTF-8.
+    let blob = new Blob([
+      isJson ? "[\n" : `\uFEFF${AAR_EXPORT_COLUMNS.join(",")}\r\n`,
+    ]);
+    let count = 0;
+    await aarForEachPage((page) => {
+      const text = page
+        .map((record) => {
+          if (isJson) return `${count++ ? ",\n" : ""}${JSON.stringify(record)}`;
+          count++;
+          return `${AAR_EXPORT_COLUMNS.map((column) =>
+            csvEscapeField(aarCsvValue(record, column)),
+          ).join(",")}\r\n`;
+        })
+        .join("");
+      blob = new Blob([blob, text]);
+    });
+    if (isJson) blob = new Blob([blob, "\n]\n"]);
+
+    aarDownload(
+      blob,
+      `wmb-archive-encheres-${day}.${isJson ? "json" : "csv"}`,
+      isJson ? "application/json;charset=utf-8" : "text/csv;charset=utf-8",
+    );
+
+    GM_notification({
+      title: "Wiki-Masters",
+      text: `${count} enchère(s) exportée(s).`,
+      timeout: 4000,
+    });
+  }
+
+  // ---- UI ----
+  function aarFormatBytes(bytes) {
+    if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} Go`;
+    return `${Math.max(1, Math.round(bytes / 1024 ** 2))} Mo`;
+  }
+
+  function aarFormatTime(timestamp) {
+    return timestamp ? new Date(timestamp).toLocaleTimeString("fr-FR") : "—";
+  }
+
+  async function aarRenderStatus(box, termsInput) {
+    const status = aarReadStatus();
+    let counts = { total: 0, open: 0, toComplete: 0 };
+    try {
+      counts = await aarCounts();
+    } catch (error) {
+      console.error("[WMB-AAR]", error);
+    }
+    const storage = await navigator.storage?.estimate?.().catch(() => null);
+
+    const lines = [
+      `Enchères archivées : ${counts.total} (${counts.open} en attente de résultat, ${counts.total - counts.open} terminées)`,
+    ];
+    if (counts.toComplete > 0) {
+      lines.push(
+        `Anciennes enchères dont le détail des mises reste à récupérer : ${counts.toComplete} (en arrière-plan, ${AAR_BACKFILL_PER_TICK} par passage)`,
+      );
+    }
+    if (storage?.usage) {
+      lines.push(
+        `Espace utilisé par le site dans le navigateur : ${aarFormatBytes(storage.usage)}${storage.quota ? ` sur ${aarFormatBytes(storage.quota)} disponibles` : ""}`,
+      );
+    }
+    if (aarReadTerms().length === 0 && !termsInput.value.trim()) {
+      lines.push("Aucun terme : saisissez-en un pour démarrer la collecte.");
+    }
+    if (status.lastTickStartedAt) {
+      lines.push(
+        status.phase === "running"
+          ? `Passage en cours depuis ${aarFormatTime(status.lastTickStartedAt)}`
+          : `Dernier passage : ${aarFormatTime(status.lastTickStartedAt)} · prochain : ${aarFormatTime(status.nextTickAt)}`,
+      );
+    } else {
+      lines.push("Aucun passage effectué pour l'instant.");
+    }
+    if ((status.rateLimitedUntil ?? 0) > Date.now()) {
+      lines.push(
+        `Limite de requêtes : pause jusqu'à ${aarFormatTime(status.rateLimitedUntil)}`,
+      );
+    }
+    if (status.lastError) lines.push(`Dernière erreur : ${status.lastError}`);
+
+    box.replaceChildren(
+      ...lines.map((line) => {
+        const row = document.createElement("div");
+        row.textContent = line;
+        return row;
+      }),
+    );
+  }
+
+  function buildAuctionArchiveModal() {
+    const overlay = document.createElement("div");
+    overlay.className = "wm-settings-overlay";
+
+    const modal = document.createElement("div");
+    modal.className = "wm-settings-modal wm-aar-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Archive des enchères");
+
+    const header = document.createElement("div");
+    header.className = "wm-settings-header";
+
+    const title = document.createElement("h2");
+    title.className = "wm-settings-title";
+    title.textContent = "📦 Archive des enchères";
+
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "wm-settings-close";
+    closeBtn.setAttribute("aria-label", "Fermer");
+    closeBtn.textContent = "✕";
+
+    header.append(title, closeBtn);
+
+    const hint = document.createElement("p");
+    hint.className = "wm-settings-hint";
+    hint.textContent =
+      "Toutes les 5 minutes, les enchères correspondant à ces termes sont archivées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois terminées. Laissez un onglet wiki-masters.com ouvert.";
+
+    const termsRow = document.createElement("div");
+    termsRow.className = "wm-aar-row";
+
+    const termsInput = document.createElement("input");
+    termsInput.type = "text";
+    termsInput.className = "wm-aar-input";
+    termsInput.placeholder = "Termes séparés par des virgules (ex : avion, bateau)";
+    termsInput.value = aarReadTerms().join(", ");
+
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "wm-aar-btn";
+    saveBtn.textContent = "Enregistrer";
+
+    termsRow.append(termsInput, saveBtn);
+
+    const statusBox = document.createElement("div");
+    statusBox.className = "wm-aar-status";
+
+    const actions = document.createElement("div");
+    actions.className = "wm-aar-row";
+
+    const makeButton = (label, onClick) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "wm-aar-btn";
+      button.textContent = label;
+      button.addEventListener("click", onClick);
+      return button;
+    };
+
+    const refresh = () => aarRenderStatus(statusBox, termsInput);
+
+    const save = () => {
+      localStorage.setItem(
+        AAR_TERMS_KEY,
+        JSON.stringify(aarParseTermsInput(termsInput.value)),
+      );
+      termsInput.value = aarReadTerms().join(", ");
+      // Asks the browser not to evict the archive when the disk runs low
+      navigator.storage?.persist?.().catch(() => {});
+      aarWake();
+      refresh();
+    };
+    saveBtn.addEventListener("click", save);
+    termsInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") save();
+    });
+
+    actions.append(
+      makeButton("Scanner maintenant", () => {
+        aarWake();
+        setTimeout(refresh, 500);
+      }),
+      makeButton("Exporter en CSV", () =>
+        exportAuctionArchive("csv").catch(console.error),
+      ),
+      makeButton("Exporter en JSON", () =>
+        exportAuctionArchive("json").catch(console.error),
+      ),
+      makeButton(`Compacter (> ${AAR_COMPACT_DAYS} j)`, async () => {
+        if (
+          !confirm(
+            `Supprimer la liste détaillée des mises des enchères terminées depuis plus de ${AAR_COMPACT_DAYS} jours ?\nLes prix, nombres de mises et d'enchérisseurs, et dates de première et dernière mise sont conservés.`,
+          )
+        ) {
+          return;
+        }
+        const compacted = await aarCompact();
+        GM_notification({
+          title: "Wiki-Masters",
+          text: `${compacted} enchère(s) compactée(s).`,
+          timeout: 4000,
+        });
+        refresh();
+      }),
+      makeButton("Vider l'archive", async () => {
+        if (!confirm("Supprimer toute l'archive des enchères ?")) return;
+        await aarClear();
+        refresh();
+      }),
+    );
+
+    modal.append(header, hint, termsRow, statusBox, actions);
+    overlay.appendChild(modal);
+
+    refresh();
+    const refreshTimer = setInterval(refresh, 5000);
+
+    const onKeydown = (event) => {
+      if (event.key === "Escape") close();
+    };
+    const close = () => {
+      clearInterval(refreshTimer);
+      overlay.remove();
+      document.removeEventListener("keydown", onKeydown);
+    };
+
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) close();
+    });
+    closeBtn.addEventListener("click", close);
+    document.addEventListener("keydown", onKeydown);
+
+    return overlay;
+  }
+
+  function setupAuctionArchiveButton() {
+    const nav = document.querySelector("nav h1")?.closest("nav");
+    if (!nav) return;
+
+    const row = ensureToggleRow(nav);
+    if (row.querySelector(":scope > .wm-aar-toggle")) return;
+
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "wm-aar-toggle";
+    toggle.title = "Archive des enchères";
+    toggle.setAttribute("aria-haspopup", "dialog");
+
+    const icon = document.createElement("span");
+    icon.textContent = "📦";
+    toggle.appendChild(icon);
+
+    toggle.addEventListener("click", () => {
+      if (document.querySelector(".wm-settings-overlay")) return;
+      document.body.appendChild(buildAuctionArchiveModal());
+    });
+
+    const anchor =
+      row.querySelector(":scope > .wm-tutorial-toggle") ??
+      row.querySelector(":scope > .wm-settings-toggle");
+    if (anchor) {
+      anchor.after(toggle);
+    } else {
+      row.appendChild(toggle);
+    }
+  }
+
+  function watchAuctionArchive() {
+    // Own class instead of .wm-fold-toggle: Feature NPN's "is the pin button there?" check matches that class
+    GM_addStyle(`
+      .wm-aar-toggle {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex: 1 1 0;
+        min-width: 0;
+        padding: 0.75rem;
+        border-radius: 0.75rem;
+        border: 1px solid var(--color-border);
+        background: transparent;
+        color: var(--color-foreground);
+        opacity: 0.6;
+        cursor: pointer;
+        font-size: 1.1rem;
+        line-height: 1;
+        transition: background-color 0.2s ease, opacity 0.2s ease;
+      }
+      .wm-aar-toggle:hover {
+        opacity: 1;
+        background-color: var(--color-surface-light);
+      }
+      .wm-aar-modal {
+        width: min(42rem, 92vw);
+      }
+      .wm-aar-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin: 0.5rem 0;
+      }
+      .wm-aar-input {
+        flex: 1 1 14rem;
+        min-width: 0;
+        padding: 0.4rem 0.6rem;
+        border-radius: 0.5rem;
+        border: 1px solid var(--color-border);
+        background: transparent;
+        color: var(--color-foreground);
+        font-size: 0.85rem;
+      }
+      .wm-aar-btn {
+        padding: 0.4rem 0.9rem;
+        border-radius: 0.5rem;
+        border: 1px solid var(--color-accent);
+        background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+        color: var(--color-accent);
+        font-size: 0.8rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background-color 0.2s ease;
+      }
+      .wm-aar-btn:hover {
+        background: color-mix(in srgb, var(--color-accent) 20%, transparent);
+      }
+      .wm-aar-status {
+        margin: 0.5rem 0;
+        padding: 0.5rem 0.75rem;
+        border: 1px solid rgba(128, 128, 128, 0.4);
+        border-radius: 0.5rem;
+        font-size: 0.8rem;
+        line-height: 1.5;
+        font-variant-numeric: tabular-nums;
+      }
+    `);
+
+    setupAuctionArchiveButton();
+    const observer = new MutationObserver(() => setupAuctionArchiveButton());
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Only the top frame collects, and only one tab at a time
+    if (window.top !== window.self || !window.indexedDB) return;
+
+    try {
+      const channel = new BroadcastChannel(AAR_CHANNEL_NAME);
+      channel.onmessage = (event) => {
+        if (event.data === "wake") aarWakeUp?.();
+      };
+    } catch {
+      // No cross-tab wake-up: the scheduled pass will do
+    }
+
+    const lead = () =>
+      aarRunLoop().catch((error) => console.error("[WMB-AAR]", error));
+    if (navigator.locks?.request) {
+      // Held for as long as the loop runs (it never ends); queued tabs take over when this one closes
+      navigator.locks.request(AAR_LOCK_NAME, lead);
+    } else {
+      lead();
+    }
+  }
+
+  // ============================================================
+  // Feature ACH: price history of the card on its bid page, drawn from the auction archive (Feature AAR).
+  // On a bid page (/marketplace/{UUID}), a small "Historique de la carte" block is appended at the end of the column
+  // holding the card's name and the bid panel (the closest .space-y-4 around h1.flex-1). It plots, as a small inline
+  // SVG, the final price of every archived sale of the same card (same wikipedia_title, same shiny flag; the auction
+  // on screen is left out) over time, with the median as a dashed line and, from 4 sales, a smoothed trend line (a
+  // Gaussian-weighted moving average, geometric when the axis is logarithmic; broken where sales are too sparse).
+  // Hovering a dot shows its date and price (native tooltip). Under the chart: number of sales, share of auctions
+  // that sold, median and range. With a single sale only the text is shown.
+  // The card is identified from the archive when this auction is already in it, otherwise with one
+  // GET /api/marketplace/{UUID} (nothing is requested while the archive is empty). Sales are read from the archive's
+  // "card" index (IndexedDB version 3). Nothing is shown when the card was never archived. Reads only: this feature
+  // never writes to the archive nor starts the crawl.
+  // ============================================================
+  const ACH_WIDGET_CLASS = "wm-ach-widget";
+  const ACH_CHART_WIDTH = 480;
+  const ACH_CHART_HEIGHT = 130;
+  const ACH_TREND_MIN_SALES = 4;
+  const ACH_SVG_NS = "http://www.w3.org/2000/svg";
+  const achNumberFormat = new Intl.NumberFormat("fr-FR", {
+    maximumFractionDigits: 0,
+  });
+  const achCompactFormat = new Intl.NumberFormat("fr-FR", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  });
+  const achDateTimeFormat = new Intl.DateTimeFormat("fr-FR", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const achDayFormat = new Intl.DateTimeFormat("fr-FR", {
+    day: "2-digit",
+    month: "2-digit",
+  });
+
+  function achSvg(tag, attributes, parent) {
+    const element = document.createElementNS(ACH_SVG_NS, tag);
+    for (const [name, value] of Object.entries(attributes ?? {})) {
+      element.setAttribute(name, value);
+    }
+    parent?.appendChild(element);
+    return element;
+  }
+
+  function achQuantile(sorted, q) {
+    const position = (sorted.length - 1) * q;
+    const low = Math.floor(position);
+    const high = Math.ceil(position);
+    return sorted[low] + (sorted[high] - sorted[low]) * (position - low);
+  }
+
+  // Sales of one card (same shiny flag) out of its archived auctions, oldest first, plus how many ended unsold
+  function achSummarize(records, currentId, shiny) {
+    const sales = [];
+    let unsold = 0;
+    for (const record of records) {
+      if (record.id === currentId || record.state !== "done") continue;
+      if (Boolean(record.isShiny) !== shiny) continue;
+      if (record.status === "settled_unsold") {
+        unsold++;
+      } else if (record.status === "settled_sold" && record.finalPrice > 0) {
+        const time =
+          aarParseTime(record.settledAt) ??
+          aarParseTime(record.endAt) ??
+          record.resolvedAt;
+        if (typeof time === "number") {
+          sales.push({ time, price: record.finalPrice });
+        }
+      }
+    }
+    sales.sort((a, b) => a.time - b.time);
+    return { sales, unsold };
+  }
+
+  function achGetCardRecords(cardName) {
+    return aarRun("readonly", (store, out) => {
+      const request = store.index("card").getAll(cardName);
+      request.onsuccess = () => out(request.result);
+    });
+  }
+
+  // The card behind a bid page: from the archive when it holds this auction, else from the auction itself
+  async function achIdentifyCard(uuid) {
+    const [record] = await aarGetMany([uuid]);
+    if (record?.cardName) {
+      return { name: record.cardName, shiny: Boolean(record.isShiny) };
+    }
+    const data = await aarFetchJson(`/api/marketplace/${uuid}`);
+    const auction = data?.auction;
+    if (!auction?.card?.wikipedia_title) return null;
+    return {
+      name: auction.card.wikipedia_title,
+      shiny: Boolean(auction.is_shiny ?? auction.card.is_shiny),
+    };
+  }
+
+  // Smoothed trend as an SVG path: Gaussian-weighted moving average sampled along the x axis (computed in the axis'
+  // own space: log10 prices on a log axis), joined with Catmull-Rom curves. Samples with too little weight (no
+  // sale nearby) break the line instead of inventing a trend across a gap.
+  function achTrendPath(sales, x0, x1, toX, toY, isLog) {
+    const transform = isLog ? (v) => Math.log10(Math.max(v, 1)) : (v) => v;
+    const bandwidth = Math.max((x1 - x0) / 6, 1);
+    const STEPS = 48;
+    const segments = [];
+    let segment = [];
+    for (let step = 0; step <= STEPS; step++) {
+      const x = x0 + ((x1 - x0) * step) / STEPS;
+      let weightSum = 0;
+      let valueSum = 0;
+      for (const sale of sales) {
+        const z = (sale.time - x) / bandwidth;
+        const weight = Math.exp(-0.5 * z * z);
+        weightSum += weight;
+        valueSum += weight * transform(sale.price);
+      }
+      if (weightSum >= 0.5) {
+        const mean = valueSum / weightSum;
+        segment.push({ x: toX(x), y: toY(isLog ? 10 ** mean : mean) });
+      } else if (segment.length) {
+        segments.push(segment);
+        segment = [];
+      }
+    }
+    if (segment.length) segments.push(segment);
+
+    let path = "";
+    for (const points of segments) {
+      if (points.length < 2) continue;
+      path += `M${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
+      for (let i = 0; i < points.length - 1; i++) {
+        const p0 = points[Math.max(0, i - 1)];
+        const p1 = points[i];
+        const p2 = points[i + 1];
+        const p3 = points[Math.min(points.length - 1, i + 2)];
+        const c1x = p1.x + (p2.x - p0.x) / 6;
+        const c1y = p1.y + (p2.y - p0.y) / 6;
+        const c2x = p2.x - (p3.x - p1.x) / 6;
+        const c2y = p2.y - (p3.y - p1.y) / 6;
+        path += `C${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
+      }
+    }
+    return path;
+  }
+
+  function achBuildChart(sales, median) {
+    const margin = { left: 40, right: 10, top: 10, bottom: 20 };
+    const width = ACH_CHART_WIDTH;
+    const height = ACH_CHART_HEIGHT;
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = height - margin.top - margin.bottom;
+
+    const prices = sales.map((sale) => sale.price);
+    const low = Math.min(...prices);
+    const high = Math.max(...prices);
+    // A very wide price range (cheap and very expensive sales) would flatten everything: go logarithmic
+    const isLog = high / Math.max(low, 1) > 40;
+    let ticks = [];
+    let toY;
+    if (isLog) {
+      const from = Math.floor(Math.log10(Math.max(low, 1)));
+      const to = Math.ceil(Math.log10(high));
+      for (let e = from; e <= to; e++) ticks.push(10 ** e);
+      toY = (value) =>
+        margin.top +
+        plotHeight -
+        ((Math.log10(Math.max(value, 1)) - from) / Math.max(1, to - from)) *
+          plotHeight;
+    } else {
+      const raw = high / 3;
+      const power = 10 ** Math.floor(Math.log10(raw));
+      const factor = raw / power;
+      const step =
+        (factor <= 1 ? 1 : factor <= 2 ? 2 : factor <= 5 ? 5 : 10) * power;
+      const max = Math.ceil(high / step) * step;
+      for (let value = 0; value <= max + 1e-9; value += step) ticks.push(value);
+      toY = (value) => margin.top + plotHeight - (value / max) * plotHeight;
+    }
+
+    const x0 = sales[0].time;
+    const x1 = Math.max(sales[sales.length - 1].time, x0 + 1);
+    const toX = (time) => margin.left + ((time - x0) / (x1 - x0)) * plotWidth;
+
+    const svg = achSvg("svg", {
+      viewBox: `0 0 ${width} ${height}`,
+      role: "img",
+      "aria-label": "Prix des ventes précédentes de cette carte",
+    });
+    for (const tick of ticks) {
+      achSvg(
+        "line",
+        {
+          x1: margin.left,
+          x2: width - margin.right,
+          y1: toY(tick),
+          y2: toY(tick),
+          stroke: "currentColor",
+          "stroke-opacity": "0.12",
+        },
+        svg,
+      );
+      achSvg(
+        "text",
+        {
+          x: margin.left - 5,
+          y: toY(tick) + 3.5,
+          "text-anchor": "end",
+          "font-size": "10",
+          fill: "currentColor",
+          "fill-opacity": "0.55",
+        },
+        svg,
+      ).textContent = achCompactFormat.format(tick);
+    }
+
+    // Day and time while the sales span a few days only, otherwise the day alone
+    const dateLabel = (time) =>
+      (x1 - x0 < 3 * 24 * 3600 * 1000
+        ? achDateTimeFormat
+        : achDayFormat
+      ).format(time);
+    [
+      [x0, "start"],
+      [x1, "end"],
+    ].forEach(([time, anchor]) => {
+      achSvg(
+        "text",
+        {
+          x: toX(time),
+          y: height - 5,
+          "text-anchor": anchor,
+          "font-size": "10",
+          fill: "currentColor",
+          "fill-opacity": "0.55",
+        },
+        svg,
+      ).textContent = dateLabel(time);
+    });
+
+    achSvg(
+      "line",
+      {
+        x1: margin.left,
+        x2: width - margin.right,
+        y1: toY(median),
+        y2: toY(median),
+        stroke: "currentColor",
+        "stroke-opacity": "0.45",
+        "stroke-dasharray": "4 3",
+      },
+      svg,
+    );
+    achSvg(
+      "text",
+      {
+        x: width - margin.right,
+        y: toY(median) - 4,
+        "text-anchor": "end",
+        "font-size": "10",
+        fill: "currentColor",
+        "fill-opacity": "0.8",
+        stroke: "var(--color-surface, #000)",
+        "stroke-width": "3",
+        "paint-order": "stroke",
+      },
+      svg,
+    ).textContent = `médiane ${achNumberFormat.format(median)}`;
+
+    if (sales.length >= ACH_TREND_MIN_SALES) {
+      const path = achTrendPath(sales, x0, x1, toX, toY, isLog);
+      if (path) {
+        achSvg(
+          "path",
+          {
+            d: path,
+            fill: "none",
+            stroke: "var(--color-accent)",
+            "stroke-opacity": "0.55",
+            "stroke-width": "2.5",
+            "stroke-linecap": "round",
+            "stroke-linejoin": "round",
+          },
+          svg,
+        );
+      }
+    }
+
+    for (const sale of sales) {
+      const dot = achSvg(
+        "circle",
+        {
+          cx: toX(sale.time),
+          cy: toY(sale.price),
+          r: "3.5",
+          fill: "var(--color-accent)",
+          stroke: "var(--color-surface, #000)",
+          "stroke-width": "1",
+        },
+        svg,
+      );
+      achSvg("title", {}, dot).textContent =
+        `${achDateTimeFormat.format(sale.time)} : ${achNumberFormat.format(sale.price)} wikibidous`;
+    }
+    return svg;
+  }
+
+  async function achBuildWidget(uuid) {
+    const counts = await aarCounts();
+    if (!counts.total) return null;
+
+    const card = await achIdentifyCard(uuid);
+    if (!card) return null;
+
+    const records = await achGetCardRecords(card.name);
+    const { sales, unsold } = achSummarize(records, uuid, card.shiny);
+    if (!sales.length && !unsold) return null;
+
+    const widget = document.createElement("div");
+    widget.className = `card-frame p-4 space-y-2 ${ACH_WIDGET_CLASS}`;
+    widget.dataset.uuid = uuid;
+
+    const title = document.createElement("div");
+    title.className =
+      "text-xs uppercase tracking-wide text-[var(--color-foreground)]/50";
+    title.textContent = "Historique de la carte (archive)";
+    widget.appendChild(title);
+
+    const summary = document.createElement("p");
+    summary.className = "text-sm text-[var(--color-foreground)]/70";
+    if (!sales.length) {
+      summary.textContent = `${unsold} enchère${unsold > 1 ? "s" : ""} archivée${unsold > 1 ? "s" : ""}, aucune vendue.`;
+      widget.appendChild(summary);
+      return widget;
+    }
+
+    const sorted = sales.map((sale) => sale.price).sort((a, b) => a - b);
+    const median = achQuantile(sorted, 0.5);
+    if (sales.length >= 2) {
+      widget.appendChild(achBuildChart(sales, median));
+    }
+    const sellRate = Math.round((sales.length / (sales.length + unsold)) * 100);
+    const parts = [
+      `${sales.length} vente${sales.length > 1 ? "s" : ""}`,
+      `${sellRate} % des enchères vendues`,
+      `médiane ${achNumberFormat.format(median)}`,
+    ];
+    if (sales.length >= 2) {
+      parts.push(
+        `de ${achNumberFormat.format(sorted[0])} à ${achNumberFormat.format(sorted[sorted.length - 1])}`,
+      );
+    }
+    summary.textContent = parts.join(" · ");
+    widget.appendChild(summary);
+    return widget;
+  }
+
+  function watchCardPriceHistory() {
+    GM_addStyle(`
+      .${ACH_WIDGET_CLASS} svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+    `);
+
+    let doneUuid = null;
+    let busyUuid = null;
+    let widget = null;
+
+    const update = () => {
+      const match = window.location.pathname.match(MARKETPLACE_BID_PATH_REGEX);
+      const uuid = match?.[1] ?? null;
+      if (!uuid) {
+        document.querySelector(`.${ACH_WIDGET_CLASS}`)?.remove();
+        doneUuid = null;
+        widget = null;
+        return;
+      }
+      if (document.querySelector("div.animate-spin")) return;
+      const host = document
+        .querySelector("h1.flex-1")
+        ?.closest(".space-y-4");
+      if (!host) return;
+
+      const shown = document.querySelector(`.${ACH_WIDGET_CLASS}`);
+      if (shown && shown.dataset.uuid !== uuid) shown.remove();
+
+      if (doneUuid === uuid) {
+        // React may have rebuilt the column: put the block back
+        if (widget && !widget.isConnected) host.appendChild(widget);
+        return;
+      }
+      if (busyUuid === uuid) return;
+      busyUuid = uuid;
+      widget = null;
+      achBuildWidget(uuid)
+        .then((built) => {
+          if (busyUuid !== uuid) return;
+          doneUuid = uuid;
+          widget = built;
+          update();
+        })
+        .catch((error) => {
+          console.error("[WMB-ACH]", error);
+          doneUuid = uuid;
+        })
+        .finally(() => {
+          if (busyUuid === uuid) busyUuid = null;
+        });
+    };
+
+    let debounceId = null;
+    const scheduleUpdate = () => {
+      clearTimeout(debounceId);
+      debounceId = setTimeout(update, 300);
+    };
+    scheduleUpdate();
+    new MutationObserver(scheduleUpdate).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   function main() {
@@ -10398,6 +11905,8 @@ const MY_USERNAME = "xxx";
     run("rule-42", watchTradeTotals);
     run("feature-mtg", watchMassTagging);
     run("feature-evl", watchEstimationsDrawer);
+    run("feature-aar", watchAuctionArchive);
+    run("feature-ach", watchCardPriceHistory);
 
     watchFeatureConfigButton();
     watchTutorialButton();

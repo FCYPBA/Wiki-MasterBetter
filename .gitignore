@@ -4,3 +4,6 @@ scripts/
 *.html
 *.json
 *.log
+
+# The auction dashboard is a tool, not generated context
+!dashboard/*.html

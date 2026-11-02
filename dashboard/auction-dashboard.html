@@ -1,0 +1,1240 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tableau de bord des enchères</title>
+<style>
+  /* ---------- tokens (palette de référence du skill dataviz, validée claire + sombre) ---------- */
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7; --surface: #fcfcfb;
+    --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,.10);
+    --s1: #2a78d6; --s2: #eb6834; --other: #c3c2b7;
+    --wash: rgba(11,11,11,.045); --accent-wash: rgba(42,120,214,.10);
+    --good: #006300; --bad: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface: #1a1a19;
+      --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,.10);
+      --s1: #3987e5; --s2: #d95926; --other: #4a4a46;
+      --wash: rgba(255,255,255,.06); --accent-wash: rgba(57,135,229,.16);
+      --good: #0ca30c; --bad: #ec835a;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19;
+    --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,.10);
+    --s1: #3987e5; --s2: #d95926; --other: #4a4a46;
+    --wash: rgba(255,255,255,.06); --accent-wash: rgba(57,135,229,.16);
+    --good: #0ca30c; --bad: #ec835a;
+  }
+
+  * { box-sizing: border-box; }
+  html { background: var(--page); }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 0 16px 64px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 650; }
+  h2 { font-size: 17px; margin: 0 0 2px; font-weight: 650; }
+  h3 { font-size: 14px; margin: 0; font-weight: 600; }
+  p { margin: 0; }
+  button, input, select { font: inherit; color: inherit; }
+  .muted { color: var(--muted); }
+  .sub { color: var(--ink2); font-size: 13px; }
+
+  header.top { display: flex; align-items: center; gap: 12px; padding: 18px 0 10px; flex-wrap: wrap; }
+  header.top .grow { flex: 1 1 auto; min-width: 12rem; }
+  header.top .meta { color: var(--ink2); font-size: 13px; }
+  .btn {
+    border: 1px solid var(--border); background: var(--surface); border-radius: 8px;
+    padding: 6px 12px; cursor: pointer; transition: background-color .15s;
+  }
+  .btn:hover { background: var(--wash); }
+  .btn.primary { border-color: var(--s1); color: var(--s1); font-weight: 600; }
+
+  /* ---------- filter row ---------- */
+  .filters {
+    position: sticky; top: 0; z-index: 5; background: var(--page);
+    display: flex; flex-wrap: wrap; gap: 8px 22px; align-items: center;
+    padding: 10px 0; border-bottom: 1px solid var(--border); margin-bottom: 18px;
+  }
+  .fgroup { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .fgroup > .flabel { color: var(--muted); font-size: 12px; margin-right: 2px; }
+  .chip {
+    border: 1px solid var(--border); background: var(--surface); border-radius: 999px;
+    padding: 3px 11px; font-size: 13px; cursor: pointer; transition: background-color .15s;
+  }
+  .chip:hover { background: var(--wash); }
+  .chip[aria-pressed="true"] { border-color: var(--s1); color: var(--s1); background: var(--accent-wash); font-weight: 600; }
+  details.params { position: relative; }
+  details.params summary { cursor: pointer; color: var(--ink2); font-size: 13px; list-style: none; }
+  details.params summary::before { content: "⚙ "; }
+  details.params[open] .pbox {
+    position: absolute; right: 0; top: 28px; z-index: 6; width: 20rem;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px;
+    box-shadow: 0 8px 28px rgba(0,0,0,.18); display: grid; gap: 10px;
+  }
+  details.tpop { position: relative; }
+  details.tpop summary { cursor: pointer; list-style: none; border: 1px solid var(--border); background: var(--surface); border-radius: 999px; padding: 3px 11px; font-size: 13px; }
+  details.tpop summary::after { content: " ▾"; color: var(--muted); }
+  details.tpop[open] summary { border-color: var(--s1); color: var(--s1); }
+  details.tpop[open] .tbox {
+    position: absolute; left: 0; top: 30px; z-index: 6; width: 22rem; max-width: 90vw;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px;
+    box-shadow: 0 8px 28px rgba(0,0,0,.18); display: grid; gap: 8px;
+  }
+  .tbox input[type="search"] { width: 100%; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border); background: transparent; }
+  .tbox .tquick { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tbox .tlist { max-height: 15rem; overflow: auto; display: grid; gap: 1px; }
+  .tbox .trow { display: grid; grid-template-columns: auto 1fr auto auto; gap: 8px; align-items: center; padding: 3px 4px; border-radius: 6px; font-size: 13px; }
+  .tbox .trow:hover { background: var(--wash); }
+  .tbox .trow .n { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .tbox .trow button.only { border: 0; background: none; color: var(--s1); cursor: pointer; font-size: 12px; padding: 0 2px; visibility: hidden; }
+  .tbox .trow:hover button.only, .tbox .trow:focus-within button.only { visibility: visible; }
+  .tbox .tnone { color: var(--muted); font-size: 13px; padding: 4px; }
+  .tbox [hidden], .btn[hidden] { display: none; }
+  .btn.small { padding: 2px 9px; font-size: 12.5px; border-radius: 999px; }
+  .pbox label { display: grid; grid-template-columns: 1fr 5rem; gap: 8px; align-items: center; font-size: 13px; }
+  .pbox input { width: 100%; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--border); background: transparent; text-align: right; }
+
+  /* ---------- tiles ---------- */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-bottom: 26px; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
+  .tile .l { color: var(--ink2); font-size: 12.5px; }
+  .tile .v { font-size: 28px; font-weight: 650; line-height: 1.15; margin-top: 2px; }
+  .tile .s { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+  /* ---------- sections & cards ---------- */
+  section.sec { margin: 0 0 34px; }
+  .sec > header { margin-bottom: 12px; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 14px; }
+  .grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 14px; }
+  figure.card, .card {
+    margin: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 14px 10px; min-width: 0;
+  }
+  .card > .ch { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
+  .card > .ch .t { flex: 1 1 auto; min-width: 0; }
+  .card > .ch .t p { color: var(--ink2); font-size: 12.5px; margin-top: 1px; }
+  .card .tog { border: 0; background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; padding: 2px 4px; }
+  .card .tog:hover { color: var(--ink); }
+  .legend { display: flex; gap: 14px; font-size: 12.5px; color: var(--ink2); margin: 0 0 6px; flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .chartbox { width: 100%; }
+  .chartbox svg { display: block; overflow: visible; }
+  .empty { color: var(--muted); padding: 18px 4px; font-size: 13px; }
+
+  svg .gridl { stroke: var(--grid); stroke-width: 1; }
+  svg .axisl { stroke: var(--axis); stroke-width: 1; }
+  svg text { fill: var(--muted); font-size: 11px; font-family: inherit; }
+  svg text.val { fill: var(--ink2); }
+  svg .hoverband { fill: var(--wash); pointer-events: none; }
+  svg .hit { fill: transparent; outline: none; }
+  svg .hit:focus-visible { stroke: var(--s1); stroke-width: 2; }
+  svg .xhair { stroke: var(--axis); stroke-width: 1; pointer-events: none; }
+  svg .ring { stroke: var(--surface); stroke-width: 2; }
+
+  .tip {
+    position: fixed; z-index: 50; pointer-events: none; background: var(--surface); color: var(--ink);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 12.5px;
+    box-shadow: 0 6px 22px rgba(0,0,0,.18); max-width: 280px;
+  }
+  .tip .tt { color: var(--ink2); margin-bottom: 4px; }
+  .tip .tr { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+  .tip .tr .k { width: 12px; height: 2px; border-radius: 1px; flex: none; }
+  .tip .tr strong { font-weight: 650; }
+  .tip .tr span.n { color: var(--ink2); }
+
+  /* ---------- tables ---------- */
+  .tablewrap { overflow-x: auto; }
+  table.dt { border-collapse: collapse; width: 100%; font-size: 13px; }
+  table.dt th, table.dt td { padding: 6px 10px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--grid); }
+  table.dt th { font-weight: 600; color: var(--ink2); position: sticky; top: 0; background: var(--surface); }
+  table.dt th.num, table.dt td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.dt th button { all: unset; cursor: pointer; }
+  table.dt th button:hover { color: var(--ink); }
+  table.dt th[aria-sort="ascending"] button::after { content: " ▲"; font-size: 9px; }
+  table.dt th[aria-sort="descending"] button::after { content: " ▼"; font-size: 9px; }
+  table.dt tbody tr:hover { background: var(--wash); }
+  button.link { all: unset; cursor: pointer; color: var(--s1); }
+  button.link:hover { text-decoration: underline; }
+  button.link:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; border-radius: 3px; }
+  .more { margin: 8px 0 2px; }
+  .good { color: var(--good); } .bad { color: var(--bad); }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .toolbar input[type=search] {
+    padding: 5px 10px; border-radius: 8px; border: 1px solid var(--border); background: transparent; min-width: 14rem;
+  }
+
+  /* ---------- empty state & dialog ---------- */
+  #drop {
+    margin: 40px auto; max-width: 560px; text-align: center; padding: 36px 24px; border-radius: 16px;
+    border: 1.5px dashed var(--axis); background: var(--surface);
+  }
+  #drop.over { border-color: var(--s1); background: var(--accent-wash); }
+  #drop p + p { margin-top: 8px; }
+  dialog {
+    width: min(920px, 96vw); max-height: 92vh; overflow: auto; border: 1px solid var(--border);
+    border-radius: 14px; background: var(--surface); color: var(--ink); padding: 18px;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.45); }
+  dialog .dh { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px; }
+  dialog .dh .grow { flex: 1; }
+  .minitiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin: 10px 0 14px; }
+  .minitiles .tile .v { font-size: 20px; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  @media (max-width: 600px) { .tile .v { font-size: 24px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="grow">
+      <h1>Tableau de bord des enchères</h1>
+      <p class="meta" id="meta">Aucun fichier chargé</p>
+    </div>
+    <button class="btn" id="theme" type="button" title="Thème clair / sombre / automatique">◐ Thème</button>
+    <button class="btn primary" id="pick" type="button">Charger un export JSON…</button>
+    <input id="file" type="file" accept=".json,application/json" hidden>
+  </header>
+
+  <div id="drop">
+    <h2>Déposez ici votre export</h2>
+    <p class="sub">Dans le script, ouvrez 📦 « Archive des enchères » puis « Exporter en JSON », et déposez le fichier ici (ou utilisez le bouton en haut).</p>
+    <p class="sub">Tout est calculé dans votre navigateur : le fichier n'est envoyé nulle part.</p>
+  </div>
+
+  <div id="app" hidden>
+    <div class="filters" id="filters"></div>
+    <div id="out"></div>
+  </div>
+</div>
+<dialog id="dlg"></dialog>
+
+<script>
+(() => {
+"use strict";
+
+/* =====================================================================
+   Constantes, état
+   ===================================================================== */
+const TZ = "Europe/Paris";
+const RARITIES = ["C", "PC", "R", "SR", "UR", "L"];
+const NS = "http://www.w3.org/2000/svg";
+const state = {
+  recs: [], groups: new Map(), terms: [], activeTerms: new Set(), rarities: new Set(RARITIES),
+  shiny: "all", period: "all", bucket: "auto", fileName: "", snap: 0,
+  params: { ratio: 50, minRef: 40, minComp: 6, minCard: 3 },
+};
+const charts = [];
+
+/* =====================================================================
+   Petits utilitaires
+   ===================================================================== */
+const $ = (s, r = document) => r.querySelector(s);
+const nf = new Intl.NumberFormat("fr-FR");
+const fmtInt = (n) => (n == null || Number.isNaN(n) ? "—" : nf.format(Math.round(n)));
+function fmtCompact(n) {
+  if (n == null || Number.isNaN(n)) return "—";
+  const a = Math.abs(n);
+  if (a >= 1e6) return (n / 1e6).toFixed(a >= 1e7 ? 0 : 1).replace(".", ",").replace(",0", "") + " M";
+  if (a >= 1e4) return Math.round(n / 1e3) + " k";
+  return nf.format(Math.round(n * 100) / 100);
+}
+const fmtPct = (x, d = 0) => (x == null || Number.isNaN(x) ? "—" : (x * 100).toFixed(d).replace(".", ",") + " %");
+const fmtSigned = (x) => (x == null ? "—" : (x > 0 ? "+" : "") + (x * 100).toFixed(0) + " %");
+const dateFmt = new Intl.DateTimeFormat("fr-FR", { timeZone: TZ, day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+const dayShort = new Intl.DateTimeFormat("fr-FR", { timeZone: TZ, day: "2-digit", month: "2-digit" });
+const dayKeyFmt = new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" });
+const hourFmt = new Intl.DateTimeFormat("fr-FR", { timeZone: TZ, hour: "numeric", hourCycle: "h23" });
+const parisDay = (ms) => dayKeyFmt.format(ms);
+const parisHour = (ms) => parseInt(hourFmt.format(ms), 10);
+function parseTime(iso) {
+  const t = Date.parse(String(iso ?? "").replace(/(\.\d{3})\d+/, "$1"));
+  return Number.isNaN(t) ? null : t;
+}
+function quantile(sorted, q) {
+  if (!sorted.length) return null;
+  const p = (sorted.length - 1) * q, lo = Math.floor(p), hi = Math.ceil(p);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (p - lo);
+}
+const sortNum = (a) => [...a].sort((x, y) => x - y);
+const median = (a) => quantile(sortNum(a), 0.5);
+function fmtDur(sec) {
+  if (sec == null) return "—";
+  const s = Math.abs(sec);
+  if (s < 90) return Math.round(s) + " s";
+  if (s < 5400) return Math.round(s / 60) + " min";
+  if (s < 172800) return (s / 3600).toFixed(1).replace(".", ",") + " h";
+  return Math.round(s / 86400) + " j";
+}
+function el(tag, props = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") e.className = v;
+    else if (k === "text") e.textContent = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v);
+  }
+  kids.flat().forEach((c) => c != null && e.append(c));
+  return e;
+}
+function svgEl(tag, attrs = {}, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.append(e);
+  return e;
+}
+function niceScale(max, ticks = 4) {
+  if (!(max > 0)) return { max: 1, step: 0.25 };
+  const raw = max / ticks, mag = 10 ** Math.floor(Math.log10(raw)), norm = raw / mag;
+  const step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10) * mag;
+  return { step, max: Math.ceil(max / step - 1e-9) * step };
+}
+
+/* =====================================================================
+   Info-bulle (une seule, texte uniquement)
+   ===================================================================== */
+const tip = el("div", { class: "tip", role: "tooltip" });
+tip.hidden = true;
+document.body.append(tip);
+function showTip(x, y, t) {
+  tip.replaceChildren();
+  if (t.title) tip.append(el("div", { class: "tt", text: t.title }));
+  (t.rows || []).forEach((r) => {
+    const row = el("div", { class: "tr" });
+    if (r.color) { const k = el("span", { class: "k" }); k.style.background = r.color; row.append(k); }
+    row.append(el("strong", { text: r.value }), el("span", { class: "n", text: r.label || "" }));
+    tip.append(row);
+  });
+  tip.hidden = false;
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let left = x + 14, top = y + 14;
+  if (left + w > innerWidth - 8) left = x - w - 14;
+  if (top + h > innerHeight - 8) top = y - h - 14;
+  tip.style.left = Math.max(8, left) + "px";
+  tip.style.top = Math.max(8, top) + "px";
+}
+const hideTip = () => { tip.hidden = true; };
+function tipAtElement(node, t) {
+  const r = node.getBoundingClientRect();
+  showTip(r.left + r.width / 2, r.top + r.height / 2, t);
+}
+
+/* =====================================================================
+   Graphiques SVG
+   ===================================================================== */
+function topRounded(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h);
+  return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
+}
+
+/* Colonnes simples ou empilées. o.cats = [{label, vals:[...], tip:{title,rows}}], o.series = [{name,color}] */
+function columnChart(box, o) {
+  const W = Math.max(280, box.clientWidth), H = o.height || 230;
+  const m = { l: 44, r: 8, t: 18, b: 28 };
+  const pw = W - m.l - m.r, ph = H - m.t - m.b, n = o.cats.length;
+  const totals = o.cats.map((c) => c.vals.reduce((a, b) => a + (b || 0), 0));
+  const tops = o.stacked ? totals : o.cats.map((c) => Math.max(0, ...c.vals.map((v) => v || 0)));
+  const sc = niceScale(o.yMax ?? Math.max(0, ...tops), 4);
+  const fmt = o.fmt || fmtCompact;
+  const y = (v) => m.t + ph - (v / sc.max) * ph;
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": o.title || "" });
+  for (let v = 0; v <= sc.max + 1e-9; v += sc.step) {
+    svgEl("line", { x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), class: v === 0 ? "axisl" : "gridl" }, svg);
+    svgEl("text", { x: m.l - 6, y: y(v) + 4, "text-anchor": "end" }, svg).textContent = fmt(v);
+  }
+  const band = pw / n, bw = Math.min(24, band * 0.62);
+  const every = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(pw / (o.labelW || 46)))));
+  const hover = svgEl("rect", { class: "hoverband", y: m.t, height: ph, width: band, visibility: "hidden" }, svg);
+  const maxTop = Math.max(...tops);
+  let labelled = false;
+  o.cats.forEach((c, i) => {
+    const cx = m.l + band * (i + 0.5);
+    let acc = 0;
+    const lastSi = c.vals.reduce((a, v, si) => (v > 0 ? si : a), -1);
+    c.vals.forEach((v, si) => {
+      if (!(v > 0)) return;
+      const y0 = y(acc), y1 = y(acc + v), gap = o.stacked && acc > 0 ? 2 : 0;
+      const hh = Math.max(1, y0 - y1 - gap);
+      const d = si === lastSi ? topRounded(cx - bw / 2, y1, bw, hh, 4) : `M${cx - bw / 2},${y1 + hh}V${y1}H${cx + bw / 2}V${y1 + hh}Z`;
+      const p = svgEl("path", { d }, svg);
+      p.style.fill = o.colorOf ? o.colorOf(c, si, i) : o.series[si].color;
+      acc += v;
+    });
+    if (!labelled && tops[i] === maxTop && maxTop > 0 && o.labelMax !== false) {
+      labelled = true;
+      svgEl("text", { x: cx, y: y(tops[i]) - 5, "text-anchor": "middle", class: "val" }, svg).textContent = fmt(tops[i]);
+    }
+    if (i % every === 0) svgEl("text", { x: cx, y: H - 9, "text-anchor": "middle" }, svg).textContent = c.label;
+  });
+  o.cats.forEach((c, i) => {
+    const hit = svgEl("rect", { class: "hit", x: m.l + band * i, y: m.t, width: band, height: ph, tabindex: 0, "aria-label": `${c.label} : ${(c.tip?.rows || []).map((r) => r.value + " " + (r.label || "")).join(", ")}` }, svg);
+    const on = (fn) => { hover.setAttribute("x", m.l + band * i); hover.setAttribute("visibility", "visible"); fn(); };
+    hit.addEventListener("pointermove", (e) => on(() => showTip(e.clientX, e.clientY, c.tip)));
+    hit.addEventListener("focus", () => on(() => tipAtElement(hit, c.tip)));
+    hit.addEventListener("pointerleave", () => { hover.setAttribute("visibility", "hidden"); hideTip(); });
+    hit.addEventListener("blur", () => { hover.setAttribute("visibility", "hidden"); hideTip(); });
+  });
+  box.replaceChildren(svg);
+}
+
+/* Lignes (une ou plusieurs séries, x catégoriel). series[i].vals peut contenir des null (trous). */
+function lineChart(box, o) {
+  const W = Math.max(240, box.clientWidth), H = o.height || 150;
+  const m = { l: 40, r: 46, t: 12, b: 24 };
+  const pw = W - m.l - m.r, ph = H - m.t - m.b, n = o.labels.length;
+  const all = o.series.flatMap((s) => s.vals).filter((v) => v != null);
+  const sc = niceScale(o.yMax ?? Math.max(0, ...all), 3);
+  const fmt = o.fmt || fmtCompact;
+  const x = (i) => m.l + (n > 1 ? (pw * i) / (n - 1) : pw / 2);
+  const y = (v) => m.t + ph - (v / sc.max) * ph;
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": o.title || "" });
+  for (let v = 0; v <= sc.max + 1e-9; v += sc.step) {
+    svgEl("line", { x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), class: v === 0 ? "axisl" : "gridl" }, svg);
+    svgEl("text", { x: m.l - 6, y: y(v) + 4, "text-anchor": "end" }, svg).textContent = fmt(v);
+  }
+  const every = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(pw / (o.labelW || 56)))));
+  o.labels.forEach((l, i) => { if (i % every === 0) svgEl("text", { x: x(i), y: H - 7, "text-anchor": "middle" }, svg).textContent = l; });
+  o.series.forEach((s) => {
+    let d = "", area = "", seg = [];
+    const flush = () => {
+      if (!seg.length) return;
+      d += seg.map(([i, v], k) => `${k ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join("");
+      if (o.series.length === 1 && seg.length > 1) area += `M${x(seg[0][0])},${y(0)}` + seg.map(([i, v]) => `L${x(i).toFixed(1)},${y(v).toFixed(1)}`).join("") + `L${x(seg[seg.length - 1][0])},${y(0)}Z`;
+      seg = [];
+    };
+    s.vals.forEach((v, i) => (v == null ? flush() : seg.push([i, v])));
+    flush();
+    if (area) { const a = svgEl("path", { d: area, opacity: 0.1 }, svg); a.style.fill = s.color; }
+    const p = svgEl("path", { d, fill: "none", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+    p.style.stroke = s.color;
+    let last = -1;
+    s.vals.forEach((v, i) => { if (v != null) last = i; });
+    if (last >= 0) {
+      const dot = svgEl("circle", { cx: x(last), cy: y(s.vals[last]), r: 4, class: "ring" }, svg);
+      dot.style.fill = s.color;
+      svgEl("text", { x: x(last) + 8, y: y(s.vals[last]) + 4, class: "val" }, svg).textContent = fmt(s.vals[last]);
+    }
+  });
+  const xh = svgEl("line", { class: "xhair", y1: m.t, y2: m.t + ph, visibility: "hidden" }, svg);
+  const marks = o.series.map((s) => { const c = svgEl("circle", { r: 4, class: "ring", visibility: "hidden" }, svg); c.style.fill = s.color; return c; });
+  const over = svgEl("rect", { class: "hit", x: m.l, y: m.t, width: pw, height: ph, tabindex: 0 }, svg);
+  const at = (i, cx, cy) => {
+    xh.setAttribute("x1", x(i)); xh.setAttribute("x2", x(i)); xh.setAttribute("visibility", "visible");
+    o.series.forEach((s, k) => {
+      const v = s.vals[i];
+      if (v == null) marks[k].setAttribute("visibility", "hidden");
+      else { marks[k].setAttribute("cx", x(i)); marks[k].setAttribute("cy", y(v)); marks[k].setAttribute("visibility", "visible"); }
+    });
+    const t = o.tipAt ? o.tipAt(i) : {
+      title: o.labels[i],
+      rows: o.series.filter((s) => s.vals[i] != null).map((s) => ({ color: s.color, value: fmt(s.vals[i]), label: o.series.length > 1 ? s.name : "" })),
+    };
+    cx == null ? tipAtElement(over, t) : showTip(cx, cy, t);
+  };
+  const idxOf = (e) => {
+    const r = over.getBoundingClientRect();
+    return Math.max(0, Math.min(n - 1, Math.round(((e.clientX - r.left) / r.width) * (n - 1))));
+  };
+  over.addEventListener("pointermove", (e) => at(idxOf(e), e.clientX, e.clientY));
+  over.addEventListener("pointerleave", () => { xh.setAttribute("visibility", "hidden"); marks.forEach((c) => c.setAttribute("visibility", "hidden")); hideTip(); });
+  over.addEventListener("focus", () => at(n - 1));
+  over.addEventListener("blur", () => { xh.setAttribute("visibility", "hidden"); marks.forEach((c) => c.setAttribute("visibility", "hidden")); hideTip(); });
+  box.replaceChildren(svg);
+}
+
+/* Nuage de points (prix d'une carte dans le temps), échelle log si l'amplitude est grande */
+function scatterChart(box, o) {
+  const W = Math.max(280, box.clientWidth), H = o.height || 240;
+  const m = { l: 48, r: 14, t: 12, b: 26 };
+  const pw = W - m.l - m.r, ph = H - m.t - m.b;
+  const ys = o.pts.map((p) => p.y).filter((v) => v > 0);
+  const lo = Math.min(...ys), hi = Math.max(...ys);
+  const log = hi / Math.max(lo, 1) > 40;
+  let ticks, yp;
+  if (log) {
+    const a = Math.floor(Math.log10(Math.max(lo, 1))), b = Math.ceil(Math.log10(hi));
+    ticks = []; for (let e = a; e <= b; e++) ticks.push(10 ** e);
+    yp = (v) => m.t + ph - ((Math.log10(Math.max(v, 1)) - a) / Math.max(1, b - a)) * ph;
+  } else {
+    const sc = niceScale(hi, 4); ticks = []; for (let v = 0; v <= sc.max + 1e-9; v += sc.step) ticks.push(v);
+    yp = (v) => m.t + ph - (v / sc.max) * ph;
+  }
+  const xs = o.pts.map((p) => p.x), x0 = Math.min(...xs), x1 = Math.max(...xs, x0 + 1);
+  const xp = (v) => m.l + ((v - x0) / (x1 - x0)) * pw;
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": o.title || "" });
+  ticks.forEach((v) => {
+    svgEl("line", { x1: m.l, x2: W - m.r, y1: yp(v), y2: yp(v), class: "gridl" }, svg);
+    svgEl("text", { x: m.l - 6, y: yp(v) + 4, "text-anchor": "end" }, svg).textContent = fmtCompact(v);
+  });
+  svgEl("line", { x1: m.l, x2: W - m.r, y1: m.t + ph, y2: m.t + ph, class: "axisl" }, svg);
+  for (let k = 0; k <= 4; k++) {
+    const t = x0 + ((x1 - x0) * k) / 4;
+    svgEl("text", { x: xp(t), y: H - 8, "text-anchor": k === 0 ? "start" : k === 4 ? "end" : "middle" }, svg).textContent = dayShort.format(t);
+  }
+  if (o.ref != null) {
+    const r = svgEl("line", { x1: m.l, x2: W - m.r, y1: yp(o.ref), y2: yp(o.ref), "stroke-width": 1.5 }, svg);
+    r.style.stroke = "var(--s2)";
+    svgEl("text", { x: W - m.r, y: yp(o.ref) - 5, "text-anchor": "end", class: "val" }, svg).textContent = "médiane " + fmtCompact(Math.round(o.ref));
+  }
+  /* Courbe de tendance : moyenne glissante pondérée (noyau gaussien), calculée dans
+     l'espace de l'axe (log10 si l'axe est logarithmique, donc moyenne géométrique).
+     Lissée en courbe, coupée là où il n'y a presque aucune vente. */
+  if (o.pts.length >= 4) {
+    const tf = log ? (v) => Math.log10(Math.max(v, 1)) : (v) => v;
+    const bw = Math.max((x1 - x0) / 6, 1);
+    const STEPS = 48, samples = [];
+    for (let k = 0; k <= STEPS; k++) {
+      const x = x0 + ((x1 - x0) * k) / STEPS;
+      let sw = 0, sv = 0;
+      o.pts.forEach((p) => { const z = (p.x - x) / bw, w = Math.exp(-0.5 * z * z); sw += w; sv += w * tf(p.y); });
+      samples.push(sw >= 0.5 ? { x: xp(x), y: yp(log ? 10 ** (sv / sw) : sv / sw) } : null);
+    }
+    let d = "", seg = [];
+    const flush = () => {
+      if (seg.length >= 2) {
+        d += `M${seg[0].x.toFixed(1)},${seg[0].y.toFixed(1)}`;
+        for (let i = 0; i < seg.length - 1; i++) {   // Catmull-Rom -> Bézier cubique
+          const p0 = seg[Math.max(0, i - 1)], p1 = seg[i], p2 = seg[i + 1], p3 = seg[Math.min(seg.length - 1, i + 2)];
+          d += `C${(p1.x + (p2.x - p0.x) / 6).toFixed(1)},${(p1.y + (p2.y - p0.y) / 6).toFixed(1)} ${(p2.x - (p3.x - p1.x) / 6).toFixed(1)},${(p2.y - (p3.y - p1.y) / 6).toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
+        }
+      }
+      seg = [];
+    };
+    samples.forEach((s) => { if (s) seg.push(s); else flush(); });
+    flush();
+    if (d) {
+      const tr = svgEl("path", { d, fill: "none", "stroke-width": 2.5, "stroke-linecap": "round", "stroke-linejoin": "round", "pointer-events": "none" }, svg);
+      tr.style.stroke = "var(--s1)"; tr.style.opacity = "0.6";
+      svgEl("text", { x: m.l + 4, y: m.t + 11, class: "val" }, svg).textContent = "ligne : tendance (moyenne glissante" + (log ? " géométrique" : "") + ")";
+    }
+  }
+  const dots = o.pts.map((p) => { const c = svgEl("circle", { cx: xp(p.x), cy: yp(p.y), r: 4, class: "ring" }, svg); c.style.fill = "var(--s1)"; return c; });
+  const sel = svgEl("circle", { r: 7, fill: "none", "stroke-width": 2, visibility: "hidden", "pointer-events": "none" }, svg);
+  sel.style.stroke = "var(--ink)";
+  const over = svgEl("rect", { class: "hit", x: m.l, y: m.t, width: pw, height: ph, tabindex: 0 }, svg);
+  const nearest = (e) => {
+    const r = over.getBoundingClientRect();
+    const mx = e.clientX - r.left + m.l, my = e.clientY - r.top + m.t;
+    let best = -1, bd = 24 * 24;
+    o.pts.forEach((p, i) => { const dx = xp(p.x) - mx, dy = yp(p.y) - my, d = dx * dx + dy * dy; if (d < bd) { bd = d; best = i; } });
+    return best;
+  };
+  over.addEventListener("pointermove", (e) => {
+    const i = nearest(e);
+    if (i < 0) { sel.setAttribute("visibility", "hidden"); hideTip(); return; }
+    sel.setAttribute("cx", xp(o.pts[i].x)); sel.setAttribute("cy", yp(o.pts[i].y)); sel.setAttribute("visibility", "visible");
+    showTip(e.clientX, e.clientY, o.pts[i].tip);
+  });
+  over.addEventListener("pointerleave", () => { sel.setAttribute("visibility", "hidden"); hideTip(); });
+  box.replaceChildren(svg);
+}
+
+/* =====================================================================
+   Carte-graphique : titre, sous-titre, bouton « Tableau »
+   spec = { title, sub, legend?:[{name,color}], data:()=>D, draw:(box,D), table:(D)=>({cols,rows}) }
+   ===================================================================== */
+function chartCard(parent, spec) {
+  let D;
+  try { D = spec.data(); } catch (e) { console.error(e); D = null; }
+  const card = el("figure", { class: "card" });
+  const tog = el("button", { class: "tog", type: "button", "aria-pressed": "false", text: "Tableau" });
+  card.append(el("div", { class: "ch" }, el("div", { class: "t" }, el("h3", { text: spec.title }), spec.sub ? el("p", { text: spec.sub }) : null), tog));
+  if (spec.legend) {
+    const lg = el("div", { class: "legend" });
+    spec.legend.forEach((s) => { const i = el("i"); i.style.background = s.color; lg.append(el("span", {}, i, s.name)); });
+    card.append(lg);
+  }
+  const box = el("div", { class: "chartbox" });
+  card.append(box);
+  parent.append(card);
+  let showTable = false;
+  const draw = () => {
+    if (D == null || (spec.empty && spec.empty(D))) { box.replaceChildren(el("div", { class: "empty", text: "Pas assez de données avec ces filtres." })); return; }
+    if (showTable) {
+      const t = spec.table(D);
+      box.replaceChildren(el("div", { class: "tablewrap" }, plainTable(t.cols, t.rows)));
+    } else spec.draw(box, D);
+  };
+  tog.addEventListener("click", () => {
+    showTable = !showTable;
+    tog.textContent = showTable ? "Graphique" : "Tableau";
+    tog.setAttribute("aria-pressed", String(showTable));
+    draw();
+  });
+  charts.push(draw);
+  draw();
+  return card;
+}
+function plainTable(cols, rows) {
+  const t = el("table", { class: "dt" });
+  t.append(el("thead", {}, el("tr", {}, cols.map((c, i) => el("th", { scope: "col", class: i ? "num" : "", text: c })))));
+  t.append(el("tbody", {}, rows.map((r) => el("tr", {}, r.map((v, i) => el("td", { class: i ? "num" : "", text: v }))))));
+  return t;
+}
+
+/* =====================================================================
+   Tableau triable avec « Afficher plus »
+   cols: [{key,label,num,render?(row)->Node|string, val?(row)->sort value, title?}]
+   ===================================================================== */
+function dataTable({ cols, rows, sortKey, dir = -1, pageSize = 25 }) {
+  let key = sortKey, d = dir, shown = pageSize;
+  const wrap = el("div");
+  const draw = () => {
+    const col = cols.find((c) => c.key === key);
+    const val = col?.val || ((r) => r[key]);
+    const sorted = [...rows].sort((a, b) => {
+      const x = val(a), y = val(b);
+      if (x == null && y == null) return 0;
+      if (x == null) return 1;
+      if (y == null) return -1;
+      return (typeof x === "string" ? x.localeCompare(y, "fr") : x - y) * d;
+    });
+    const t = el("table", { class: "dt" });
+    t.append(el("thead", {}, el("tr", {}, cols.map((c) => {
+      const th = el("th", { scope: "col", class: c.num ? "num" : "", title: c.title || "" });
+      th.setAttribute("aria-sort", c.key === key ? (d > 0 ? "ascending" : "descending") : "none");
+      th.append(el("button", { type: "button", text: c.label, onclick: () => { if (key === c.key) d = -d; else { key = c.key; d = c.num ? -1 : 1; } shown = pageSize; draw(); } }));
+      return th;
+    }))));
+    t.append(el("tbody", {}, sorted.slice(0, shown).map((r) => el("tr", {}, cols.map((c) => {
+      const v = c.render ? c.render(r) : r[c.key];
+      return el("td", { class: c.num ? "num" : "" }, v);
+    })))));
+    wrap.replaceChildren(el("div", { class: "tablewrap" }, t));
+    if (sorted.length > shown) wrap.append(el("button", { class: "btn more", type: "button", text: `Afficher plus (${fmtInt(sorted.length - shown)} restantes)`, onclick: () => { shown += pageSize * 2; draw(); } }));
+    if (!sorted.length) wrap.append(el("div", { class: "empty", text: "Aucune ligne avec ces filtres." }));
+  };
+  draw();
+  return wrap;
+}
+const cardLink = (r) => el("button", { class: "link", type: "button", text: r.name + (r.shiny ? " ✨" : ""), onclick: () => openCard(r.key) });
+
+/* =====================================================================
+   Préparation des données
+   ===================================================================== */
+function prepare(raw) {
+  const recs = raw.map((r) => {
+    const end = parseTime(r.endAt), created = parseTime(r.createdAt);
+    const sold = r.status === "settled_sold", unsold = r.status === "settled_unsold";
+    const rec = {
+      id: r.id, name: r.cardName || "(sans nom)", rarity: r.rarity, shiny: !!r.isShiny,
+      key: (r.cardName || r.cardId || "?") + (r.isShiny ? " ✨" : ""),
+      terms: r.terms || [], status: r.status, sold, unsold, fin: sold || unsold, open: r.state === "open" && r.status === "active",
+      start: r.startPrice, final: r.finalPrice, bids: r.bidCount, bidders: r.bidderCount,
+      end, created, dur: end && created ? Math.round((end - created) / 60000) : null,
+      lastBidSec: r.lastBidAt && end ? (end - r.lastBidAt) / 1000 : null,
+      seen: r.lastSeenAt || r.firstSeenAt || 0,
+      hour: null, day: null,
+    };
+    if (rec.fin && end) { rec.hour = parisHour(end); rec.day = parisDay(end); }
+    return rec;
+  });
+  return recs;
+}
+function buildGroups(recs) {
+  const g = new Map();
+  recs.forEach((r) => {
+    if (!r.sold || r.final == null) return;
+    let e = g.get(r.key);
+    if (!e) g.set(r.key, (e = { prices: [], recs: [] }));
+    e.prices.push(r.final); e.recs.push(r);
+  });
+  g.forEach((e) => e.prices.sort((a, b) => a - b));
+  return g;
+}
+/* Médiane des autres ventes de la même carte : on retire (virtuellement) cette vente de la liste triée */
+function lowerBound(a, v) { let lo = 0, hi = a.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (a[mid] < v) lo = mid + 1; else hi = mid; } return lo; }
+function looMedian(sorted, price) {
+  const n = sorted.length - 1;
+  if (n < 1) return null;
+  const p = lowerBound(sorted, price), at = (i) => (i < p ? sorted[i] : sorted[i + 1]);
+  return n % 2 ? at((n - 1) / 2) : (at(n / 2 - 1) + at(n / 2)) / 2;
+}
+
+/* =====================================================================
+   Filtrage
+   ===================================================================== */
+function inScope(r) {
+  if (state.activeTerms.size < state.terms.length && !r.terms.some((t) => state.activeTerms.has(t))) return false;
+  if (!state.rarities.has(r.rarity)) return false;
+  if (state.shiny === "no" && r.shiny) return false;
+  if (state.shiny === "only" && !r.shiny) return false;
+  return true;
+}
+function periodStart() {
+  const days = { all: 0, "24h": 1, "7d": 7, "30d": 30 }[state.period];
+  return days ? state.maxEnd - days * 864e5 : 0;
+}
+
+/* =====================================================================
+   Calcul de toutes les données dérivées (une fois par rendu)
+   ===================================================================== */
+function compute() {
+  const since = periodStart();
+  const fin = state.recs.filter((r) => r.fin && inScope(r) && r.end >= since);
+  const sold = fin.filter((r) => r.sold && r.final != null);
+  const P = state.params;
+  const evaluable = [];
+  sold.forEach((r) => {
+    const g = state.groups.get(r.key);
+    if (!g || g.prices.length - 1 < P.minComp) return;
+    const ref = looMedian(g.prices, r.final);
+    if (ref == null || ref < P.minRef) return;
+    evaluable.push({ r, ref, ratio: r.final / ref });
+  });
+  const thr = P.ratio / 100;
+  const deals = evaluable.filter((e) => e.ratio <= thr);
+  return { fin, sold, evaluable, deals, thr };
+}
+
+/* =====================================================================
+   Sections
+   ===================================================================== */
+function section(out, title, sub) {
+  const s = el("section", { class: "sec" }, el("header", {}, el("h2", { text: title }), sub ? el("p", { class: "sub", text: sub }) : null));
+  out.append(s);
+  return s;
+}
+function tile(l, v, s) { return el("div", { class: "tile" }, el("div", { class: "l", text: l }), el("div", { class: "v", text: v }), s ? el("div", { class: "s", text: s }) : null); }
+function legendFor(pairs) { return pairs.map(([name, color]) => ({ name, color })); }
+const SOLD = "var(--s1)", UNSOLD = "var(--s2)";
+
+function renderAll() {
+  charts.length = 0;
+  hideTip();
+  const out = $("#out");
+  out.replaceChildren();
+  const C = compute();
+  const { fin, sold, evaluable, deals } = C;
+  const P = state.params;
+  if (!fin.length) { out.append(el("div", { class: "empty", text: "Aucune enchère terminée avec ces filtres." })); return; }
+
+  /* ---------- Chiffres clés ---------- */
+  const prices = sortNum(sold.map((r) => r.final));
+  const tiles = el("div", { class: "tiles" });
+  tiles.append(
+    tile("Enchères terminées", fmtInt(fin.length), `${fmtInt(sold.length)} vendues · ${fmtInt(fin.length - sold.length)} invendues`),
+    tile("Taux de vente", fmtPct(sold.length / fin.length), "part des enchères qui trouvent preneur"),
+    tile("Prix médian (vendues)", fmtInt(quantile(prices, 0.5)), `50 % des ventes entre ${fmtInt(quantile(prices, 0.25))} et ${fmtInt(quantile(prices, 0.75))}`),
+    tile("Wikibidous échangés", fmtCompact(prices.reduce((a, b) => a + b, 0)), "somme des prix finaux"),
+    tile("Enchérisseurs médians", fmtInt(median(sold.map((r) => r.bidders || 0))), "par enchère vendue"),
+    tile(`Ventes ≤ ${P.ratio} % du médian`, evaluable.length ? fmtPct(deals.length / evaluable.length) : "—", `${fmtInt(deals.length)} sur ${fmtInt(evaluable.length)} évaluables`),
+  );
+  out.append(tiles);
+
+  /* ---------- ACHETER ---------- */
+  const buy = section(out, "Acheter moins cher", `Une vente est une « bonne affaire » quand son prix est ≤ ${P.ratio} % de la médiane des autres ventes de la même carte (référence ≥ ${P.minRef}, au moins ${P.minComp} ventes comparables).`);
+  const dealsCard = el("div", { class: "card", style: "margin-bottom:14px" });
+  dealsCard.append(el("div", { class: "ch" }, el("div", { class: "t" }, el("h3", { text: "Meilleures affaires passées" }), el("p", { text: "Triez par économie (médiane − prix payé) ou par % du médian. Cliquez une carte pour son historique." }))));
+  dealsCard.append(dataTable({
+    sortKey: "save",
+    cols: [
+      { key: "name", label: "Carte", render: (e) => cardLink(e.r), val: (e) => e.r.name },
+      { key: "rar", label: "Rareté", val: (e) => RARITIES.indexOf(e.r.rarity), render: (e) => e.r.rarity },
+      { key: "price", label: "Prix payé", num: true, val: (e) => e.r.final, render: (e) => fmtInt(e.r.final) },
+      { key: "ref", label: "Médiane (autres)", title: "Médiane des autres ventes de la même carte", num: true, val: (e) => e.ref, render: (e) => fmtInt(e.ref) },
+      { key: "ratio", label: "% du médian", num: true, val: (e) => e.ratio, render: (e) => fmtPct(e.ratio) },
+      { key: "save", label: "Économie", num: true, val: (e) => e.ref - e.r.final, render: (e) => fmtInt(e.ref - e.r.final) },
+      { key: "bids", label: "Mises", num: true, val: (e) => e.r.bids, render: (e) => fmtInt(e.r.bids) },
+      { key: "bidders", label: "Enchér.", title: "Enchérisseurs différents", num: true, val: (e) => e.r.bidders, render: (e) => fmtInt(e.r.bidders) },
+      { key: "last", label: "Dernière mise", title: "Délai entre la dernière mise et la fin", num: true, val: (e) => e.r.lastBidSec, render: (e) => fmtDur(e.r.lastBidSec) },
+      { key: "end", label: "Fin", num: true, val: (e) => e.r.end, render: (e) => dateFmt.format(e.r.end) },
+    ],
+    rows: deals,
+  }));
+  buy.append(dealsCard);
+  const g1 = el("div", { class: "grid2" });
+  buy.append(g1);
+
+  chartCard(g1, {
+    title: "Prix payé par rapport au médian de la carte",
+    sub: `Les barres en couleur sont les ventes ≤ ${P.ratio} % du médian.`,
+    data: () => {
+      const edges = [0.1, 0.25, 0.5, 0.75, 1, 1.5, 2.5, Infinity];
+      const labels = ["< 10 %", "10–25 %", "25–50 %", "50–75 %", "75–100 %", "100–150 %", "150–250 %", "> 250 %"];
+      const cnt = labels.map(() => 0);
+      evaluable.forEach((e) => { cnt[edges.findIndex((x) => e.ratio < x)]++; });
+      return { edges, labels, cnt, total: evaluable.length };
+    },
+    empty: (D) => !D.total,
+    draw: (box, D) => columnChart(box, {
+      title: "Répartition du prix payé par rapport au médian",
+      cats: D.labels.map((l, i) => ({ label: l, vals: [D.cnt[i]], edge: D.edges[i], tip: { title: `Prix ${l} du médian`, rows: [{ value: fmtInt(D.cnt[i]), label: `ventes (${fmtPct(D.cnt[i] / D.total, 1)})` }] } })),
+      series: [{ name: "Ventes", color: SOLD }],
+      colorOf: (c) => (c.edge <= C.thr + 1e-9 ? SOLD : "var(--other)"), labelW: 58,
+    }),
+    table: (D) => ({ cols: ["Prix / médian", "Ventes", "Part"], rows: D.labels.map((l, i) => [l, fmtInt(D.cnt[i]), fmtPct(D.cnt[i] / D.total, 1)]) }),
+  });
+
+  chartCard(g1, {
+    title: "Bonnes affaires selon le nombre d'enchérisseurs",
+    sub: `Part des ventes ≤ ${P.ratio} % du médian, selon le nombre d'enchérisseurs différents.`,
+    data: () => {
+      const defs = [["1", (b) => b === 1], ["2", (b) => b === 2], ["3", (b) => b === 3], ["4–5", (b) => b >= 4 && b <= 5], ["6+", (b) => b >= 6]];
+      return defs.map(([label, f]) => {
+        const rs = evaluable.filter((e) => f(e.r.bidders));
+        return { label, n: rs.length, deals: rs.filter((e) => e.ratio <= C.thr).length, med: rs.length ? median(rs.map((e) => e.ratio)) : null };
+      });
+    },
+    empty: (D) => !D.some((x) => x.n),
+    draw: (box, D) => columnChart(box, {
+      title: "Part de bonnes affaires selon le nombre d'enchérisseurs", fmt: (v) => Math.round(v * 100) + " %",
+      cats: D.map((d) => ({ label: d.label + (d.label === "1" ? " enchérisseur" : ""), vals: [d.n ? d.deals / d.n : 0], tip: { title: `${d.label} enchérisseur(s)`, rows: [{ value: d.n ? fmtPct(d.deals / d.n) : "—", label: "de bonnes affaires" }, { value: fmtPct(d.med), label: "du médian (médiane du groupe)" }, { value: fmtInt(d.n), label: "ventes" }] } })),
+      series: [{ name: "Part", color: SOLD }], labelW: 90,
+    }),
+    table: (D) => ({ cols: ["Enchérisseurs", "Ventes évaluables", "Bonnes affaires", "Part", "Prix / médian (médiane)"], rows: D.map((d) => [d.label, fmtInt(d.n), fmtInt(d.deals), d.n ? fmtPct(d.deals / d.n) : "—", fmtPct(d.med)]) }),
+  });
+
+  chartCard(g1, {
+    title: "À quelle heure se concluent les bonnes affaires",
+    sub: "Part des ventes ≤ seuil, selon l'heure de fin (heure de Paris).",
+    data: () => {
+      const rows = Array.from({ length: 24 }, (_, h) => ({ h, n: 0, d: 0 }));
+      evaluable.forEach((e) => { rows[e.r.hour].n++; if (e.ratio <= C.thr) rows[e.r.hour].d++; });
+      return rows;
+    },
+    empty: (D) => !D.some((r) => r.n),
+    draw: (box, D) => columnChart(box, {
+      title: "Part de bonnes affaires par heure de fin", fmt: (v) => Math.round(v * 100) + " %", labelW: 30,
+      cats: D.map((r) => ({ label: String(r.h), vals: [r.n ? r.d / r.n : 0], tip: { title: `Fin entre ${r.h} h et ${r.h + 1} h`, rows: [{ value: r.n ? fmtPct(r.d / r.n) : "—", label: "de bonnes affaires" }, { value: fmtInt(r.d) + " / " + fmtInt(r.n), label: "ventes" }] } })),
+      series: [{ name: "Part", color: SOLD }],
+    }),
+    table: (D) => ({ cols: ["Heure de fin", "Bonnes affaires", "Ventes évaluables", "Part"], rows: D.map((r) => [r.h + " h", fmtInt(r.d), fmtInt(r.n), r.n ? fmtPct(r.d / r.n) : "—"]) }),
+  });
+
+  chartCard(g1, {
+    title: "Quand tombe la dernière mise ?",
+    sub: "Part des ventes selon le délai entre la dernière mise et la fin : où se jouent les enchères.",
+    data: () => {
+      const defs = [["< 10 s", 10], ["10–60 s", 60], ["1–5 min", 300], ["5–30 min", 1800], ["30 min–2 h", 7200], ["> 2 h", Infinity]];
+      const rs = sold.filter((r) => r.lastBidSec != null);
+      const cnt = defs.map(() => 0);
+      rs.forEach((r) => { cnt[defs.findIndex(([, hi]) => r.lastBidSec < hi)]++; });
+      return { defs, cnt, total: rs.length };
+    },
+    empty: (D) => !D.total,
+    draw: (box, D) => columnChart(box, {
+      title: "Délai entre la dernière mise et la fin", fmt: (v) => Math.round(v * 100) + " %", labelW: 76,
+      cats: D.defs.map(([l], i) => ({ label: l, vals: [D.cnt[i] / D.total], tip: { title: `Dernière mise ${l} avant la fin`, rows: [{ value: fmtPct(D.cnt[i] / D.total, 1), label: "des ventes" }, { value: fmtInt(D.cnt[i]), label: "ventes" }] } })),
+      series: [{ name: "Part", color: SOLD }],
+    }),
+    table: (D) => ({ cols: ["Dernière mise", "Ventes", "Part"], rows: D.defs.map(([l], i) => [l, fmtInt(D.cnt[i]), fmtPct(D.cnt[i] / D.total, 1)]) }),
+  });
+
+  /* ---------- En cours ---------- */
+  const live = state.recs.filter((r) => r.open && inScope(r) && r.end > state.snap).map((r) => {
+    const g = state.groups.get(r.key);
+    if (!g || g.prices.length < P.minComp) return null;
+    const ref = quantile(g.prices, 0.5);
+    if (ref < P.minRef || r.start > ref * C.thr) return null;
+    return { r, ref, ratio: r.start / ref };
+  }).filter(Boolean);
+  if (live.length) {
+    const c = el("div", { class: "card", style: "margin-top:14px" });
+    c.append(el("div", { class: "ch" }, el("div", { class: "t" }, el("h3", { text: "À surveiller : enchères en cours à mise de départ basse" }), el("p", { text: `Au moment du dernier passage du script (${dateFmt.format(state.snap)}). Seule la mise de départ est archivée, pas la mise courante : vérifiez sur le site.` }))));
+    c.append(dataTable({
+      sortKey: "end", dir: 1,
+      cols: [
+        { key: "name", label: "Carte", render: (e) => cardLink(e.r), val: (e) => e.r.name },
+        { key: "rar", label: "Rareté", val: (e) => RARITIES.indexOf(e.r.rarity), render: (e) => e.r.rarity },
+        { key: "start", label: "Mise de départ", num: true, val: (e) => e.r.start, render: (e) => fmtInt(e.r.start) },
+        { key: "ref", label: "Médiane de la carte", num: true, val: (e) => e.ref, render: (e) => fmtInt(e.ref) },
+        { key: "ratio", label: "Départ / médiane", num: true, val: (e) => e.ratio, render: (e) => fmtPct(e.ratio) },
+        { key: "end", label: "Fin", num: true, val: (e) => e.r.end, render: (e) => `${dateFmt.format(e.r.end)} (dans ${fmtDur((e.r.end - state.snap) / 1000)})` },
+      ],
+      rows: live, pageSize: 15,
+    }));
+    buy.append(c);
+  }
+
+  /* ---------- VENDRE ---------- */
+  const sell = section(out, "Vendre mieux", "Comment mettre une carte en vente : mise de départ, durée, heure de fin. Le taux de vente est la part des enchères qui trouvent preneur.");
+  const g2 = el("div", { class: "grid2" });
+  sell.append(g2);
+  const rateTip = (title, rs) => {
+    const s = rs.filter((r) => r.sold);
+    return { title, rows: [{ value: fmtPct(rs.length ? s.length / rs.length : null), label: "de taux de vente" }, { value: fmtInt(median(s.map((r) => r.final))), label: "prix médian vendu" }, { value: fmtInt(rs.length), label: "enchères" }] };
+  };
+  const groupBy = (defs, f) => defs.map(([label, test]) => { const rs = fin.filter((r) => f(r) != null && test(f(r))); return { label, rs }; });
+
+  chartCard(g2, {
+    title: "Taux de vente selon la mise de départ",
+    sub: "Plus la mise de départ est haute, moins l'enchère trouve preneur.",
+    data: () => groupBy([["1", (v) => v <= 1], ["2–10", (v) => v > 1 && v <= 10], ["11–50", (v) => v > 10 && v <= 50], ["51–200", (v) => v > 50 && v <= 200], ["201–1 000", (v) => v > 200 && v <= 1000], ["> 1 000", (v) => v > 1000]], (r) => r.start),
+    empty: (D) => !D.some((g) => g.rs.length),
+    draw: (box, D) => columnChart(box, {
+      title: "Taux de vente par mise de départ", fmt: (v) => Math.round(v * 100) + " %", yMax: 1, labelW: 70,
+      cats: D.map((g) => ({ label: g.label, vals: [g.rs.length ? g.rs.filter((r) => r.sold).length / g.rs.length : 0], tip: rateTip(`Mise de départ ${g.label}`, g.rs) })),
+      series: [{ name: "Taux", color: SOLD }],
+    }),
+    table: (D) => ({ cols: ["Mise de départ", "Enchères", "Taux de vente", "Prix médian vendu"], rows: D.map((g) => [g.label, fmtInt(g.rs.length), fmtPct(g.rs.length ? g.rs.filter((r) => r.sold).length / g.rs.length : null), fmtInt(median(g.rs.filter((r) => r.sold).map((r) => r.final)))]) }),
+  });
+
+  chartCard(g2, {
+    title: "Taux de vente selon la durée",
+    sub: "Durée de l'enchère, de sa mise en vente à sa fin.",
+    data: () => groupBy([["≤ 20 min", (v) => v <= 20], ["30 min", (v) => v > 20 && v <= 45], ["1 h", (v) => v > 45 && v <= 90], ["3 h", (v) => v > 90 && v <= 240], ["6 h", (v) => v > 240 && v <= 540], ["12 h", (v) => v > 540 && v <= 900], ["> 12 h", (v) => v > 900]], (r) => r.dur),
+    empty: (D) => !D.some((g) => g.rs.length),
+    draw: (box, D) => columnChart(box, {
+      title: "Taux de vente par durée", fmt: (v) => Math.round(v * 100) + " %", yMax: 1, labelW: 70,
+      cats: D.map((g) => ({ label: g.label, vals: [g.rs.length ? g.rs.filter((r) => r.sold).length / g.rs.length : 0], tip: rateTip(`Durée ${g.label}`, g.rs) })),
+      series: [{ name: "Taux", color: SOLD }],
+    }),
+    table: (D) => ({ cols: ["Durée", "Enchères", "Taux de vente", "Prix médian vendu"], rows: D.map((g) => [g.label, fmtInt(g.rs.length), fmtPct(g.rs.length ? g.rs.filter((r) => r.sold).length / g.rs.length : null), fmtInt(median(g.rs.filter((r) => r.sold).map((r) => r.final)))]) }),
+  });
+
+  chartCard(g2, {
+    title: "Taux de vente selon l'heure de fin",
+    sub: "Heure de fin de l'enchère (heure de Paris).",
+    data: () => Array.from({ length: 24 }, (_, h) => ({ label: String(h), rs: fin.filter((r) => r.hour === h) })),
+    draw: (box, D) => columnChart(box, {
+      title: "Taux de vente par heure de fin", fmt: (v) => Math.round(v * 100) + " %", yMax: 1, labelW: 30,
+      cats: D.map((g) => ({ label: g.label, vals: [g.rs.length ? g.rs.filter((r) => r.sold).length / g.rs.length : 0], tip: rateTip(`Fin entre ${g.label} h et ${+g.label + 1} h`, g.rs) })),
+      series: [{ name: "Taux", color: SOLD }],
+    }),
+    table: (D) => ({ cols: ["Heure de fin", "Enchères", "Taux de vente", "Prix médian vendu"], rows: D.map((g) => [g.label + " h", fmtInt(g.rs.length), fmtPct(g.rs.length ? g.rs.filter((r) => r.sold).length / g.rs.length : null), fmtInt(median(g.rs.filter((r) => r.sold).map((r) => r.final)))]) }),
+  });
+
+  const rarCard = el("div", { class: "card" });
+  rarCard.append(el("div", { class: "ch" }, el("div", { class: "t" }, el("h3", { text: "Par rareté" }), el("p", { text: "La valeur attendue d'une mise en vente = taux de vente × prix médian." }))));
+  rarCard.append(dataTable({
+    sortKey: "ord", dir: 1,
+    cols: [
+      { key: "rar", label: "Rareté", val: (x) => x.ord, render: (x) => x.rar },
+      { key: "n", label: "Enchères", num: true, render: (x) => fmtInt(x.n) },
+      { key: "rate", label: "Taux de vente", num: true, render: (x) => fmtPct(x.rate) },
+      { key: "med", label: "Prix médian", num: true, render: (x) => fmtInt(x.med) },
+      { key: "ev", label: "Valeur attendue", num: true, render: (x) => fmtInt(x.ev) },
+    ],
+    rows: RARITIES.map((rar, ord) => {
+      const rs = fin.filter((r) => r.rarity === rar), s = rs.filter((r) => r.sold);
+      const rate = rs.length ? s.length / rs.length : null, med = median(s.map((r) => r.final));
+      return { rar, ord, n: rs.length, rate, med, start: median(rs.map((r) => r.start)), bidders: median(s.map((r) => r.bidders || 0)), ev: rate != null && med != null ? rate * med : null };
+    }).filter((x) => x.n),
+  }));
+  g2.append(rarCard);
+
+  /* ---------- TENDANCES ---------- */
+  const trend = section(out, "Tendances du marché", "Évolution dans le temps, par heure ou par jour (heure de Paris) selon la période.");
+  const buckets = (() => {
+    const mins = Math.min(...fin.map((r) => r.end)), maxs = Math.max(...fin.map((r) => r.end));
+    const hourly = state.bucket === "hour" || (state.bucket === "auto" && maxs - mins <= 4 * 864e5);
+    const keys = [], labels = [], seen = new Set();
+    for (let t = Math.floor(mins / 36e5) * 36e5; t <= maxs + 36e5; t += 36e5) {
+      const k = hourly ? parisDay(t) + " " + String(parisHour(t)).padStart(2, "0") : parisDay(t);
+      if (!seen.has(k)) { seen.add(k); keys.push(k); labels.push(hourly ? dayShort.format(t) + " " + parisHour(t) + "h" : dayShort.format(t)); }
+    }
+    const idx = new Map(keys.map((k, i) => [k, i]));
+    const keyOf = (r) => (hourly ? r.day + " " + String(r.hour).padStart(2, "0") : r.day);
+    const per = keys.map(() => []);
+    fin.forEach((r) => { const i = idx.get(keyOf(r)); if (i != null) per[i].push(r); });
+    return { labels, per, hourly };
+  })();
+  const g3 = el("div", { class: "grid2" });
+  trend.append(g3);
+  chartCard(g3, {
+    title: "Volume d'enchères terminées",
+    sub: "Vendues et invendues, par " + (buckets.hourly ? "heure" : "jour") + " de fin.",
+    legend: legendFor([["Vendues", SOLD], ["Invendues", UNSOLD]]),
+    data: () => buckets,
+    draw: (box, D) => columnChart(box, {
+      title: "Volume d'enchères terminées", stacked: true, labelMax: false, labelW: buckets.hourly ? 64 : 46,
+      cats: D.labels.map((l, i) => { const s = D.per[i].filter((r) => r.sold).length, u = D.per[i].length - s; return { label: l, vals: [s, u], tip: { title: l, rows: [{ color: SOLD, value: fmtInt(s), label: "vendues" }, { color: UNSOLD, value: fmtInt(u), label: "invendues" }] } }; }),
+      series: [{ name: "Vendues", color: SOLD }, { name: "Invendues", color: UNSOLD }],
+    }),
+    table: (D) => ({ cols: ["Période", "Vendues", "Invendues"], rows: D.labels.map((l, i) => { const s = D.per[i].filter((r) => r.sold).length; return [l, fmtInt(s), fmtInt(D.per[i].length - s)]; }) }),
+  });
+  chartCard(g3, {
+    title: "Taux de vente dans le temps",
+    sub: "Les périodes avec moins de 5 enchères sont laissées vides.",
+    data: () => buckets,
+    draw: (box, D) => lineChart(box, {
+      title: "Taux de vente dans le temps", labels: D.labels, fmt: (v) => Math.round(v * 100) + " %", yMax: 1, height: 190, labelW: buckets.hourly ? 70 : 52,
+      series: [{ name: "Taux de vente", color: SOLD, vals: D.per.map((rs) => (rs.length >= 5 ? rs.filter((r) => r.sold).length / rs.length : null)) }],
+      tipAt: (i) => ({ title: D.labels[i], rows: [{ value: D.per[i].length >= 5 ? fmtPct(D.per[i].filter((r) => r.sold).length / D.per[i].length) : "—", label: "taux de vente" }, { value: fmtInt(D.per[i].length), label: "enchères" }] }),
+    }),
+    table: (D) => ({ cols: ["Période", "Enchères", "Taux de vente"], rows: D.labels.map((l, i) => [l, fmtInt(D.per[i].length), D.per[i].length >= 5 ? fmtPct(D.per[i].filter((r) => r.sold).length / D.per[i].length) : "—"]) }),
+  });
+  const smTitle = el("h3", { text: "Prix médian vendu, par rareté", style: "margin:18px 0 2px" });
+  trend.append(smTitle, el("p", { class: "sub", text: "Un graphique par rareté, chacun avec sa propre échelle. Les périodes avec moins de 3 ventes sont laissées vides." }));
+  const g4 = el("div", { class: "grid3", style: "margin-top:10px" });
+  trend.append(g4);
+  RARITIES.forEach((rar) => {
+    chartCard(g4, {
+      title: rar, sub: null,
+      data: () => ({ labels: buckets.labels, vals: buckets.per.map((rs) => { const s = rs.filter((r) => r.rarity === rar && r.sold); return s.length >= 3 ? median(s.map((r) => r.final)) : null; }), cnt: buckets.per.map((rs) => rs.filter((r) => r.rarity === rar && r.sold).length) }),
+      empty: (D) => !D.vals.some((v) => v != null),
+      draw: (box, D) => lineChart(box, {
+        title: `Prix médian ${rar}`, labels: D.labels, height: 130, labelW: buckets.hourly ? 80 : 56,
+        series: [{ name: "Prix médian", color: SOLD, vals: D.vals }],
+        tipAt: (i) => ({ title: D.labels[i], rows: [{ value: D.vals[i] == null ? "—" : fmtInt(D.vals[i]), label: "prix médian" }, { value: fmtInt(D.cnt[i]), label: "ventes" }] }),
+      }),
+      table: (D) => ({ cols: ["Période", "Prix médian", "Ventes"], rows: D.labels.map((l, i) => [l, D.vals[i] == null ? "—" : fmtInt(D.vals[i]), fmtInt(D.cnt[i])]) }),
+    });
+  });
+
+  /* ---------- CARTES ---------- */
+  const cards = section(out, "Cartes", `Statistiques par carte (au moins ${P.minCard} ventes). « Tendance » compare la médiane de la seconde moitié des ventes à celle de la première. Cliquez une carte pour son historique.`);
+  const byKey = new Map();
+  fin.forEach((r) => { let e = byKey.get(r.key); if (!e) byKey.set(r.key, (e = { r, all: [] })); e.all.push(r); });
+  const cardRows = [];
+  byKey.forEach(({ r, all }, key) => {
+    const s = all.filter((x) => x.sold && x.final != null).sort((a, b) => a.end - b.end);
+    if (s.length < P.minCard) return;
+    const pr = sortNum(s.map((x) => x.final)), half = Math.floor(s.length / 2);
+    const trendPct = s.length >= 6 ? (() => { const a = median(s.slice(0, half).map((x) => x.final)), b = median(s.slice(s.length - half).map((x) => x.final)); return a > 0 ? b / a - 1 : null; })() : null;
+    const rate = s.length / all.length, med = quantile(pr, 0.5);
+    cardRows.push({ r, key, name: r.name, shiny: r.shiny, rarity: r.rarity, sold: s.length, unsold: all.length - s.length, rate, med, p25: quantile(pr, 0.25), p75: quantile(pr, 0.75), last: s[s.length - 1].final, trend: trendPct, start: median(all.map((x) => x.start)), bidders: median(s.map((x) => x.bidders || 0)), ev: rate * med });
+  });
+  const cc = el("div", { class: "card" });
+  const search = el("input", { type: "search", placeholder: "Rechercher une carte…", "aria-label": "Rechercher une carte" });
+  const holder = el("div");
+  const fillTable = () => {
+    const q = search.value.trim().toLowerCase();
+    holder.replaceChildren(dataTable({
+      sortKey: "ev", pageSize: 25,
+      cols: [
+        { key: "name", label: "Carte", render: (x) => cardLink(x.r), val: (x) => x.name },
+        { key: "rarity", label: "Rareté", val: (x) => RARITIES.indexOf(x.rarity), render: (x) => x.rarity },
+        { key: "sold", label: "Vendues", num: true, render: (x) => fmtInt(x.sold) },
+        { key: "unsold", label: "Invendues", num: true, render: (x) => fmtInt(x.unsold) },
+        { key: "rate", label: "Taux", num: true, render: (x) => fmtPct(x.rate) },
+        { key: "med", label: "Prix médian", num: true, render: (x) => fmtInt(x.med) },
+        { key: "ev", label: "Valeur attendue", num: true, title: "taux de vente × prix médian", render: (x) => fmtInt(x.ev) },
+        { key: "p25", label: "25 %–75 %", num: true, val: (x) => x.p25, render: (x) => `${fmtInt(x.p25)}–${fmtInt(x.p75)}` },
+        { key: "last", label: "Dernier prix", num: true, render: (x) => fmtInt(x.last) },
+        { key: "trend", label: "Tendance", num: true, render: (x) => (x.trend == null ? "—" : el("span", { class: x.trend > 0.05 ? "good" : x.trend < -0.05 ? "bad" : "", text: fmtSigned(x.trend) })) },
+        { key: "start", label: "Départ médian", num: true, render: (x) => fmtInt(x.start) },
+        { key: "bidders", label: "Enchér. méd.", title: "Nombre médian d'enchérisseurs par vente", num: true, render: (x) => fmtInt(x.bidders) },
+      ],
+      rows: q ? cardRows.filter((x) => x.name.toLowerCase().includes(q)) : cardRows,
+    }));
+  };
+  search.addEventListener("input", fillTable);
+  fillTable();
+  cc.append(el("div", { class: "toolbar" }, search, el("span", { class: "sub", text: `${fmtInt(cardRows.length)} cartes` })), holder);
+  cards.append(cc);
+  const cancelled = state.recs.filter((r) => r.status === "cancelled").length;
+  // Les graphiques mesurent leur largeur à l'ajout : on les redessine une fois la grille en place
+  requestAnimationFrame(() => charts.forEach((d) => d()));
+  out.append(el("p", { class: "note", text: `${fmtInt(cancelled)} enchères annulées et ${fmtInt(state.recs.filter((r) => r.open).length)} en cours ne sont pas comptées dans les statistiques. Heures affichées : ${TZ}.` }));
+}
+
+/* =====================================================================
+   Détail d'une carte
+   ===================================================================== */
+function openCard(key) {
+  const dlg = $("#dlg");
+  const all = state.recs.filter((r) => r.key === key && r.fin).sort((a, b) => a.end - b.end);
+  if (!all.length) return;
+  const s = all.filter((r) => r.sold && r.final != null), pr = sortNum(s.map((r) => r.final));
+  const first = all[0];
+  const head = el("div", { class: "dh" }, el("div", { class: "grow" }, el("h2", { text: first.name + (first.shiny ? " ✨" : "") }), el("p", { class: "sub", text: `${first.rarity} · toutes les enchères terminées de la carte dans l'archive` })), el("button", { class: "btn", type: "button", text: "Fermer", onclick: () => dlg.close() }));
+  const mt = el("div", { class: "minitiles" });
+  mt.append(
+    tile("Ventes", fmtInt(s.length), `${fmtInt(all.length - s.length)} invendues`),
+    tile("Taux de vente", fmtPct(s.length / all.length)),
+    tile("Prix médian", fmtInt(quantile(pr, 0.5)), `${fmtInt(quantile(pr, 0.25))}–${fmtInt(quantile(pr, 0.75))}`),
+    tile("Min / max", `${fmtInt(pr[0])} / ${fmtInt(pr[pr.length - 1])}`),
+    tile("Dernier prix", fmtInt(s[s.length - 1]?.final)),
+  );
+  const body = el("div");
+  dlg.replaceChildren(head, mt, body);
+  dlg.showModal();
+  const pts = s.map((r) => ({ x: r.end, y: r.final, tip: { title: dateFmt.format(r.end), rows: [{ value: fmtInt(r.final), label: `payé (départ ${fmtInt(r.start)})` }, { value: fmtInt(r.bidders), label: "enchérisseurs" }, { value: fmtDur(r.lastBidSec), label: "dernière mise avant la fin" }] } }));
+  if (pts.length >= 2) {
+    const box = el("div", { class: "chartbox" });
+    body.append(el("h3", { text: "Prix des ventes dans le temps", style: "margin-bottom:6px" }), box);
+    const draw = () => scatterChart(box, { title: "Prix des ventes dans le temps", pts, ref: quantile(pr, 0.5) });
+    requestAnimationFrame(draw);
+    dlg.__draw = draw;
+  } else dlg.__draw = null;
+  const recent = [...all].reverse().slice(0, 15);
+  body.append(el("h3", { text: "Dernières enchères", style: "margin:14px 0 6px" }), el("div", { class: "tablewrap" }, plainTable(
+    ["Fin", "Résultat", "Départ", "Prix", "Mises", "Enchérisseurs"],
+    recent.map((r) => [dateFmt.format(r.end), r.sold ? "vendue" : "invendue", fmtInt(r.start), r.sold ? fmtInt(r.final) : "—", fmtInt(r.bids), fmtInt(r.bidders)]),
+  )));
+}
+$("#dlg").addEventListener("click", (e) => { if (e.target === e.currentTarget) e.currentTarget.close(); });
+$("#dlg").addEventListener("close", () => { hideTip(); $("#dlg").__draw = null; });
+
+/* =====================================================================
+   Barre de filtres (une seule ligne, au-dessus de tout)
+   ===================================================================== */
+/* Termes : quelques puces en ligne, ou une liste déroulante filtrable quand ils sont nombreux.
+   Dans les deux cas, « Tous les termes » réapparaît dès qu'une sélection partielle est active. */
+const TERMS_INLINE_MAX = 6;
+function termsGroup(group, chip, rerender) {
+  const all = state.terms, total = all.length;
+  const resetBtn = el("button", { class: "btn small", type: "button", text: "↺ Tous les termes", title: "Sélectionner tous les termes" });
+  const sync = () => { resetBtn.hidden = state.activeTerms.size === total; };
+  const setTerms = (next, partial) => { state.activeTerms = new Set(next); if (partial) { partial(); renderAll(); } else rerender(); };
+  const selectAll = () => setTerms(all, state.__refreshTerms);
+  resetBtn.addEventListener("click", selectAll);
+
+  if (total <= TERMS_INLINE_MAX) {
+    state.__refreshTerms = null;
+    sync();
+    return group("Termes", ...all.map((t) => chip(t, state.activeTerms.has(t), () => { state.activeTerms.has(t) ? state.activeTerms.delete(t) : state.activeTerms.add(t); rerender(); })), resetBtn);
+  }
+
+  const summary = el("summary");
+  const search = el("input", { type: "search", placeholder: `Filtrer parmi ${total} termes…`, "aria-label": "Filtrer les termes" });
+  const list = el("div", { class: "tlist" });
+  const rows = all.map((t) => {
+    const cb = el("input", { type: "checkbox" });
+    const only = el("button", { class: "only", type: "button", text: "seul", title: `Ne garder que « ${t} »` });
+    const row = el("label", { class: "trow" }, cb, el("span", { text: t }), el("span", { class: "n", text: fmtInt(state.termCounts.get(t) || 0) }), only);
+    cb.addEventListener("change", () => { cb.checked ? state.activeTerms.add(t) : state.activeTerms.delete(t); refresh(); renderAll(); });
+    only.addEventListener("click", (e) => { e.preventDefault(); state.activeTerms = new Set([t]); refresh(); renderAll(); });
+    return { t, cb, row };
+  });
+  const none = el("div", { class: "tnone", text: "Aucun terme ne correspond." });
+  const refresh = () => {
+    const n = state.activeTerms.size;
+    summary.textContent = n === total ? `Termes : tous (${total})` : n === 0 ? "Termes : aucun" : n <= 2 ? `Termes : ${[...state.activeTerms].join(", ")}` : `Termes : ${n} / ${total}`;
+    rows.forEach((r) => { r.cb.checked = state.activeTerms.has(r.t); });
+    sync();
+  };
+  const filter = () => {
+    const q = search.value.trim().toLowerCase();
+    let shown = 0;
+    rows.forEach((r) => { const ok = !q || r.t.toLowerCase().includes(q); r.row.hidden = !ok; if (ok) shown++; });
+    none.hidden = shown > 0;
+  };
+  search.addEventListener("input", filter);
+  rows.forEach((r) => list.append(r.row));
+  const quick = el("div", { class: "tquick" },
+    el("button", { class: "btn small", type: "button", text: "Tous", onclick: () => { state.activeTerms = new Set(all); refresh(); renderAll(); } }),
+    el("button", { class: "btn small", type: "button", text: "Aucun", onclick: () => { state.activeTerms = new Set(); refresh(); renderAll(); } }),
+    el("button", { class: "btn small", type: "button", text: "Inverser", onclick: () => { state.activeTerms = new Set(all.filter((t) => !state.activeTerms.has(t))); refresh(); renderAll(); } }),
+    el("button", { class: "btn small", type: "button", text: "Filtrés seulement", title: "Ne garder que les termes affichés par le filtre", onclick: () => { state.activeTerms = new Set(rows.filter((r) => !r.row.hidden).map((r) => r.t)); refresh(); renderAll(); } }),
+  );
+  none.hidden = true;
+  const det = el("details", { class: "tpop" }, summary, el("div", { class: "tbox" }, search, quick, list, none));
+  state.__refreshTerms = refresh;
+  refresh();
+  return group(null, det, resetBtn);
+}
+
+function buildFilters() {
+  const f = $("#filters");
+  f.replaceChildren();
+  const rerender = () => { buildFilters(); renderAll(); };
+  const group = (label, ...kids) => el("div", { class: "fgroup" }, label ? el("span", { class: "flabel", text: label }) : null, ...kids);
+  const chip = (text, on, click) => el("button", { class: "chip", type: "button", "aria-pressed": String(on), text, onclick: click });
+
+  f.append(group("Période", ...[["all", "Tout"], ["24h", "24 h"], ["7d", "7 j"], ["30d", "30 j"]].map(([v, t]) => chip(t, state.period === v, () => { state.period = v; rerender(); }))));
+  f.append(termsGroup(group, chip, rerender));
+  f.append(group("Rareté", ...RARITIES.map((r) => chip(r, state.rarities.has(r), () => { state.rarities.has(r) ? state.rarities.delete(r) : state.rarities.add(r); rerender(); }))));
+  f.append(group("Shiny", ...[["all", "Toutes"], ["no", "Sans"], ["only", "Seulement"]].map(([v, t]) => chip(t, state.shiny === v, () => { state.shiny = v; rerender(); }))));
+  f.append(group("Tendances", ...[["auto", "Auto"], ["hour", "Heure"], ["day", "Jour"]].map(([v, t]) => chip(t, state.bucket === v, () => { state.bucket = v; rerender(); }))));
+
+  const box = el("div", { class: "pbox" });
+  const num = (label, key, min, max) => {
+    const inp = el("input", { type: "number", min: String(min), max: String(max), value: String(state.params[key]) });
+    inp.addEventListener("change", () => { const v = Math.max(min, Math.min(max, +inp.value || min)); state.params[key] = v; renderAll(); });
+    return el("label", {}, el("span", { text: label }), inp);
+  };
+  box.append(
+    num("Bonne affaire : prix ≤ … % du médian", "ratio", 5, 100),
+    num("Médiane de référence minimale", "minRef", 1, 100000),
+    num("Ventes comparables minimales", "minComp", 2, 200),
+    num("Ventes minimales par carte (tableau)", "minCard", 1, 200),
+  );
+  const det = el("details", { class: "params" }, el("summary", { text: "Paramètres" }), box);
+  f.append(el("div", { class: "fgroup", style: "margin-left:auto" }, det));
+}
+
+/* =====================================================================
+   Chargement des données
+   ===================================================================== */
+function load(raw, name) {
+  if (!Array.isArray(raw)) throw new Error("Le fichier n'est pas un export de l'archive (tableau JSON attendu).");
+  state.recs = prepare(raw);
+  state.groups = buildGroups(state.recs);
+  state.termCounts = new Map();
+  raw.forEach((r) => (r.terms || []).forEach((t) => state.termCounts.set(t, (state.termCounts.get(t) || 0) + 1)));
+  state.terms = [...state.termCounts.keys()].sort((a, b) => state.termCounts.get(b) - state.termCounts.get(a) || a.localeCompare(b));
+  state.activeTerms = new Set(state.terms);
+  state.fileName = name;
+  const fins = state.recs.filter((r) => r.fin && r.end);
+  state.maxEnd = Math.max(0, ...fins.map((r) => r.end));
+  state.snap = Math.max(0, ...state.recs.map((r) => r.seen));
+  const dates = fins.map((r) => r.end);
+  $("#meta").textContent = `${fmtInt(state.recs.length)} enchères archivées (${fmtInt(fins.length)} terminées) · du ${dayShort.format(Math.min(...dates))} au ${dayShort.format(Math.max(...dates))} · ${name}`;
+  $("#drop").hidden = true;
+  $("#app").hidden = false;
+  buildFilters();
+  renderAll();
+}
+async function loadFile(file) {
+  try {
+    const text = await file.text();
+    load(JSON.parse(text), file.name);
+    remember(file);
+  } catch (e) {
+    alert("Impossible de lire ce fichier : " + e.message);
+  }
+}
+
+/* Mémorise le dernier fichier dans IndexedDB du navigateur (local), pour rouvrir la page sans le recharger */
+function idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open("wmb-dashboard", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("kv");
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function remember(file) {
+  try { const db = await idb(); db.transaction("kv", "readwrite").objectStore("kv").put({ name: file.name, blob: file }, "last"); } catch { /* optionnel */ }
+}
+async function restore() {
+  try {
+    const db = await idb();
+    const v = await new Promise((res) => { const q = db.transaction("kv").objectStore("kv").get("last"); q.onsuccess = () => res(q.result); q.onerror = () => res(null); });
+    if (v?.blob) load(JSON.parse(await v.blob.text()), v.name + " (dernier fichier chargé)");
+  } catch { /* rien à restaurer */ }
+}
+
+$("#pick").addEventListener("click", () => $("#file").click());
+$("#file").addEventListener("change", (e) => e.target.files[0] && loadFile(e.target.files[0]));
+/* Les menus déroulants (termes, paramètres) se referment au clic ailleurs ou sur Échap */
+document.addEventListener("click", (e) => document.querySelectorAll("details.tpop[open], details.params[open]").forEach((d) => { if (!d.contains(e.target)) d.open = false; }));
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") document.querySelectorAll("details.tpop[open], details.params[open]").forEach((d) => { d.open = false; }); });
+["dragenter", "dragover"].forEach((t) => document.addEventListener(t, (e) => { e.preventDefault(); $("#drop").classList.add("over"); }));
+["dragleave", "drop"].forEach((t) => document.addEventListener(t, (e) => { e.preventDefault(); $("#drop").classList.remove("over"); }));
+document.addEventListener("drop", (e) => { const f = e.dataTransfer?.files?.[0]; if (f) loadFile(f); });
+
+/* Thème : automatique → clair → sombre */
+$("#theme").addEventListener("click", () => {
+  const cur = document.documentElement.dataset.theme || "auto";
+  const next = cur === "auto" ? "light" : cur === "light" ? "dark" : "auto";
+  if (next === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("wmb-dash-theme", next); } catch { /* ignoré */ }
+});
+try { const t = localStorage.getItem("wmb-dash-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch { /* ignoré */ }
+
+let resizeTimer;
+addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { charts.forEach((d) => d()); const dlg = $("#dlg"); if (dlg.open && dlg.__draw) dlg.__draw(); }, 150); });
+
+/* ?data=chemin.json : chargement direct quand la page est servie en http (pratique pour tester) */
+const q = new URLSearchParams(location.search).get("data");
+if (q) fetch(q).then((r) => r.json()).then((j) => load(j, q)).catch((e) => console.error(e));
+else restore();
+})();
+</script>
+</body>
+</html>
