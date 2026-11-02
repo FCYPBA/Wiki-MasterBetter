@@ -106,6 +106,7 @@ Je ne liste que celles qui change quelque chose de significatif pour l'utilisate
   - ⚠️ Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois) ; rien n'est collecté navigateur fermé, ni si le navigateur met l'onglet en veille pour économiser la mémoire
   - Les requêtes sont espacées et la collecte se met en pause quand le site limite le débit (limite de requêtes)
   - Vider les données du site dans le navigateur supprime l'archive : pensez à l'exporter
+- **Historique des prix de la carte sur sa page d'enchère** : Sur la page d'une enchère, un petit graphique trace, d'après l'archive, les prix des ventes précédentes de la même carte : un point par vente, une ligne pointillée pour la médiane et, dès 4 ventes, une courbe de tendance lissée ; survoler un point donne sa date et son prix. Sous le graphique : nombre de ventes, part des enchères vendues, médiane et fourchette de prix. Rien ne s'affiche pour une carte jamais archivée.
 
 ### 📊 Tableau de bord des enchères
 

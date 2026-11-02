@@ -3892,6 +3892,10 @@ const MY_USERNAME = "xxx";
       id: "feature-aar",
       label: "Archive en direct des enchères correspondant à des termes de recherche",
     },
+    {
+      id: "feature-ach",
+      label: "Historique des prix de la carte (d'après l'archive) sur sa page d'enchère",
+    },
   ];
 
   function readFeatureFlags() {
@@ -4318,6 +4322,10 @@ const MY_USERNAME = "xxx";
     {
       title: "Archiver des enchères en direct",
       text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau) : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée, avec le détail des mises. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON ; « Compacter » supprime le détail des mises des enchères de plus de 30 jours pour gagner de la place.",
+    },
+    {
+      title: "Historique des prix d'une carte",
+      text: "Sur la page d'une enchère, un bloc « Historique de la carte (archive) » sous le panneau de mise trace les prix des ventes précédentes de la même carte (archivées par la fonctionnalité d'archive des enchères) : un point par vente, une ligne pointillée pour la médiane et, dès 4 ventes, une courbe de tendance lissée. Survolez un point pour voir sa date et son prix. Rien ne s'affiche tant que la carte n'a jamais été archivée.",
     },
   ];
 
@@ -10383,7 +10391,7 @@ const MY_USERNAME = "xxx";
   const AAR_RETRY_MAX_MS = 30 * 60 * 1000;
   const AAR_COOLDOWN_BASE_MS = 60 * 1000;
   const AAR_COOLDOWN_MAX_MS = 10 * 60 * 1000;
-  const AAR_DB_VERSION = 2;
+  const AAR_DB_VERSION = 3;
   const AAR_BACKFILL_PER_TICK = 60;
   const AAR_COMPACT_DAYS = 30;
   const AAR_EXPORT_CHUNK = 2000;
@@ -10514,6 +10522,10 @@ const MY_USERNAME = "xxx";
               cursor.update({ ...cursor.value, rich: 0 });
               cursor.continue();
             };
+          }
+          if (event.oldVersion < 3) {
+            // Feature ACH looks the finished auctions of one card up by name
+            store.createIndex("card", "cardName");
           }
         };
         request.onsuccess = () => {
@@ -11376,6 +11388,430 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Feature ACH: price history of the card on its bid page, drawn from the auction archive (Feature AAR).
+  // On a bid page (/marketplace/{UUID}), a small "Historique de la carte" block is appended at the end of the column
+  // holding the card's name and the bid panel (the closest .space-y-4 around h1.flex-1). It plots, as a small inline
+  // SVG, the final price of every archived sale of the same card (same wikipedia_title, same shiny flag; the auction
+  // on screen is left out) over time, with the median as a dashed line and, from 4 sales, a smoothed trend line (a
+  // Gaussian-weighted moving average, geometric when the axis is logarithmic; broken where sales are too sparse).
+  // Hovering a dot shows its date and price (native tooltip). Under the chart: number of sales, share of auctions
+  // that sold, median and range. With a single sale only the text is shown.
+  // The card is identified from the archive when this auction is already in it, otherwise with one
+  // GET /api/marketplace/{UUID} (nothing is requested while the archive is empty). Sales are read from the archive's
+  // "card" index (IndexedDB version 3). Nothing is shown when the card was never archived. Reads only: this feature
+  // never writes to the archive nor starts the crawl.
+  // ============================================================
+  const ACH_WIDGET_CLASS = "wm-ach-widget";
+  const ACH_CHART_WIDTH = 480;
+  const ACH_CHART_HEIGHT = 130;
+  const ACH_TREND_MIN_SALES = 4;
+  const ACH_SVG_NS = "http://www.w3.org/2000/svg";
+  const achNumberFormat = new Intl.NumberFormat("fr-FR", {
+    maximumFractionDigits: 0,
+  });
+  const achCompactFormat = new Intl.NumberFormat("fr-FR", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  });
+  const achDateTimeFormat = new Intl.DateTimeFormat("fr-FR", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const achDayFormat = new Intl.DateTimeFormat("fr-FR", {
+    day: "2-digit",
+    month: "2-digit",
+  });
+
+  function achSvg(tag, attributes, parent) {
+    const element = document.createElementNS(ACH_SVG_NS, tag);
+    for (const [name, value] of Object.entries(attributes ?? {})) {
+      element.setAttribute(name, value);
+    }
+    parent?.appendChild(element);
+    return element;
+  }
+
+  function achQuantile(sorted, q) {
+    const position = (sorted.length - 1) * q;
+    const low = Math.floor(position);
+    const high = Math.ceil(position);
+    return sorted[low] + (sorted[high] - sorted[low]) * (position - low);
+  }
+
+  // Sales of one card (same shiny flag) out of its archived auctions, oldest first, plus how many ended unsold
+  function achSummarize(records, currentId, shiny) {
+    const sales = [];
+    let unsold = 0;
+    for (const record of records) {
+      if (record.id === currentId || record.state !== "done") continue;
+      if (Boolean(record.isShiny) !== shiny) continue;
+      if (record.status === "settled_unsold") {
+        unsold++;
+      } else if (record.status === "settled_sold" && record.finalPrice > 0) {
+        const time =
+          aarParseTime(record.settledAt) ??
+          aarParseTime(record.endAt) ??
+          record.resolvedAt;
+        if (typeof time === "number") {
+          sales.push({ time, price: record.finalPrice });
+        }
+      }
+    }
+    sales.sort((a, b) => a.time - b.time);
+    return { sales, unsold };
+  }
+
+  function achGetCardRecords(cardName) {
+    return aarRun("readonly", (store, out) => {
+      const request = store.index("card").getAll(cardName);
+      request.onsuccess = () => out(request.result);
+    });
+  }
+
+  // The card behind a bid page: from the archive when it holds this auction, else from the auction itself
+  async function achIdentifyCard(uuid) {
+    const [record] = await aarGetMany([uuid]);
+    if (record?.cardName) {
+      return { name: record.cardName, shiny: Boolean(record.isShiny) };
+    }
+    const data = await aarFetchJson(`/api/marketplace/${uuid}`);
+    const auction = data?.auction;
+    if (!auction?.card?.wikipedia_title) return null;
+    return {
+      name: auction.card.wikipedia_title,
+      shiny: Boolean(auction.is_shiny ?? auction.card.is_shiny),
+    };
+  }
+
+  // Smoothed trend as an SVG path: Gaussian-weighted moving average sampled along the x axis (computed in the axis'
+  // own space: log10 prices on a log axis), joined with Catmull-Rom curves. Samples with too little weight (no
+  // sale nearby) break the line instead of inventing a trend across a gap.
+  function achTrendPath(sales, x0, x1, toX, toY, isLog) {
+    const transform = isLog ? (v) => Math.log10(Math.max(v, 1)) : (v) => v;
+    const bandwidth = Math.max((x1 - x0) / 6, 1);
+    const STEPS = 48;
+    const segments = [];
+    let segment = [];
+    for (let step = 0; step <= STEPS; step++) {
+      const x = x0 + ((x1 - x0) * step) / STEPS;
+      let weightSum = 0;
+      let valueSum = 0;
+      for (const sale of sales) {
+        const z = (sale.time - x) / bandwidth;
+        const weight = Math.exp(-0.5 * z * z);
+        weightSum += weight;
+        valueSum += weight * transform(sale.price);
+      }
+      if (weightSum >= 0.5) {
+        const mean = valueSum / weightSum;
+        segment.push({ x: toX(x), y: toY(isLog ? 10 ** mean : mean) });
+      } else if (segment.length) {
+        segments.push(segment);
+        segment = [];
+      }
+    }
+    if (segment.length) segments.push(segment);
+
+    let path = "";
+    for (const points of segments) {
+      if (points.length < 2) continue;
+      path += `M${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
+      for (let i = 0; i < points.length - 1; i++) {
+        const p0 = points[Math.max(0, i - 1)];
+        const p1 = points[i];
+        const p2 = points[i + 1];
+        const p3 = points[Math.min(points.length - 1, i + 2)];
+        const c1x = p1.x + (p2.x - p0.x) / 6;
+        const c1y = p1.y + (p2.y - p0.y) / 6;
+        const c2x = p2.x - (p3.x - p1.x) / 6;
+        const c2y = p2.y - (p3.y - p1.y) / 6;
+        path += `C${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
+      }
+    }
+    return path;
+  }
+
+  function achBuildChart(sales, median) {
+    const margin = { left: 40, right: 10, top: 10, bottom: 20 };
+    const width = ACH_CHART_WIDTH;
+    const height = ACH_CHART_HEIGHT;
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = height - margin.top - margin.bottom;
+
+    const prices = sales.map((sale) => sale.price);
+    const low = Math.min(...prices);
+    const high = Math.max(...prices);
+    // A very wide price range (cheap and very expensive sales) would flatten everything: go logarithmic
+    const isLog = high / Math.max(low, 1) > 40;
+    let ticks = [];
+    let toY;
+    if (isLog) {
+      const from = Math.floor(Math.log10(Math.max(low, 1)));
+      const to = Math.ceil(Math.log10(high));
+      for (let e = from; e <= to; e++) ticks.push(10 ** e);
+      toY = (value) =>
+        margin.top +
+        plotHeight -
+        ((Math.log10(Math.max(value, 1)) - from) / Math.max(1, to - from)) *
+          plotHeight;
+    } else {
+      const raw = high / 3;
+      const power = 10 ** Math.floor(Math.log10(raw));
+      const factor = raw / power;
+      const step =
+        (factor <= 1 ? 1 : factor <= 2 ? 2 : factor <= 5 ? 5 : 10) * power;
+      const max = Math.ceil(high / step) * step;
+      for (let value = 0; value <= max + 1e-9; value += step) ticks.push(value);
+      toY = (value) => margin.top + plotHeight - (value / max) * plotHeight;
+    }
+
+    const x0 = sales[0].time;
+    const x1 = Math.max(sales[sales.length - 1].time, x0 + 1);
+    const toX = (time) => margin.left + ((time - x0) / (x1 - x0)) * plotWidth;
+
+    const svg = achSvg("svg", {
+      viewBox: `0 0 ${width} ${height}`,
+      role: "img",
+      "aria-label": "Prix des ventes précédentes de cette carte",
+    });
+    for (const tick of ticks) {
+      achSvg(
+        "line",
+        {
+          x1: margin.left,
+          x2: width - margin.right,
+          y1: toY(tick),
+          y2: toY(tick),
+          stroke: "currentColor",
+          "stroke-opacity": "0.12",
+        },
+        svg,
+      );
+      achSvg(
+        "text",
+        {
+          x: margin.left - 5,
+          y: toY(tick) + 3.5,
+          "text-anchor": "end",
+          "font-size": "10",
+          fill: "currentColor",
+          "fill-opacity": "0.55",
+        },
+        svg,
+      ).textContent = achCompactFormat.format(tick);
+    }
+
+    // Day and time while the sales span a few days only, otherwise the day alone
+    const dateLabel = (time) =>
+      (x1 - x0 < 3 * 24 * 3600 * 1000
+        ? achDateTimeFormat
+        : achDayFormat
+      ).format(time);
+    [
+      [x0, "start"],
+      [x1, "end"],
+    ].forEach(([time, anchor]) => {
+      achSvg(
+        "text",
+        {
+          x: toX(time),
+          y: height - 5,
+          "text-anchor": anchor,
+          "font-size": "10",
+          fill: "currentColor",
+          "fill-opacity": "0.55",
+        },
+        svg,
+      ).textContent = dateLabel(time);
+    });
+
+    achSvg(
+      "line",
+      {
+        x1: margin.left,
+        x2: width - margin.right,
+        y1: toY(median),
+        y2: toY(median),
+        stroke: "currentColor",
+        "stroke-opacity": "0.45",
+        "stroke-dasharray": "4 3",
+      },
+      svg,
+    );
+    achSvg(
+      "text",
+      {
+        x: width - margin.right,
+        y: toY(median) - 4,
+        "text-anchor": "end",
+        "font-size": "10",
+        fill: "currentColor",
+        "fill-opacity": "0.8",
+        stroke: "var(--color-surface, #000)",
+        "stroke-width": "3",
+        "paint-order": "stroke",
+      },
+      svg,
+    ).textContent = `médiane ${achNumberFormat.format(median)}`;
+
+    if (sales.length >= ACH_TREND_MIN_SALES) {
+      const path = achTrendPath(sales, x0, x1, toX, toY, isLog);
+      if (path) {
+        achSvg(
+          "path",
+          {
+            d: path,
+            fill: "none",
+            stroke: "var(--color-accent)",
+            "stroke-opacity": "0.55",
+            "stroke-width": "2.5",
+            "stroke-linecap": "round",
+            "stroke-linejoin": "round",
+          },
+          svg,
+        );
+      }
+    }
+
+    for (const sale of sales) {
+      const dot = achSvg(
+        "circle",
+        {
+          cx: toX(sale.time),
+          cy: toY(sale.price),
+          r: "3.5",
+          fill: "var(--color-accent)",
+          stroke: "var(--color-surface, #000)",
+          "stroke-width": "1",
+        },
+        svg,
+      );
+      achSvg("title", {}, dot).textContent =
+        `${achDateTimeFormat.format(sale.time)} : ${achNumberFormat.format(sale.price)} wikibidous`;
+    }
+    return svg;
+  }
+
+  async function achBuildWidget(uuid) {
+    const counts = await aarCounts();
+    if (!counts.total) return null;
+
+    const card = await achIdentifyCard(uuid);
+    if (!card) return null;
+
+    const records = await achGetCardRecords(card.name);
+    const { sales, unsold } = achSummarize(records, uuid, card.shiny);
+    if (!sales.length && !unsold) return null;
+
+    const widget = document.createElement("div");
+    widget.className = `card-frame p-4 space-y-2 ${ACH_WIDGET_CLASS}`;
+    widget.dataset.uuid = uuid;
+
+    const title = document.createElement("div");
+    title.className =
+      "text-xs uppercase tracking-wide text-[var(--color-foreground)]/50";
+    title.textContent = "Historique de la carte (archive)";
+    widget.appendChild(title);
+
+    const summary = document.createElement("p");
+    summary.className = "text-sm text-[var(--color-foreground)]/70";
+    if (!sales.length) {
+      summary.textContent = `${unsold} enchère${unsold > 1 ? "s" : ""} archivée${unsold > 1 ? "s" : ""}, aucune vendue.`;
+      widget.appendChild(summary);
+      return widget;
+    }
+
+    const sorted = sales.map((sale) => sale.price).sort((a, b) => a - b);
+    const median = achQuantile(sorted, 0.5);
+    if (sales.length >= 2) {
+      widget.appendChild(achBuildChart(sales, median));
+    }
+    const sellRate = Math.round((sales.length / (sales.length + unsold)) * 100);
+    const parts = [
+      `${sales.length} vente${sales.length > 1 ? "s" : ""}`,
+      `${sellRate} % des enchères vendues`,
+      `médiane ${achNumberFormat.format(median)}`,
+    ];
+    if (sales.length >= 2) {
+      parts.push(
+        `de ${achNumberFormat.format(sorted[0])} à ${achNumberFormat.format(sorted[sorted.length - 1])}`,
+      );
+    }
+    summary.textContent = parts.join(" · ");
+    widget.appendChild(summary);
+    return widget;
+  }
+
+  function watchCardPriceHistory() {
+    GM_addStyle(`
+      .${ACH_WIDGET_CLASS} svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+    `);
+
+    let doneUuid = null;
+    let busyUuid = null;
+    let widget = null;
+
+    const update = () => {
+      const match = window.location.pathname.match(MARKETPLACE_BID_PATH_REGEX);
+      const uuid = match?.[1] ?? null;
+      if (!uuid) {
+        document.querySelector(`.${ACH_WIDGET_CLASS}`)?.remove();
+        doneUuid = null;
+        widget = null;
+        return;
+      }
+      if (document.querySelector("div.animate-spin")) return;
+      const host = document
+        .querySelector("h1.flex-1")
+        ?.closest(".space-y-4");
+      if (!host) return;
+
+      const shown = document.querySelector(`.${ACH_WIDGET_CLASS}`);
+      if (shown && shown.dataset.uuid !== uuid) shown.remove();
+
+      if (doneUuid === uuid) {
+        // React may have rebuilt the column: put the block back
+        if (widget && !widget.isConnected) host.appendChild(widget);
+        return;
+      }
+      if (busyUuid === uuid) return;
+      busyUuid = uuid;
+      widget = null;
+      achBuildWidget(uuid)
+        .then((built) => {
+          if (busyUuid !== uuid) return;
+          doneUuid = uuid;
+          widget = built;
+          update();
+        })
+        .catch((error) => {
+          console.error("[WMB-ACH]", error);
+          doneUuid = uuid;
+        })
+        .finally(() => {
+          if (busyUuid === uuid) busyUuid = null;
+        });
+    };
+
+    let debounceId = null;
+    const scheduleUpdate = () => {
+      clearTimeout(debounceId);
+      debounceId = setTimeout(update, 300);
+    };
+    scheduleUpdate();
+    new MutationObserver(scheduleUpdate).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   function main() {
@@ -11470,6 +11906,7 @@ const MY_USERNAME = "xxx";
     run("feature-mtg", watchMassTagging);
     run("feature-evl", watchEstimationsDrawer);
     run("feature-aar", watchAuctionArchive);
+    run("feature-ach", watchCardPriceHistory);
 
     watchFeatureConfigButton();
     watchTutorialButton();
