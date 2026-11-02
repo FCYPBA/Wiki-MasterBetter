@@ -107,6 +107,18 @@ Je ne liste que celles qui change quelque chose de significatif pour l'utilisate
   - Les requêtes sont espacées et la collecte se met en pause quand le site limite le débit (limite de requêtes)
   - Vider les données du site dans le navigateur supprime l'archive : pensez à l'exporter
 
+### 📊 Tableau de bord des enchères
+
+Un outil à part (hors userscript) pour exploiter l'archive des enchères : [`dashboard/auction-dashboard.html`](dashboard/auction-dashboard.html). Une seule page HTML, sans serveur ni dépendance : ouvrez-la dans le navigateur et déposez-y le JSON exporté depuis la modale 📦. Tout est calculé localement (rien n'est envoyé), et le dernier fichier chargé est mémorisé dans le navigateur. Les exports contiennent des pseudos : ne les publiez pas.
+
+- **Filtres communs** : période (tout, 24 h, 7 j, 30 j), termes de recherche, rareté, shiny, pas des tendances (heure ou jour), et seuils des « bonnes affaires » réglables
+- **Acheter moins cher** : meilleures affaires passées (vente à 50 % ou moins de la médiane des autres ventes de la même carte), répartition des prix par rapport à la médiane, part de bonnes affaires selon le nombre d'enchérisseurs et l'heure de fin, moment de la dernière mise, et liste des enchères en cours dont le prix de départ est bas
+- **Vendre mieux** : taux de vente selon le prix de départ, la durée et l'heure de fin, et valeur attendue par rareté (taux de vente × prix médian)
+- **Tendances** : volume (vendues / invendues), taux de vente et prix médian par rareté dans le temps
+- **Cartes** : tableau triable et filtrable (ventes, taux de vente, prix médian, valeur attendue, tendance) ; un clic ouvre l'historique de la carte, avec le nuage des prix de vente, une courbe de tendance lissée, la médiane et les dernières enchères
+- Chaque graphique a une vue « Tableau », avec infobulles au survol et thème clair/sombre
+- Limite : pour une enchère en cours, seul le prix de départ est archivé, pas la mise actuelle
+
 ### 📦 Catalogue
 
 - **Nettoyage de la liste de souhaits** : Quand le filtre « uniquement les cartes de ma liste de souhaits » est actif, un bouton retire d'un coup toutes celles que vous possédez déjà
