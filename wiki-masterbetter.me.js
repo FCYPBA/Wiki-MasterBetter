@@ -2985,14 +2985,20 @@ const MY_USERNAME = "xxx";
   // BSP) and "eval-" (Feature ETS) localStorage entry as a downloadable "key,value" CSV file, so that cache can be
   // moved to another browser/device. Values are carried as their raw stored strings (not re-parsed), since Feature
   // BSP's entries are JSON-encoded arrays while Feature ETS's are plain strings; both are CSV-quoted as needed.
-  // Feature FOL's followed-users list is carried too.
+  // Feature FOL's followed-users list is carried too, and so are the cards' base rarities ("wm-rarity-{name}", see
+  // Feature ETS (cont'd)), which Feature EVL's drawer needs to tint and filter the estimates: without them a
+  // freshly imported cache would show every card without its rarity until its collection page is displayed again.
+  // Feature EVL's drawer offers the same Exporter / Importer buttons (the pill below only exists on /profile, and
+  // only once some prices were observed, so it can't be used to restore a cache on a brand-new browser).
   const TAGGED_CACHE_PREFIXES = [BSP_KEY_PREFIX, "eval-"];
 
   // Feature FOL's followed-users list (FOLLOWED_USERS_KEY, declared further down, hence the function) travels with
-  // that cache too; on import it's merged into the local list rather than replacing it.
+  // that cache too; on import it's merged into the local list rather than replacing it. Same reason for
+  // RARITY_KEY_PREFIX, declared further down.
   function isTaggedCacheKey(key) {
     return (
       key === FOLLOWED_USERS_KEY ||
+      key.startsWith(RARITY_KEY_PREFIX) ||
       TAGGED_CACHE_PREFIXES.some((prefix) => key.startsWith(prefix))
     );
   }
@@ -3132,6 +3138,10 @@ const MY_USERNAME = "xxx";
             }
             return;
           }
+
+          // A rarity is a short code ("UR"); anything else is not one of ours
+          if (key.startsWith(RARITY_KEY_PREFIX) && (!value || value.length > 20))
+            return;
 
           localStorage.setItem(key, value);
           importedCount++;
@@ -3510,7 +3520,7 @@ const MY_USERNAME = "xxx";
   // tag's text before our appendix) is saved under "wm-rarity-{name}" — only for cards that have an estimate, and
   // only ever as seen on /collection — so that Feature EVL can show it; nothing else records it, hence a card
   // only gets one once its page of the collection has been displayed (Feature EBC's "Estimation complète" walks
-  // them all). Not part of the cache export.
+  // them all). Part of the cache export (see TAGGED_CACHE_PREFIXES' comment).
   // ============================================================
   const RARITY_KEY_PREFIX = "wm-rarity-";
 
@@ -4317,7 +4327,7 @@ const MY_USERNAME = "xxx";
     },
     {
       title: "Lister toutes vos estimations",
-      text: "Sur la collection, l'onglet « Estimations » collé au menu de gauche ouvre un panneau coulissant listant toutes les cartes estimées, de la plus chère à la moins chère, par pages de 100, avec leur rareté (et sa couleur) quand elle est connue. Les boutons L, UR, SR, R, PC, C en haut du panneau filtrent la liste par rareté. La loupe d'une ligne lance la recherche de cette carte dans la collection, et la corbeille la retire du cache (carte vendue ou échangée), avec un bouton « Annuler » juste après. Estimez votre collection pour remplir la liste.",
+      text: "Sur la collection, l'onglet « Estimations » collé au menu de gauche ouvre un panneau coulissant listant toutes les cartes estimées, de la plus chère à la moins chère, par pages de 100, avec leur rareté (et sa couleur) quand elle est connue. Les boutons L, UR, SR, R, PC, C en haut du panneau filtrent la liste par rareté. La loupe d'une ligne lance la recherche de cette carte dans la collection, et la corbeille la retire du cache (carte vendue ou échangée), avec un bouton « Annuler » juste après. Estimez votre collection pour remplir la liste. Les boutons ⬇ et ⬆ du panneau exportent et importent tout le cache (estimations, raretés, prix observés, joueurs suivis) en CSV : exportez-le pour le retrouver sur un autre navigateur ou ordinateur sans tout recalculer.",
     },
     {
       title: "Archiver des enchères en direct",
@@ -9726,7 +9736,9 @@ const MY_USERNAME = "xxx";
   // deleted, the row leaves the list (the following ones move up) and the stale estimate tag is taken off the
   // matching card of the collection grid. A bar under the header then offers an "Annuler" button that puts back
   // the last removed card (until another one is removed or the drawer is closed). The header has a refresh
-  // button: the list is built when the drawer opens or the page changes, not live. The
+  // button: the list is built when the drawer opens or the page changes, not live. Two more buttons there, ⬇ and
+  // ⬆, export and import the whole script cache as CSV (same functions as the pill under /profile's prices, see
+  // Feature BSP/ETS' import/export), which makes it possible to restore the estimates on a new browser. The
   // open/closed state is remembered in localStorage ("wm-estimations-drawer-open"). The drawer only exists on
   // /collection (removed anywhere else) and on desktop widths (hidden below 768px, where the site stacks its
   // layout vertically). Its position is re-checked on every DOM mutation, in case the site re-renders its layout.
@@ -9898,7 +9910,24 @@ const MY_USERNAME = "xxx";
       setEstimationsDrawerOpen(drawer, false),
     );
 
-    header.append(titleBlock, refreshBtn, closeBtn);
+    // Same CSV as the one on /profile: estimates, observed sale prices, base rarities and followed players
+    const exportBtn = document.createElement("button");
+    exportBtn.type = "button";
+    exportBtn.className = "wm-est-icon-btn";
+    exportBtn.textContent = "⬇";
+    exportBtn.title =
+      "Exporter le cache en CSV (estimations, raretés, prix de vente observés, joueurs suivis)";
+    exportBtn.addEventListener("click", exportTaggedCacheEntries);
+
+    const importBtn = document.createElement("button");
+    importBtn.type = "button";
+    importBtn.className = "wm-est-icon-btn";
+    importBtn.textContent = "⬆";
+    importBtn.title =
+      "Importer un cache exporté (CSV), par exemple depuis un autre navigateur ou ordinateur";
+    importBtn.addEventListener("click", importTaggedCacheEntries);
+
+    header.append(titleBlock, exportBtn, importBtn, refreshBtn, closeBtn);
     panel.appendChild(header);
 
     if (evlLastRemoved) {
