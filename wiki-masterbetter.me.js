@@ -2988,17 +2988,19 @@ const MY_USERNAME = "xxx";
   // Feature FOL's followed-users list is carried too, and so are the cards' base rarities ("wm-rarity-{name}", see
   // Feature ETS (cont'd)), which Feature EVL's drawer needs to tint and filter the estimates: without them a
   // freshly imported cache would show every card without its rarity until its collection page is displayed again.
+  // The cards' tags ("wm-tags-{name}") travel for the same reason (Feature EVL's tag filter).
   // Feature EVL's drawer offers the same Exporter / Importer buttons (the pill below only exists on /profile, and
   // only once some prices were observed, so it can't be used to restore a cache on a brand-new browser).
   const TAGGED_CACHE_PREFIXES = [BSP_KEY_PREFIX, "eval-"];
 
   // Feature FOL's followed-users list (FOLLOWED_USERS_KEY, declared further down, hence the function) travels with
   // that cache too; on import it's merged into the local list rather than replacing it. Same reason for
-  // RARITY_KEY_PREFIX, declared further down.
+  // RARITY_KEY_PREFIX and TAGS_KEY_PREFIX, declared further down.
   function isTaggedCacheKey(key) {
     return (
       key === FOLLOWED_USERS_KEY ||
       key.startsWith(RARITY_KEY_PREFIX) ||
+      key.startsWith(TAGS_KEY_PREFIX) ||
       TAGGED_CACHE_PREFIXES.some((prefix) => key.startsWith(prefix))
     );
   }
@@ -3142,6 +3144,8 @@ const MY_USERNAME = "xxx";
           // A rarity is a short code ("UR"); anything else is not one of ours
           if (key.startsWith(RARITY_KEY_PREFIX) && (!value || value.length > 20))
             return;
+
+          if (key.startsWith(TAGS_KEY_PREFIX) && value.length > 2000) return;
 
           localStorage.setItem(key, value);
           importedCount++;
@@ -3531,6 +3535,36 @@ const MY_USERNAME = "xxx";
     if (localStorage.getItem(key) !== rarity) localStorage.setItem(key, rarity);
   }
 
+  // Feature ETS (cont'd): the card's tags (étiquettes), read from the chips of its card in the grid
+  // (div.flex-wrap.shrink-0 > span, text = emoji and name, e.g. "🛫Avions"), saved the same way and for the same
+  // cards as the rarity, under "wm-tags-{name}", for Feature EVL's tag filter. Stored as the tag names joined by a
+  // tab, never as a JSON array: an array (an empty one above all) would be taken by Feature BSP's legacy-key
+  // migration for a list of prices. The empty string means "seen, no tag"; a missing key means "never seen", which
+  // the filter must not mistake for "untagged". Refreshed every time the card is displayed, so re-tagging a card on
+  // the site is picked up. Part of the cache export.
+  const TAGS_KEY_PREFIX = "wm-tags-";
+  const TAGS_SEPARATOR = "\t";
+
+  function recordCardTags(cardName, tags) {
+    const key = `${TAGS_KEY_PREFIX}${cardName}`;
+    const value = tags.join(TAGS_SEPARATOR);
+    if (localStorage.getItem(key) !== value) localStorage.setItem(key, value);
+  }
+
+  // The card's saved tags, or null when they were never seen
+  function readCardTags(cardName) {
+    const raw = localStorage.getItem(`${TAGS_KEY_PREFIX}${cardName}`);
+    if (raw === null) return null;
+    return raw === "" ? [] : raw.split(TAGS_SEPARATOR);
+  }
+
+  function readCardTagChips(card) {
+    return Array.from(card.querySelectorAll("div.flex-wrap.shrink-0 > span"))
+      .map((chip) => chip.textContent.trim())
+      // A "+N" overflow chip, should the site ever show one, is not a tag
+      .filter((text) => text && !/^\+\d+$/.test(text));
+  }
+
   function formatEvalValue(rawValue) {
     const num = parseFloat(rawValue.replace(/\s/g, "").replace(",", "."));
     if (Number.isNaN(num)) return rawValue;
@@ -3561,6 +3595,7 @@ const MY_USERNAME = "xxx";
         rarityEl.dataset.wmBaseRarity ?? rarityEl.textContent.trim();
       rarityEl.dataset.wmBaseRarity = baseRarity;
       recordCardRarity(cardName, baseRarity);
+      recordCardTags(cardName, readCardTagChips(card));
 
       const appendixText = ` (${formatEvalValue(evalValue)})`;
       let appendix = rarityEl.querySelector(":scope > .wm-eval-appendix");
@@ -4327,7 +4362,7 @@ const MY_USERNAME = "xxx";
     },
     {
       title: "Lister toutes vos estimations",
-      text: "Sur la collection, l'onglet « Estimations » collé au menu de gauche ouvre un panneau coulissant listant toutes les cartes estimées, de la plus chère à la moins chère, par pages de 100, avec leur rareté (et sa couleur) quand elle est connue. Les boutons L, UR, SR, R, PC, C en haut du panneau filtrent la liste par rareté. La loupe d'une ligne lance la recherche de cette carte dans la collection, et la corbeille la retire du cache (carte vendue ou échangée), avec un bouton « Annuler » juste après. Estimez votre collection pour remplir la liste. Les boutons ⬇ et ⬆ du panneau exportent et importent tout le cache (estimations, raretés, prix observés, joueurs suivis) en CSV : exportez-le pour le retrouver sur un autre navigateur ou ordinateur sans tout recalculer.",
+      text: "Sur la collection, l'onglet « Estimations » collé au menu de gauche ouvre un panneau coulissant listant toutes les cartes estimées, de la plus chère à la moins chère, par pages de 100, avec leur rareté (et sa couleur) quand elle est connue. Les boutons L, UR, SR, R, PC, C en haut du panneau filtrent la liste par rareté. La loupe d'une ligne lance la recherche de cette carte dans la collection, et la corbeille la retire du cache (carte vendue ou échangée), avec un bouton « Annuler » juste après. Estimez votre collection pour remplir la liste. Les boutons ⬇ et ⬆ du panneau exportent et importent tout le cache (estimations, raretés, étiquettes, prix observés, joueurs suivis) en CSV : exportez-le pour le retrouver sur un autre navigateur ou ordinateur sans tout recalculer. Sous les boutons de rareté, une barre d'étiquettes permet d'exclure les cartes portant certaines étiquettes (pour repérer ce que vous pouvez vendre sans toucher aux catégories à garder) ou de ne garder que celles-ci. Les étiquettes d'une carte sont connues dès qu'elle a été affichée dans la collection.",
     },
     {
       title: "Archiver des enchères en direct",
@@ -9742,6 +9777,10 @@ const MY_USERNAME = "xxx";
   // open/closed state is remembered in localStorage ("wm-estimations-drawer-open"). The drawer only exists on
   // /collection (removed anywhere else) and on desktop widths (hidden below 768px, where the site stacks its
   // layout vertically). Its position is re-checked on every DOM mutation, in case the site re-renders its layout.
+  // A tag bar under the rarity chips filters by the cards' tags (see Feature ETS (cont'd) for how they are known):
+  // "Exclure" hides the cards carrying any selected tag (to find what is free to sell), "Garder seulement" keeps
+  // only those, "Sans étiquette" standing for no tag at all; the choice is saved in localStorage. A card whose
+  // tags were never seen is hidden by any active tag filter, with a note saying how many.
   // ============================================================
   const EVL_PAGE_SIZE = 100;
   const EVL_OPEN_KEY = "wm-estimations-drawer-open";
@@ -9750,6 +9789,48 @@ const MY_USERNAME = "xxx";
   let evlCurrentCardName = null;
   let evlRarityFilter = null;
   let evlLastRemoved = null;
+
+  // Tag filter. Mode "exclude" hides the cards carrying any selected tag (to find what is free to sell, i.e. not
+  // in a category to keep); mode "include" keeps only those. EVL_NO_TAG stands for "no tag at all". Unlike the
+  // rarity filter, it is remembered in localStorage. Cards whose tags were never seen are hidden by any active tag
+  // filter, since they could well be in a category to keep.
+  const EVL_TAG_FILTER_KEY = "wm-estimations-tag-filter";
+  const EVL_NO_TAG = "\u0000none";
+  let evlTagMode = "exclude";
+  let evlTagSet = new Set();
+  let evlTagBarScroll = 0;
+
+  function loadEstimationsTagFilter() {
+    try {
+      const stored = JSON.parse(
+        localStorage.getItem(EVL_TAG_FILTER_KEY) ?? "null",
+      );
+      if (stored?.mode === "include" || stored?.mode === "exclude") {
+        evlTagMode = stored.mode;
+      }
+      if (Array.isArray(stored?.tags)) {
+        evlTagSet = new Set(stored.tags.filter((t) => typeof t === "string"));
+      }
+    } catch {
+      // Unreadable: start with no filter
+    }
+  }
+
+  function saveEstimationsTagFilter() {
+    localStorage.setItem(
+      EVL_TAG_FILTER_KEY,
+      JSON.stringify({ mode: evlTagMode, tags: [...evlTagSet] }),
+    );
+  }
+
+  function entryPassesTagFilter(entry) {
+    if (evlTagSet.size === 0) return true;
+    if (entry.tags === null) return false;
+
+    const keys = entry.tags.length ? entry.tags : [EVL_NO_TAG];
+    const hit = keys.some((key) => evlTagSet.has(key));
+    return evlTagMode === "include" ? hit : !hit;
+  }
 
   // The card's rarity as one of EVL_RARITIES, or null when unknown / not one of them
   function getRarityCode(rarity) {
@@ -9775,6 +9856,7 @@ const MY_USERNAME = "xxx";
           cardName,
           value,
           rarity: localStorage.getItem(`${RARITY_KEY_PREFIX}${cardName}`),
+          tags: readCardTags(cardName),
         });
       }
     }
@@ -9788,14 +9870,17 @@ const MY_USERNAME = "xxx";
   function removeCardFromCache(cardName) {
     const evalKey = `${EVAL_KEY_PREFIX}${cardName}`;
     const rarityKey = `${RARITY_KEY_PREFIX}${cardName}`;
+    const tagsKey = `${TAGS_KEY_PREFIX}${cardName}`;
     const removed = {
       cardName,
       value: localStorage.getItem(evalKey),
       rarity: localStorage.getItem(rarityKey),
+      tagsRaw: localStorage.getItem(tagsKey),
     };
 
     localStorage.removeItem(evalKey);
     localStorage.removeItem(rarityKey);
+    localStorage.removeItem(tagsKey);
 
     // The estimate shown on the card's rarity tag would otherwise stay until the grid is re-rendered
     getAllCollectionCards()?.forEach((card) => {
@@ -9808,12 +9893,15 @@ const MY_USERNAME = "xxx";
     return removed;
   }
 
-  function restoreCardToCache({ cardName, value, rarity }) {
+  function restoreCardToCache({ cardName, value, rarity, tagsRaw }) {
     if (value !== null) {
       localStorage.setItem(`${EVAL_KEY_PREFIX}${cardName}`, value);
     }
     if (rarity !== null) {
       localStorage.setItem(`${RARITY_KEY_PREFIX}${cardName}`, rarity);
+    }
+    if (tagsRaw !== null) {
+      localStorage.setItem(`${TAGS_KEY_PREFIX}${cardName}`, tagsRaw);
     }
     appendEvalToRarityTags();
   }
@@ -9825,6 +9913,118 @@ const MY_USERNAME = "xxx";
     NATIVE_INPUT_VALUE_SETTER.call(input, cardName);
     input.dispatchEvent(new Event("input", { bubbles: true }));
     return true;
+  }
+
+  function buildEstimationsTagBar(drawer, allEntries, byRarity) {
+    const rerender = () => {
+      saveEstimationsTagFilter();
+      evlPage = 1;
+      renderEstimationsPanel(drawer);
+    };
+
+    const counts = new Map();
+    let untagged = 0;
+    let unknown = 0;
+    allEntries.forEach((entry) => {
+      if (entry.tags === null) unknown++;
+      else if (entry.tags.length === 0) untagged++;
+      else entry.tags.forEach((tag) => counts.set(tag, (counts.get(tag) ?? 0) + 1));
+    });
+    // A selected tag that no card carries any more stays visible, so it can still be unselected
+    evlTagSet.forEach((tag) => {
+      if (tag !== EVL_NO_TAG && !counts.has(tag)) counts.set(tag, 0);
+    });
+
+    const bar = document.createElement("div");
+    bar.className = "wm-est-tag-bar";
+
+    if (counts.size > 0 || untagged > 0) {
+      const head = document.createElement("div");
+      head.className = "wm-est-tag-head";
+
+      const label = document.createElement("span");
+      label.textContent = "Étiquettes :";
+      head.appendChild(label);
+
+      [
+        ["exclude", "Exclure", "Masquer les cartes portant une des étiquettes choisies"],
+        ["include", "Garder seulement", "N'afficher que les cartes portant une des étiquettes choisies"],
+      ].forEach(([mode, text, title]) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "wm-est-chip wm-est-tagchip";
+        button.classList.toggle("wm-est-chip-active", evlTagMode === mode);
+        button.textContent = text;
+        button.title = title;
+        button.addEventListener("click", () => {
+          evlTagMode = mode;
+          rerender();
+        });
+        head.appendChild(button);
+      });
+
+      if (evlTagSet.size > 0) {
+        const clear = document.createElement("button");
+        clear.type = "button";
+        clear.className = "wm-est-tag-clear";
+        clear.textContent = "✕ Effacer";
+        clear.title = "Ne plus filtrer par étiquette";
+        clear.addEventListener("click", () => {
+          evlTagSet = new Set();
+          rerender();
+        });
+        head.appendChild(clear);
+      }
+      bar.appendChild(head);
+
+      const chips = document.createElement("div");
+      chips.className = "wm-est-tag-chips";
+      const makeChip = (key, text, count) => {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "wm-est-chip wm-est-tagchip";
+        const active = evlTagSet.has(key);
+        chip.classList.toggle("wm-est-chip-active", active);
+        chip.classList.toggle(
+          "wm-est-chip-excluded",
+          active && evlTagMode === "exclude",
+        );
+        chip.textContent = `${text} (${count})`;
+        chip.title = `${count} carte${count > 1 ? "s" : ""} estimée${count > 1 ? "s" : ""}`;
+        chip.addEventListener("click", () => {
+          if (evlTagSet.has(key)) evlTagSet.delete(key);
+          else evlTagSet.add(key);
+          rerender();
+        });
+        chips.appendChild(chip);
+      };
+      makeChip(EVL_NO_TAG, "Sans étiquette", untagged);
+      [...counts.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "fr"))
+        .forEach(([tag, count]) => makeChip(tag, tag, count));
+      chips.addEventListener("scroll", () => {
+        evlTagBarScroll = chips.scrollTop;
+      });
+      bar.appendChild(chips);
+      // The panel is rebuilt on every click: put the chips back where they were scrolled to
+      requestAnimationFrame(() => {
+        chips.scrollTop = evlTagBarScroll;
+      });
+    }
+
+    if (unknown > 0) {
+      const note = document.createElement("p");
+      note.className = "wm-est-tag-note";
+      const hidden =
+        evlTagSet.size > 0
+          ? byRarity.filter((entry) => entry.tags === null).length
+          : 0;
+      note.textContent = `${unknown} carte${unknown > 1 ? "s" : ""} dont les étiquettes ne sont pas encore connues${hidden ? ` (${hidden} masquée${hidden > 1 ? "s" : ""} par le filtre)` : ""}. Parcourez votre collection, ou lancez « Estimation complète », pour les découvrir.`;
+      bar.appendChild(note);
+    }
+
+    if (!bar.childElementCount) bar.hidden = true;
+    return bar;
   }
 
   function buildEstimationsPager(page, pageCount, onChange) {
@@ -9871,11 +10071,12 @@ const MY_USERNAME = "xxx";
     panel.replaceChildren();
 
     const allEntries = collectAllEvals();
-    const entries = evlRarityFilter
+    const byRarity = evlRarityFilter
       ? allEntries.filter(
           (entry) => getRarityCode(entry.rarity) === evlRarityFilter,
         )
       : allEntries;
+    const entries = byRarity.filter(entryPassesTagFilter);
     const pageCount = Math.max(1, Math.ceil(entries.length / EVL_PAGE_SIZE));
     evlPage = Math.min(Math.max(1, evlPage), pageCount);
 
@@ -9974,6 +10175,7 @@ const MY_USERNAME = "xxx";
         filterBar.appendChild(chip);
       });
       panel.appendChild(filterBar);
+      panel.appendChild(buildEstimationsTagBar(drawer, allEntries, byRarity));
     }
 
     const list = document.createElement("div");
@@ -9985,7 +10187,7 @@ const MY_USERNAME = "xxx";
       hint.textContent =
         allEntries.length === 0
           ? "Lancez une estimation depuis cette page : les valeurs trouvées apparaîtront ici."
-          : "Aucune carte de cette rareté. Elle n'est connue que pour les cartes déjà affichées dans la collection.";
+          : "Aucune carte ne correspond aux filtres. La rareté et les étiquettes ne sont connues que pour les cartes déjà affichées dans la collection.";
       list.appendChild(hint);
     }
 
@@ -10004,7 +10206,9 @@ const MY_USERNAME = "xxx";
       const name = document.createElement("span");
       name.className = "wm-est-name";
       name.textContent = entry.cardName;
-      name.title = entry.cardName;
+      name.title = entry.tags?.length
+        ? `${entry.cardName}\n${entry.tags.join(" · ")}`
+        : entry.cardName;
 
       const rarity = document.createElement("span");
       rarity.className = "wm-est-rarity";
@@ -10109,6 +10313,8 @@ const MY_USERNAME = "xxx";
   }
 
   function watchEstimationsDrawer() {
+    loadEstimationsTagFilter();
+
     GM_addStyle(`
       .wm-est-drawer {
         display: flex;
@@ -10218,6 +10424,55 @@ const MY_USERNAME = "xxx";
       .wm-est-chip.wm-est-chip-active {
         opacity: 1;
         outline: 1px solid currentColor;
+      }
+      .wm-est-tag-bar {
+        display: grid;
+        gap: 0.4rem;
+        padding: 0.5rem 1rem;
+        border-bottom: 1px solid var(--color-border);
+      }
+      .wm-est-tag-head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.4rem;
+        font-size: 0.75rem;
+      }
+      .wm-est-tag-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.3rem;
+        max-height: 7.5rem;
+        overflow-y: auto;
+      }
+      .wm-est-tagchip {
+        max-width: 14rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        background: var(--color-surface-light);
+        color: var(--color-foreground);
+        font-weight: 500;
+      }
+      .wm-est-tagchip.wm-est-chip-excluded {
+        text-decoration: line-through;
+        color: #f87171;
+        outline-color: #f87171;
+      }
+      .wm-est-tag-clear {
+        border: none;
+        background: transparent;
+        color: inherit;
+        font-size: 0.75rem;
+        opacity: 0.6;
+        cursor: pointer;
+      }
+      .wm-est-tag-clear:hover {
+        opacity: 1;
+      }
+      .wm-est-tag-note {
+        font-size: 0.7rem;
+        opacity: 0.55;
       }
       .wm-est-list {
         flex: 1;
