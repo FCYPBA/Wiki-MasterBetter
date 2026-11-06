@@ -4366,7 +4366,7 @@ const MY_USERNAME = "xxx";
     },
     {
       title: "Archiver des enchères en direct",
-      text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau) : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée, avec le détail des mises. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON ; « Compacter » supprime le détail des mises des enchères de plus de 30 jours pour gagner de la place.",
+      text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau) : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée, avec le détail des mises. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON, et un export JSON se réimporte (« Importer (JSON) ») pour transférer l'archive vers un autre navigateur ou ordinateur : les enchères sont fusionnées, rien n'est supprimé ; « Compacter » supprime le détail des mises des enchères de plus de 30 jours pour gagner de la place.",
     },
     {
       title: "Historique des prix d'une carte",
@@ -10630,6 +10630,9 @@ const MY_USERNAME = "xxx";
   // auctions resolved more than AAR_COMPACT_DAYS ago (and the bookkeeping fields, AAR_COMPACT_DROPPED_FIELDS)
   // and keeps every aggregate. Exports read the store page by
   // page (AAR_EXPORT_CHUNK) and assemble the file as a Blob, so they don't need the whole archive in memory.
+  // "Importer (JSON)" reads such a JSON export back (streamed, one record per line) to move an archive between
+  // browsers/computers: records are merged by id, the more complete version of an auction wins (finished > open,
+  // full > compacted > result still to fetch; the local one on a tie) and the terms of both are united.
   // Database version 2 added the richer fields and the "rich" index: the records of version 1 are flagged 0 on
   // upgrade, and aarBackfill re-fetches them in the background, newest first, AAR_BACKFILL_PER_TICK per pass,
   // after the regular resolutions.
@@ -11347,6 +11350,159 @@ const MY_USERNAME = "xxx";
     });
   }
 
+  // ---- Import ----
+  // Reads back a JSON export (the CSV is a lossy flat view and can't be imported) to carry an archive from one
+  // browser/computer to another. The file is read as a stream, one record per line (that's how the export writes
+  // it: "[", then the records separated by ",", then "]"), so a very large archive never sits in memory at once.
+  // Records are merged by auction id, inside one transaction per batch so a concurrent crawler write is never lost.
+  function aarIsImportableRecord(record) {
+    return (
+      record &&
+      typeof record === "object" &&
+      typeof record.id === "string" &&
+      record.id &&
+      (record.state === "open" || record.state === "done") &&
+      Array.isArray(record.terms)
+    );
+  }
+
+  // How much a record knows: a finished auction beats an open one, and a full record (bids included, rich 1)
+  // beats a compacted one (rich 2), which beats one whose result is still to fetch (rich 0)
+  function aarRecordCompleteness(record) {
+    let score = record.state === "done" ? 10 : 0;
+    if (record.rich === 1) score += 2;
+    else if (record.rich === 2) score += 1;
+    return score;
+  }
+
+  // The two versions of one auction: the more complete one is kept (the local one on a tie), with the terms of both
+  function aarMergeRecords(local, imported) {
+    const winner =
+      aarRecordCompleteness(imported) > aarRecordCompleteness(local)
+        ? imported
+        : local;
+    const terms = [...local.terms];
+    imported.terms.forEach((term) => {
+      if (typeof term === "string" && !terms.includes(term)) terms.push(term);
+    });
+    return { ...winner, terms };
+  }
+
+  // Merges one batch of records; resolves with { added, updated, kept }
+  function aarImportBatch(records) {
+    return aarRun("readwrite", (store, out) => {
+      const stats = { added: 0, updated: 0, kept: 0 };
+      let pending = records.length;
+      if (pending === 0) out(stats);
+      records.forEach((imported) => {
+        const request = store.get(imported.id);
+        request.onsuccess = () => {
+          const local = request.result;
+          if (!local) {
+            store.put(imported);
+            stats.added++;
+          } else {
+            const merged = aarMergeRecords(local, imported);
+            const changed =
+              merged.terms.length !== local.terms.length ||
+              aarRecordCompleteness(imported) > aarRecordCompleteness(local);
+            if (changed) {
+              store.put(merged);
+              stats.updated++;
+            } else {
+              stats.kept++;
+            }
+          }
+          if (--pending === 0) out(stats);
+        };
+      });
+    });
+  }
+
+  async function importAuctionArchive(file) {
+    const total = { added: 0, updated: 0, kept: 0, invalid: 0 };
+    let batch = new Map();
+
+    const flush = async () => {
+      if (batch.size === 0) return;
+      const stats = await aarImportBatch([...batch.values()]);
+      total.added += stats.added;
+      total.updated += stats.updated;
+      total.kept += stats.kept;
+      batch = new Map();
+    };
+
+    const handleLine = async (line) => {
+      // Record lines end with "," in the export; the "[" and "]" lines are skipped
+      const text = line.trim().replace(/,$/, "");
+      if (!text || text === "[" || text === "]") return;
+      let record;
+      try {
+        record = JSON.parse(text);
+      } catch {
+        total.invalid++;
+        return;
+      }
+      if (!aarIsImportableRecord(record)) {
+        total.invalid++;
+        return;
+      }
+      // The same auction twice in one file: merged before it reaches the database
+      const previous = batch.get(record.id);
+      batch.set(
+        record.id,
+        previous ? aarMergeRecords(previous, record) : record,
+      );
+      if (batch.size >= AAR_EXPORT_CHUNK) await flush();
+    };
+
+    const reader = file.stream().pipeThrough(new TextDecoderStream()).getReader();
+    let rest = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const lines = (rest + value).split("\n");
+      rest = lines.pop();
+      for (const line of lines) await handleLine(line);
+    }
+    await handleLine(rest);
+    await flush();
+    return total;
+  }
+
+  function pickAndImportAuctionArchive(onDone) {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json,application/json";
+    input.style.display = "none";
+    document.body.appendChild(input);
+
+    input.addEventListener("change", async () => {
+      const file = input.files?.[0];
+      input.remove();
+      if (!file) return;
+
+      try {
+        const total = await importAuctionArchive(file);
+        if (total.added + total.updated + total.kept === 0) {
+          alert("Le fichier n'est pas un export JSON valide de l'archive.");
+          return;
+        }
+        GM_notification({
+          title: "Wiki-Masters",
+          text: `Import terminé : ${total.added} enchère(s) ajoutée(s), ${total.updated} mise(s) à jour, ${total.kept} déjà à jour${total.invalid ? `, ${total.invalid} ligne(s) ignorée(s)` : ""}.`,
+          timeout: 6000,
+        });
+      } catch (error) {
+        console.error("[WMB-AAR]", error);
+        alert("Le fichier n'a pas pu être importé.");
+      }
+      onDone();
+    });
+
+    input.click();
+  }
+
   // ---- UI ----
   function aarFormatBytes(bytes) {
     if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} Go`;
@@ -11497,6 +11653,9 @@ const MY_USERNAME = "xxx";
       ),
       makeButton("Exporter en JSON", () =>
         exportAuctionArchive("json").catch(console.error),
+      ),
+      makeButton("Importer (JSON)", () =>
+        pickAndImportAuctionArchive(refresh),
       ),
       makeButton(`Compacter (> ${AAR_COMPACT_DAYS} j)`, async () => {
         if (
