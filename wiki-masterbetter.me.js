@@ -4366,7 +4366,7 @@ const MY_USERNAME = "xxx";
     },
     {
       title: "Archiver des enchères en direct",
-      text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau) : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée, avec le détail des mises. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON, et un export JSON se réimporte (« Importer (JSON) ») pour transférer l'archive vers un autre navigateur ou ordinateur : les enchères sont fusionnées, rien n'est supprimé ; « Compacter » supprime le détail des mises des enchères de plus de 30 jours pour gagner de la place.",
+      text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau), et/ou cochez « Légendaires » pour archiver toutes les enchères de cartes Légendaires sans terme : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée, avec le détail des mises. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON, et un export JSON se réimporte (« Importer (JSON) ») pour transférer l'archive vers un autre navigateur ou ordinateur : les enchères sont fusionnées, rien n'est supprimé ; « Compacter » supprime le détail des mises des enchères de plus de 30 jours pour gagner de la place.",
     },
     {
       title: "Historique des prix d'une carte",
@@ -10637,10 +10637,14 @@ const MY_USERNAME = "xxx";
   // upgrade, and aarBackfill re-fetches them in the background, newest first, AAR_BACKFILL_PER_TICK per pass,
   // after the regular resolutions.
   //
+  // A ribbon with a checkbox ("Légendaires", localStorage "wm-auction-archive-legendary") adds one more source to
+  // the discovery: GET /api/marketplace?page=N&limit=50&sort=recent&rarity=L, crawled exactly like a term (same stop
+  // rule) and stored in the records' "terms" under the label AAR_LEGENDARY_LABEL ("rarity:L"). It works with no term.
+  //
   // Collection, in a loop that only ever runs in ONE tab (a Web Lock, "wmb-auction-archive-crawler": the other
   // tabs queue on it and take over when the leader tab closes). It needs a wiki-masters.com tab left open: a
   // closed tab, or one the browser discarded to save memory, collects nothing. Every 5 minutes it:
-  //   1. Discovers — for each term, pages through GET /api/marketplace?page=N&limit=50&sort=recent&q={term}
+  //   1. Discovers — for each term (and the Legendary source), pages through GET /api/marketplace?page=N&limit=50&sort=recent&q={term}
   //      (newest first) and upserts every auction. It stops at the first page that holds nothing new for that
   //      term, so a regular pass costs one request per term; the first pass of a new term walks the whole list
   //      (AAR_MAX_PAGES at most). An auction already known has its end time refreshed (it may be extended).
@@ -10662,6 +10666,9 @@ const MY_USERNAME = "xxx";
   const AAR_STORE = "auctions";
   const AAR_TERMS_KEY = "wm-auction-archive-terms";
   const AAR_STATUS_KEY = "wm-auction-archive-status";
+  const AAR_LEGENDARY_KEY = "wm-auction-archive-legendary";
+  // Stored in a record's "terms" for the auctions found by the Legendary toggle (no search term involved)
+  const AAR_LEGENDARY_LABEL = "rarity:L";
   const AAR_LOCK_NAME = "wmb-auction-archive-crawler";
   const AAR_CHANNEL_NAME = "wmb-auction-archive";
   const AAR_TICK_MS = 5 * 60 * 1000;
@@ -10747,6 +10754,15 @@ const MY_USERNAME = "xxx";
         : [];
     } catch {
       return [];
+    }
+  }
+
+  // The "Légendaires" toggle: every Legendary auction is archived, whatever the search terms
+  function aarReadLegendary() {
+    try {
+      return localStorage.getItem(AAR_LEGENDARY_KEY) === "1";
+    } catch {
+      return false;
     }
   }
 
@@ -11026,29 +11042,30 @@ const MY_USERNAME = "xxx";
     return record;
   }
 
-  async function aarCrawlTerm(term) {
+  // label is what gets stored in the records' "terms"; filter is the query string part that selects the auctions
+  async function aarCrawlSource(label, filter) {
     for (let page = 1; page <= AAR_MAX_PAGES; page++) {
       const data = await aarFetchJson(
-        `/api/marketplace?page=${page}&limit=${AAR_PAGE_SIZE}&sort=recent&q=${encodeURIComponent(term)}`,
+        `/api/marketplace?page=${page}&limit=${AAR_PAGE_SIZE}&sort=recent&${filter}`,
       );
       const items = Array.isArray(data?.auctions) ? data.auctions : [];
       const now = Date.now();
       const known = await aarGetMany(items.map((item) => item.id));
 
-      let newForTerm = 0;
+      let newForSource = 0;
       const records = items.map((item, index) => {
         const existing = known[index];
         if (!existing) {
-          newForTerm++;
-          return aarRecordFromListing(item, term, now);
+          newForSource++;
+          return aarRecordFromListing(item, label, now);
         }
-        if (!existing.terms.includes(term)) newForTerm++;
-        return aarMergeListing(existing, item, term, now);
+        if (!existing.terms.includes(label)) newForSource++;
+        return aarMergeListing(existing, item, label, now);
       });
       await aarPutMany(records);
 
       // Newest first: a page with nothing new means everything after it is already archived
-      if (!data?.hasMore || items.length === 0 || newForTerm === 0) break;
+      if (!data?.hasMore || items.length === 0 || newForSource === 0) break;
       await aarSleep(AAR_REQUEST_PACING_MS);
     }
   }
@@ -11206,8 +11223,13 @@ const MY_USERNAME = "xxx";
 
     try {
       const terms = aarReadTerms();
+      const legendary = aarReadLegendary();
       for (const term of terms) {
-        await aarCrawlTerm(term);
+        await aarCrawlSource(term, `q=${encodeURIComponent(term)}`);
+        await aarSleep(AAR_REQUEST_PACING_MS);
+      }
+      if (legendary) {
+        await aarCrawlSource(AAR_LEGENDARY_LABEL, "rarity=L");
         await aarSleep(AAR_REQUEST_PACING_MS);
       }
       await aarResolveDue(started + AAR_RESOLVE_BUDGET_MS);
@@ -11216,7 +11238,9 @@ const MY_USERNAME = "xxx";
       aarSetStatus({ lastError: null, rateLimitedUntil: null });
 
       const counts = await aarCounts();
-      if (terms.length === 0 && counts.open === 0) return AAR_IDLE_MS;
+      if (terms.length === 0 && !legendary && counts.open === 0) {
+        return AAR_IDLE_MS;
+      }
       return Math.max(AAR_MIN_GAP_MS, AAR_TICK_MS - (Date.now() - started));
     } catch (error) {
       if (error instanceof AarRateLimitError) {
@@ -11536,8 +11560,14 @@ const MY_USERNAME = "xxx";
         `Espace utilisé par le site dans le navigateur : ${aarFormatBytes(storage.usage)}${storage.quota ? ` sur ${aarFormatBytes(storage.quota)} disponibles` : ""}`,
       );
     }
-    if (aarReadTerms().length === 0 && !termsInput.value.trim()) {
-      lines.push("Aucun terme : saisissez-en un pour démarrer la collecte.");
+    if (
+      aarReadTerms().length === 0 &&
+      !termsInput.value.trim() &&
+      !aarReadLegendary()
+    ) {
+      lines.push(
+        "Aucun terme : saisissez-en un (ou activez les Légendaires) pour démarrer la collecte.",
+      );
     }
     if (status.lastTickStartedAt) {
       lines.push(
@@ -11610,6 +11640,20 @@ const MY_USERNAME = "xxx";
 
     termsRow.append(termsInput, saveBtn);
 
+    // Ribbon: archives every Legendary auction too, with no search term
+    const legendaryRibbon = document.createElement("label");
+    legendaryRibbon.className = "wm-aar-ribbon";
+
+    const legendaryToggle = document.createElement("input");
+    legendaryToggle.type = "checkbox";
+    legendaryToggle.checked = aarReadLegendary();
+
+    const legendaryText = document.createElement("span");
+    legendaryText.textContent =
+      "Légendaires : archiver aussi toutes les enchères de cartes Légendaires (sans terme de recherche)";
+
+    legendaryRibbon.append(legendaryToggle, legendaryText);
+
     const statusBox = document.createElement("div");
     statusBox.className = "wm-aar-status";
 
@@ -11641,6 +11685,21 @@ const MY_USERNAME = "xxx";
     saveBtn.addEventListener("click", save);
     termsInput.addEventListener("keydown", (event) => {
       if (event.key === "Enter") save();
+    });
+    legendaryToggle.addEventListener("change", () => {
+      try {
+        localStorage.setItem(
+          AAR_LEGENDARY_KEY,
+          legendaryToggle.checked ? "1" : "0",
+        );
+      } catch {
+        // Unwritable storage: the toggle just won't stick
+      }
+      if (legendaryToggle.checked) {
+        navigator.storage?.persist?.().catch(() => {});
+        aarWake();
+      }
+      refresh();
     });
 
     actions.append(
@@ -11680,7 +11739,7 @@ const MY_USERNAME = "xxx";
       }),
     );
 
-    modal.append(header, hint, termsRow, statusBox, actions);
+    modal.append(header, hint, termsRow, legendaryRibbon, statusBox, actions);
     overlay.appendChild(modal);
 
     refresh();
@@ -11792,6 +11851,26 @@ const MY_USERNAME = "xxx";
       }
       .wm-aar-btn:hover {
         background: color-mix(in srgb, var(--color-accent) 20%, transparent);
+      }
+      .wm-aar-ribbon {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        margin: 0.5rem 0;
+        padding: 0.5rem 0.75rem;
+        border-radius: 0.5rem;
+        border: 1px solid #f59e0b;
+        background: color-mix(in srgb, #f59e0b 12%, transparent);
+        font-size: 0.8rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .wm-aar-ribbon input {
+        flex: none;
+        width: 1rem;
+        height: 1rem;
+        accent-color: #f59e0b;
+        cursor: pointer;
       }
       .wm-aar-status {
         margin: 0.5rem 0;
