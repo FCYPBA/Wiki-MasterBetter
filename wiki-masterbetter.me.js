@@ -10660,12 +10660,13 @@ const MY_USERNAME = "xxx";
   //      after the end) is fetched once from GET /api/marketplace/{id}: final price, bid and bidder counts are
   //      stored and the record becomes "done". An auction still "active" after its end is retried with a growing
   //      delay (AAR_MAX_CHECKS then "unresolved"); one whose end was pushed back is rescheduled; a 404 three times
-  //      in a row becomes "not_found". The resolution phase has a time budget (AAR_RESOLVE_BUDGET_MS) so a long
-  //      backlog (tab closed for a day) never delays the next discovery pass for long.
-  // Requests are spaced by AAR_REQUEST_PACING_MS. On the API's "automation_limit" answer (see Feature EBC) the
-  // whole loop sleeps, 1 min doubling up to 10 min while it keeps happening. The pacing sleeps are always
-  // scheduled right after a network/IndexedDB event rather than chained from another timer, which keeps the
-  // browser's intensive throttling of background tabs (timers limited to once a minute) from stretching them.
+  //      in a row becomes "not_found". A resolution pass has a time budget (AAR_RESOLVE_BUDGET_MS), after
+  //      which it comes back after AAR_MIN_GAP_MS instead of AAR_RESOLVE_GAP_MS.
+  //   The two phases are two independent loops (aarDiscoverLoop every 5 minutes, aarResolveLoop every minute), so a
+  //   slow, failing or rate-limited search never delays the results of finished auctions, nor the other way round.
+  //   They share only the request gate (aarFetchPaced: requests start AAR_REQUEST_PACING_MS apart, first come first
+  //   served) and the rate-limit pause: on the API's "automation_limit" answer (see Feature EBC) both stop sending,
+  //   1 min doubling up to 10 min while it keeps happening.
   // The last pass time, next pass time, rate-limit deadline and last error are mirrored in localStorage under
   // "wm-auction-archive-status" for the modal. A page reload does not restart a pass early: the loop waits for
   // 5 minutes after the last one started.
@@ -10684,9 +10685,12 @@ const MY_USERNAME = "xxx";
   const AAR_MIN_GAP_MS = 30 * 1000;
   const AAR_PAGE_SIZE = 50;
   const AAR_MAX_PAGES = 100;
+  // The Legendary source only needs its newest pages once the first full scan has been made
+  const AAR_LEGENDARY_MAX_PAGES = 20;
   const AAR_REQUEST_PACING_MS = 1200;
   const AAR_SETTLE_MARGIN_MS = 30 * 1000;
   const AAR_RESOLVE_BUDGET_MS = 3 * 60 * 1000;
+  const AAR_RESOLVE_GAP_MS = 60 * 1000;
   const AAR_MAX_CHECKS = 12;
   const AAR_NOT_FOUND_MAX = 3;
   const AAR_RETRY_BASE_MS = 30 * 1000;
@@ -10715,29 +10719,38 @@ const MY_USERNAME = "xxx";
   }
 
   let aarDbPromise = null;
-  let aarWakeUp = null;
+  // The discovery loop and the resolution loop each wait on their own timer: waking wakes both
+  const aarWakers = new Set();
   let aarRateLimitStreak = 0;
+  // Shared by both loops: the earliest time the next request may start, and the end of a rate-limit pause
+  let aarGateChain = Promise.resolve();
+  let aarNextSlotAt = 0;
+  let aarCooldownUntil = 0;
 
   function aarSleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  // Sleeps up to ms, or less if aarWakeUp() is called (terms just saved, "Scanner maintenant")
+  // Sleeps up to ms, or less if aarWake() is called (terms just saved, "Scanner maintenant")
   function aarWait(ms) {
     return new Promise((resolve) => {
       const timer = setTimeout(done, ms);
       function done() {
         clearTimeout(timer);
-        aarWakeUp = null;
+        aarWakers.delete(done);
         resolve();
       }
-      aarWakeUp = done;
+      aarWakers.add(done);
     });
+  }
+
+  function aarWakeLocal() {
+    [...aarWakers].forEach((wake) => wake());
   }
 
   // Asks the leader tab (possibly this one) to start a pass now
   function aarWake() {
-    aarWakeUp?.();
+    aarWakeLocal();
     try {
       const channel = new BroadcastChannel(AAR_CHANNEL_NAME);
       channel.postMessage("wake");
@@ -10991,6 +11004,45 @@ const MY_USERNAME = "xxx";
     return response.json();
   }
 
+  // The one door for the crawler's requests, whichever loop sends them: requests start at least
+  // AAR_REQUEST_PACING_MS apart (the two loops share the budget instead of doubling the rate) and none starts
+  // during a rate-limit pause. First come, first served, so neither loop can starve the other.
+  function aarFetchPaced(path) {
+    const slot = aarGateChain.then(async () => {
+      for (;;) {
+        const wait = Math.max(aarNextSlotAt, aarCooldownUntil) - Date.now();
+        if (wait <= 0) break;
+        await aarSleep(wait);
+      }
+      aarNextSlotAt = Date.now() + AAR_REQUEST_PACING_MS;
+    });
+    aarGateChain = slot;
+    return slot.then(async () => {
+      const data = await aarFetchJson(path);
+      if (aarCooldownUntil && Date.now() >= aarCooldownUntil) {
+        aarCooldownUntil = 0;
+        aarRateLimitStreak = 0;
+        aarSetStatus({ rateLimitedUntil: null });
+      }
+      return data;
+    });
+  }
+
+  // The site said "automation_limit": both loops pause (the gate holds every request), 1 min doubling up to 10
+  // min while it keeps happening. Resolves with the pause, for the loop that saw it to sleep as long.
+  function aarEnterCooldown() {
+    if (Date.now() < aarCooldownUntil) return aarCooldownUntil - Date.now();
+    aarRateLimitStreak++;
+    const cooldown = Math.min(
+      AAR_COOLDOWN_BASE_MS * 2 ** (aarRateLimitStreak - 1),
+      AAR_COOLDOWN_MAX_MS,
+    );
+    aarCooldownUntil = Date.now() + cooldown;
+    console.warn("[WMB-AAR] automation_limit reached, pausing", cooldown);
+    aarSetStatus({ rateLimitedUntil: aarCooldownUntil });
+    return cooldown;
+  }
+
   function aarNextCheckAfterEnd(endAt) {
     const end = aarParseTime(endAt);
     return (end ?? Date.now()) + AAR_SETTLE_MARGIN_MS;
@@ -11051,20 +11103,25 @@ const MY_USERNAME = "xxx";
   }
 
   // label is what gets stored in the records' "terms"; filter is the query string part that selects the auctions
-  async function aarCrawlSource(label, filter) {
-    for (let page = 1; page <= AAR_MAX_PAGES; page++) {
-      const data = await aarFetchJson(
+  // Resolves with what the pass found: pages read, auctions seen, auctions archived for the first time
+  async function aarCrawlSource(label, filter, maxPages = AAR_MAX_PAGES) {
+    const found = { pages: 0, seen: 0, created: 0 };
+    for (let page = 1; page <= maxPages; page++) {
+      const data = await aarFetchPaced(
         `/api/marketplace?page=${page}&limit=${AAR_PAGE_SIZE}&sort=recent&${filter}`,
       );
       const items = Array.isArray(data?.auctions) ? data.auctions : [];
       const now = Date.now();
       const known = await aarGetMany(items.map((item) => item.id));
+      found.pages++;
+      found.seen += items.length;
 
       let newForSource = 0;
       const records = items.map((item, index) => {
         const existing = known[index];
         if (!existing) {
           newForSource++;
+          found.created++;
           return aarRecordFromListing(item, label, now);
         }
         if (!existing.terms.includes(label)) newForSource++;
@@ -11074,7 +11131,25 @@ const MY_USERNAME = "xxx";
 
       // Newest first: a page with nothing new means everything after it is already archived
       if (!data?.hasMore || items.length === 0 || newForSource === 0) break;
-      await aarSleep(AAR_REQUEST_PACING_MS);
+    }
+    return found;
+  }
+
+  // Crawls one source and keeps the outcome in the status ("sources"), so the panel shows whether each one runs
+  // and what it finds. A source the site refuses (any HTTP error but the rate limit) doesn't stop the others.
+  async function aarCrawlTracked(label, filter, maxPages) {
+    const record = (outcome) =>
+      aarSetStatus({
+        sources: {
+          ...(aarReadStatus().sources ?? {}),
+          [label]: { at: Date.now(), ...outcome },
+        },
+      });
+    try {
+      record(await aarCrawlSource(label, filter, maxPages));
+    } catch (error) {
+      if (!(error instanceof AarHttpError)) throw error;
+      record({ error: error.message });
     }
   }
 
@@ -11124,7 +11199,7 @@ const MY_USERNAME = "xxx";
   async function aarResolveOne(record) {
     let data;
     try {
-      data = await aarFetchJson(`/api/marketplace/${record.id}`);
+      data = await aarFetchPaced(`/api/marketplace/${record.id}`);
     } catch (error) {
       if (!(error instanceof AarHttpError) || error.status !== 404) throw error;
 
@@ -11192,7 +11267,7 @@ const MY_USERNAME = "xxx";
 
       let data = null;
       try {
-        data = await aarFetchJson(`/api/marketplace/${record.id}`);
+        data = await aarFetchPaced(`/api/marketplace/${record.id}`);
       } catch (error) {
         if (!(error instanceof AarHttpError) || error.status !== 404) {
           throw error;
@@ -11205,7 +11280,6 @@ const MY_USERNAME = "xxx";
         record.rich = 2;
       }
       await aarPutMany([record]);
-      await aarSleep(AAR_REQUEST_PACING_MS);
     }
   }
 
@@ -11219,50 +11293,36 @@ const MY_USERNAME = "xxx";
     for (const record of due) {
       if (Date.now() > deadline) break;
       await aarResolveOne(record);
-      await aarSleep(AAR_REQUEST_PACING_MS);
     }
     await aarBackfill(deadline);
   }
 
-  // One pass: discovery then resolution. Never throws; resolves with the delay before the next pass
-  async function aarTick() {
+  // One discovery pass. Never throws; resolves with the delay before the next one
+  async function aarDiscoverTick() {
     const started = Date.now();
     aarSetStatus({ lastTickStartedAt: started, phase: "running" });
 
     try {
       const terms = aarReadTerms();
       const legendary = aarReadLegendary();
+      // The searched terms come first; the Legendaries are a bonus, last and capped, so a failure there costs nothing
       for (const term of terms) {
-        await aarCrawlSource(term, `q=${encodeURIComponent(term)}`);
-        await aarSleep(AAR_REQUEST_PACING_MS);
+        await aarCrawlTracked(term, `q=${encodeURIComponent(term)}`);
       }
       if (legendary) {
-        await aarCrawlSource(AAR_LEGENDARY_LABEL, "rarity=L");
-        await aarSleep(AAR_REQUEST_PACING_MS);
+        await aarCrawlTracked(
+          AAR_LEGENDARY_LABEL,
+          "rarity=L",
+          AAR_LEGENDARY_MAX_PAGES,
+        );
       }
-      await aarResolveDue(started + AAR_RESOLVE_BUDGET_MS);
-
-      aarRateLimitStreak = 0;
-      aarSetStatus({ lastError: null, rateLimitedUntil: null });
-
-      const counts = await aarCounts();
-      if (terms.length === 0 && !legendary && counts.open === 0) {
-        return AAR_IDLE_MS;
-      }
+      aarSetStatus({ lastError: null });
+      if (terms.length === 0 && !legendary) return AAR_IDLE_MS;
       return Math.max(AAR_MIN_GAP_MS, AAR_TICK_MS - (Date.now() - started));
     } catch (error) {
       if (error instanceof AarRateLimitError) {
-        aarRateLimitStreak++;
-        const cooldown = Math.min(
-          AAR_COOLDOWN_BASE_MS * 2 ** (aarRateLimitStreak - 1),
-          AAR_COOLDOWN_MAX_MS,
-        );
-        console.warn("[WMB-AAR] automation_limit reached, pausing", cooldown);
-        aarSetStatus({
-          lastError: "Limite de requêtes du site atteinte",
-          rateLimitedUntil: Date.now() + cooldown,
-        });
-        return cooldown;
+        aarSetStatus({ lastError: "Limite de requêtes du site atteinte" });
+        return aarEnterCooldown();
       }
       console.error("[WMB-AAR]", error);
       aarSetStatus({ lastError: String(error?.message ?? error) });
@@ -11270,7 +11330,31 @@ const MY_USERNAME = "xxx";
     }
   }
 
-  async function aarRunLoop() {
+  // One resolution pass: fetches the result of every finished auction that is due, then backfills a few old
+  // records. Independent of discovery: a failing or slow search never delays the results.
+  async function aarResolveTick() {
+    const started = Date.now();
+    aarSetStatus({ resolveStartedAt: started, resolvePhase: "running" });
+
+    try {
+      await aarResolveDue(started + AAR_RESOLVE_BUDGET_MS);
+      aarSetStatus({ resolveError: null });
+      // A pass that ran out of budget still has a backlog: come back sooner
+      return Date.now() - started >= AAR_RESOLVE_BUDGET_MS
+        ? AAR_MIN_GAP_MS
+        : AAR_RESOLVE_GAP_MS;
+    } catch (error) {
+      if (error instanceof AarRateLimitError) {
+        aarSetStatus({ resolveError: "Limite de requêtes du site atteinte" });
+        return aarEnterCooldown();
+      }
+      console.error("[WMB-AAR]", error);
+      aarSetStatus({ resolveError: String(error?.message ?? error) });
+      return AAR_RESOLVE_GAP_MS;
+    }
+  }
+
+  async function aarDiscoverLoop() {
     // A reload must not trigger an early pass
     const status = aarReadStatus();
     const firstDelay = Math.max(
@@ -11282,10 +11366,23 @@ const MY_USERNAME = "xxx";
     await aarWait(firstDelay);
 
     for (;;) {
-      const delay = await aarTick();
+      const delay = await aarDiscoverTick();
       aarSetStatus({ nextTickAt: Date.now() + delay, phase: "idle" });
       await aarWait(delay);
     }
+  }
+
+  async function aarResolveLoop() {
+    for (;;) {
+      const delay = await aarResolveTick();
+      aarSetStatus({ resolveNextAt: Date.now() + delay, resolvePhase: "idle" });
+      await aarWait(delay);
+    }
+  }
+
+  // Two loops side by side in the leader tab, sharing only the request gate and the rate-limit pause
+  function aarRunLoop() {
+    return Promise.all([aarDiscoverLoop(), aarResolveLoop()]);
   }
 
   // ---- Export ----
@@ -11577,6 +11674,15 @@ const MY_USERNAME = "xxx";
         "Aucun terme : saisissez-en un (ou activez les Légendaires) pour démarrer la collecte.",
       );
     }
+    // What each source found at its last pass (Legendaries included, under their internal label)
+    for (const [label, source] of Object.entries(status.sources ?? {})) {
+      const name = label === AAR_LEGENDARY_LABEL ? "Légendaires" : `« ${label} »`;
+      lines.push(
+        source.error
+          ? `${name} : dernier scan ${aarFormatTime(source.at)}, refusé par le site (${source.error})`
+          : `${name} : dernier scan ${aarFormatTime(source.at)}, ${source.seen} enchère(s) vue(s) sur ${source.pages} page(s), dont ${source.created} nouvelle(s)`,
+      );
+    }
     if (status.lastTickStartedAt) {
       lines.push(
         status.phase === "running"
@@ -11586,12 +11692,22 @@ const MY_USERNAME = "xxx";
     } else {
       lines.push("Aucun passage effectué pour l'instant.");
     }
+    if (status.resolveStartedAt) {
+      lines.push(
+        status.resolvePhase === "running"
+          ? `Résultats : relevé en cours depuis ${aarFormatTime(status.resolveStartedAt)}`
+          : `Résultats : dernier relevé ${aarFormatTime(status.resolveStartedAt)} · prochain : ${aarFormatTime(status.resolveNextAt)}`,
+      );
+    }
     if ((status.rateLimitedUntil ?? 0) > Date.now()) {
       lines.push(
         `Limite de requêtes : pause jusqu'à ${aarFormatTime(status.rateLimitedUntil)}`,
       );
     }
     if (status.lastError) lines.push(`Dernière erreur : ${status.lastError}`);
+    if (status.resolveError) {
+      lines.push(`Dernière erreur (résultats) : ${status.resolveError}`);
+    }
 
     box.replaceChildren(
       ...lines.map((line) => {
@@ -11901,7 +12017,7 @@ const MY_USERNAME = "xxx";
     try {
       const channel = new BroadcastChannel(AAR_CHANNEL_NAME);
       channel.onmessage = (event) => {
-        if (event.data === "wake") aarWakeUp?.();
+        if (event.data === "wake") aarWakeLocal();
       };
     } catch {
       // No cross-tab wake-up: the scheduled pass will do

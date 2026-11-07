@@ -75,6 +75,13 @@
   }
   .chip:hover { background: var(--wash); }
   .chip[aria-pressed="true"] { border-color: var(--s1); color: var(--s1); background: var(--accent-wash); font-weight: 600; }
+  /* Couleurs officielles des raretés (variables --color-rarity-* de wiki-masters.com). Ce sont des pastels :
+     texte sombre dessus dans les deux thèmes, jamais en texte coloré sur fond clair. */
+  .chip.rar { --rc: var(--muted); }
+  .chip.rar::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--rc); margin-right: 6px; vertical-align: -1px; }
+  .chip.rar[aria-pressed="true"] { background: var(--rc); border-color: var(--rc); color: #111; }
+  .chip.rar[aria-pressed="true"]::before { background: #111; }
+  .rbadge { display: inline-block; min-width: 2.2em; text-align: center; padding: 0 7px; border-radius: 999px; background: var(--rc, var(--wash)); color: #111; font-size: 12px; font-weight: 600; line-height: 1.6; }
   details.params { position: relative; }
   details.params summary { cursor: pointer; color: var(--ink2); font-size: 13px; list-style: none; }
   details.params summary::before { content: "⚙ "; }
@@ -229,6 +236,12 @@
    ===================================================================== */
 const TZ = "Europe/Paris";
 const RARITIES = ["C", "PC", "R", "SR", "UR", "L"];
+/* Entrée « Any » du filtre des termes : les enchères qui ne viennent d'aucun terme de recherche (ex. toutes les
+   Légendaires archivées via la case « Légendaires », dont le terme interne est « rarity:L »). */
+const ANY_TERM = "Any (sans terme)";
+const isSourceLabel = (t) => t.startsWith("rarity:");
+const RARITY_COLORS = { C: "#b8f2d5", PC: "#b1cff2", R: "#c6a7f2", SR: "#ed6fa3", UR: "#fa9931", L: "#ffe144" };
+const rarityBadge = (code) => el("span", { class: "rbadge", style: `--rc:${RARITY_COLORS[code] || "transparent"}`, text: code ?? "?" });
 const NS = "http://www.w3.org/2000/svg";
 const state = {
   recs: [], groups: new Map(), terms: [], activeTerms: new Set(), rarities: new Set(RARITIES),
@@ -308,6 +321,11 @@ const tip = el("div", { class: "tip", role: "tooltip" });
 tip.hidden = true;
 document.body.append(tip);
 function showTip(x, y, t) {
+  // A modal <dialog> lives in the browser's top layer, above any z-index: while one is open, the tooltip must
+  // be inside it to be seen (it stays position: fixed, so the coordinates are still the viewport's)
+  const dlg = document.getElementById("dlg");
+  const host = dlg?.open ? dlg : document.body;
+  if (tip.parentNode !== host) host.append(tip);
   tip.replaceChildren();
   if (t.title) tip.append(el("div", { class: "tt", text: t.title }));
   (t.rows || []).forEach((r) => {
@@ -629,14 +647,16 @@ function prepare(raw) {
     const sold = r.status === "settled_sold", unsold = r.status === "settled_unsold";
     const rec = {
       id: r.id, name: r.cardName || "(sans nom)", rarity: r.rarity, shiny: !!r.isShiny,
-      key: (r.cardName || r.cardId || "?") + (r.isShiny ? " ✨" : ""),
-      terms: r.terms || [], status: r.status, sold, unsold, fin: sold || unsold, open: r.state === "open" && r.status === "active",
+      // One card name can exist in several rarities (e.g. SR and UR): each one is its own card, with its own prices
+      key: (r.cardName || r.cardId || "?") + " [" + r.rarity + "]" + (r.isShiny ? " ✨" : ""),
+      terms: r.terms || [], tkeys: (r.terms || []).filter((t) => !isSourceLabel(t)), status: r.status, sold, unsold, fin: sold || unsold, open: r.state === "open" && r.status === "active",
       start: r.startPrice, final: r.finalPrice, bids: r.bidCount, bidders: r.bidderCount,
       end, created, dur: end && created ? Math.round((end - created) / 60000) : null,
       lastBidSec: r.lastBidAt && end ? (end - r.lastBidAt) / 1000 : null,
       seen: r.lastSeenAt || r.firstSeenAt || 0,
       hour: null, day: null,
     };
+    if (!rec.tkeys.length) rec.tkeys = [ANY_TERM];
     if (rec.fin && end) { rec.hour = parisHour(end); rec.day = parisDay(end); }
     return rec;
   });
@@ -666,7 +686,7 @@ function looMedian(sorted, price) {
    Filtrage
    ===================================================================== */
 function inScope(r) {
-  if (state.activeTerms.size < state.terms.length && !r.terms.some((t) => state.activeTerms.has(t))) return false;
+  if (state.activeTerms.size < state.terms.length && !r.tkeys.some((t) => state.activeTerms.has(t))) return false;
   if (!state.rarities.has(r.rarity)) return false;
   if (state.shiny === "no" && r.shiny) return false;
   if (state.shiny === "only" && !r.shiny) return false;
@@ -741,7 +761,7 @@ function renderAll() {
     sortKey: "save",
     cols: [
       { key: "name", label: "Carte", render: (e) => cardLink(e.r), val: (e) => e.r.name },
-      { key: "rar", label: "Rareté", val: (e) => RARITIES.indexOf(e.r.rarity), render: (e) => e.r.rarity },
+      { key: "rar", label: "Rareté", val: (e) => RARITIES.indexOf(e.r.rarity), render: (e) => rarityBadge(e.r.rarity) },
       { key: "price", label: "Prix payé", num: true, val: (e) => e.r.final, render: (e) => fmtInt(e.r.final) },
       { key: "ref", label: "Médiane (autres)", title: "Médiane des autres ventes de la même carte", num: true, val: (e) => e.ref, render: (e) => fmtInt(e.ref) },
       { key: "ratio", label: "% du médian", num: true, val: (e) => e.ratio, render: (e) => fmtPct(e.ratio) },
@@ -847,7 +867,7 @@ function renderAll() {
       sortKey: "end", dir: 1,
       cols: [
         { key: "name", label: "Carte", render: (e) => cardLink(e.r), val: (e) => e.r.name },
-        { key: "rar", label: "Rareté", val: (e) => RARITIES.indexOf(e.r.rarity), render: (e) => e.r.rarity },
+        { key: "rar", label: "Rareté", val: (e) => RARITIES.indexOf(e.r.rarity), render: (e) => rarityBadge(e.r.rarity) },
         { key: "start", label: "Mise de départ", num: true, val: (e) => e.r.start, render: (e) => fmtInt(e.r.start) },
         { key: "ref", label: "Médiane de la carte", num: true, val: (e) => e.ref, render: (e) => fmtInt(e.ref) },
         { key: "ratio", label: "Départ / médiane", num: true, val: (e) => e.ratio, render: (e) => fmtPct(e.ratio) },
@@ -911,7 +931,7 @@ function renderAll() {
   rarCard.append(dataTable({
     sortKey: "ord", dir: 1,
     cols: [
-      { key: "rar", label: "Rareté", val: (x) => x.ord, render: (x) => x.rar },
+      { key: "rar", label: "Rareté", val: (x) => x.ord, render: (x) => rarityBadge(x.rar) },
       { key: "n", label: "Enchères", num: true, render: (x) => fmtInt(x.n) },
       { key: "rate", label: "Taux de vente", num: true, render: (x) => fmtPct(x.rate) },
       { key: "med", label: "Prix médian", num: true, render: (x) => fmtInt(x.med) },
@@ -1006,7 +1026,7 @@ function renderAll() {
       sortKey: "ev", pageSize: 25,
       cols: [
         { key: "name", label: "Carte", render: (x) => cardLink(x.r), val: (x) => x.name },
-        { key: "rarity", label: "Rareté", val: (x) => RARITIES.indexOf(x.rarity), render: (x) => x.rarity },
+        { key: "rarity", label: "Rareté", val: (x) => RARITIES.indexOf(x.rarity), render: (x) => rarityBadge(x.rarity) },
         { key: "sold", label: "Vendues", num: true, render: (x) => fmtInt(x.sold) },
         { key: "unsold", label: "Invendues", num: true, render: (x) => fmtInt(x.unsold) },
         { key: "rate", label: "Taux", num: true, render: (x) => fmtPct(x.rate) },
@@ -1040,7 +1060,7 @@ function openCard(key) {
   if (!all.length) return;
   const s = all.filter((r) => r.sold && r.final != null), pr = sortNum(s.map((r) => r.final));
   const first = all[0];
-  const head = el("div", { class: "dh" }, el("div", { class: "grow" }, el("h2", { text: first.name + (first.shiny ? " ✨" : "") }), el("p", { class: "sub", text: `${first.rarity} · toutes les enchères terminées de la carte dans l'archive` })), el("button", { class: "btn", type: "button", text: "Fermer", onclick: () => dlg.close() }));
+  const head = el("div", { class: "dh" }, el("div", { class: "grow" }, el("h2", { text: first.name + (first.shiny ? " ✨" : "") }), el("p", { class: "sub" }, rarityBadge(first.rarity), " toutes les enchères terminées de la carte dans l'archive")), el("button", { class: "btn", type: "button", text: "Fermer", onclick: () => dlg.close() }));
   const mt = el("div", { class: "minitiles" });
   mt.append(
     tile("Ventes", fmtInt(s.length), `${fmtInt(all.length - s.length)} invendues`),
@@ -1137,7 +1157,22 @@ function buildFilters() {
 
   f.append(group("Période", ...[["all", "Tout"], ["24h", "24 h"], ["7d", "7 j"], ["30d", "30 j"]].map(([v, t]) => chip(t, state.period === v, () => { state.period = v; rerender(); }))));
   f.append(termsGroup(group, chip, rerender));
-  f.append(group("Rareté", ...RARITIES.map((r) => chip(r, state.rarities.has(r), () => { state.rarities.has(r) ? state.rarities.delete(r) : state.rarities.add(r); rerender(); }))));
+  // « Any » = toutes les raretés. Tant qu'il est actif, cliquer une rareté ne garde qu'elle ; les clics suivants
+  // en ajoutent (ou retirent) d'autres ; retirer la dernière revient à « Any ».
+  const anyRarity = state.rarities.size === RARITIES.length;
+  f.append(group("Rareté", chip("Any", anyRarity, () => { state.rarities = new Set(RARITIES); rerender(); }), ...RARITIES.map((r) => {
+    const c = chip(r, !anyRarity && state.rarities.has(r), () => {
+      if (anyRarity) state.rarities = new Set([r]);
+      else {
+        state.rarities.has(r) ? state.rarities.delete(r) : state.rarities.add(r);
+        if (!state.rarities.size) state.rarities = new Set(RARITIES);
+      }
+      rerender();
+    });
+    c.classList.add("rar");
+    c.style.setProperty("--rc", RARITY_COLORS[r]);
+    return c;
+  })));
   f.append(group("Shiny", ...[["all", "Toutes"], ["no", "Sans"], ["only", "Seulement"]].map(([v, t]) => chip(t, state.shiny === v, () => { state.shiny = v; rerender(); }))));
   f.append(group("Tendances", ...[["auto", "Auto"], ["hour", "Heure"], ["day", "Jour"]].map(([v, t]) => chip(t, state.bucket === v, () => { state.bucket = v; rerender(); }))));
 
@@ -1165,8 +1200,9 @@ function load(raw, name) {
   state.recs = prepare(raw);
   state.groups = buildGroups(state.recs);
   state.termCounts = new Map();
-  raw.forEach((r) => (r.terms || []).forEach((t) => state.termCounts.set(t, (state.termCounts.get(t) || 0) + 1)));
-  state.terms = [...state.termCounts.keys()].sort((a, b) => state.termCounts.get(b) - state.termCounts.get(a) || a.localeCompare(b));
+  state.recs.forEach((r) => r.tkeys.forEach((t) => state.termCounts.set(t, (state.termCounts.get(t) || 0) + 1)));
+  // « Any » toujours en premier, puis les termes du plus au moins fréquent
+  state.terms = [...state.termCounts.keys()].sort((a, b) => (b === ANY_TERM) - (a === ANY_TERM) || state.termCounts.get(b) - state.termCounts.get(a) || a.localeCompare(b));
   state.activeTerms = new Set(state.terms);
   state.fileName = name;
   const fins = state.recs.filter((r) => r.fin && r.end);
