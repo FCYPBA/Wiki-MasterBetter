@@ -4378,7 +4378,7 @@ const MY_USERNAME = "xxx";
     },
     {
       title: "Récapitulatif de la page de collection",
-      text: "En haut de la collection, une barre résume la page affichée : nombre de cartes, valeur estimée totale et, pour chaque rareté (L, UR, SR, R, PC, C), le nombre de cartes et leur valeur. Seules les estimations déjà connues comptent : les cartes sans estimation sont signalées à part. Le bouton 📷 copie le récapitulatif et les cartes de la page comme image (à coller dans une discussion), le bouton 💾 la télécharge en PNG, nommé d'après l'étiquette choisie, la recherche, la page et la date. Il suffit d'un clic, sans capture d'écran ni autorisation. Seule la page affichée est comptée : passez à la page suivante pour obtenir son récapitulatif.",
+      text: "En haut de la collection, une barre résume la page affichée : nombre de cartes, valeur estimée totale et, pour chaque rareté (L, UR, SR, R, PC, C), le nombre de cartes et leur valeur. Seules les estimations déjà connues comptent : les cartes sans estimation sont signalées à part. Le bouton 📷 copie le récapitulatif et les cartes de la page comme image (à coller dans une discussion), la case « Valeurs » décide si les valeurs estimées du récapitulatif figurent dans l'image (décochée, seul le nombre de cartes par rareté reste), le bouton 💾 la télécharge en PNG, nommé d'après l'étiquette choisie, la recherche, la page et la date. Il suffit d'un clic, sans capture d'écran ni autorisation. Seule la page affichée est comptée : passez à la page suivante pour obtenir son récapitulatif.",
     },
   ];
 
@@ -12478,6 +12478,16 @@ const MY_USERNAME = "xxx";
   const CPR_EXCLUDED_FROM_CAPTURE =
     ".wm-cpr-actions, .wm-quick-action, div.flex.items-center.justify-center.gap-2.py-3";
   const cprNumberFormat = new Intl.NumberFormat("fr-FR");
+  // A "Valeurs" checkbox next to the buttons: unchecked, the recap's estimated values (total, and per rarity,
+  // marked .wm-cpr-value) are left out of the image, the card counts per rarity stay. Kept in localStorage.
+  const CPR_VALUES_KEY = "wm-cpr-include-values";
+  let cprIncludeValues = (() => {
+    try {
+      return localStorage.getItem(CPR_VALUES_KEY) !== "0";
+    } catch {
+      return true;
+    }
+  })();
 
   function cprReadCardRarity(card) {
     const rarityEl = card.querySelector("div.top-2.left-2");
@@ -12523,15 +12533,18 @@ const MY_USERNAME = "xxx";
     head.className = "wm-cpr-head";
     const cards = document.createElement("strong");
     cards.textContent = cardsLabel;
+    head.append(cards);
+    // Total value and the count of unestimated cards go together: both are dropped when values are left out
     const value = document.createElement("span");
+    value.className = "wm-cpr-value";
     value.textContent = ` · valeur estimée : ${cprNumberFormat.format(Math.round(stats.value))}`;
-    head.append(cards, value);
     if (stats.unestimated > 0) {
       const missing = document.createElement("span");
       missing.className = "wm-cpr-missing";
       missing.textContent = ` (${stats.unestimated} sans estimation)`;
-      head.append(missing);
+      value.append(missing);
     }
+    head.append(value);
 
     const chips = cprRarityOrder([...stats.byRarity.keys()]).map((code) => {
       const entry = stats.byRarity.get(code);
@@ -12539,7 +12552,11 @@ const MY_USERNAME = "xxx";
       chip.className = "wm-cpr-chip";
       chip.style.setProperty("--wm-cpr-color", `var(--color-rarity-${code.toLowerCase()}, currentColor)`);
       const worth = entry.estimated > 0 ? cprNumberFormat.format(Math.round(entry.value)) : "—";
-      chip.textContent = `${code} ×${entry.cards} · ${worth}`;
+      chip.append(`${code} ×${entry.cards}`);
+      const worthEl = document.createElement("span");
+      worthEl.className = "wm-cpr-value";
+      worthEl.textContent = ` · ${worth}`;
+      chip.append(worthEl);
       return chip;
     });
 
@@ -12608,7 +12625,11 @@ const MY_USERNAME = "xxx";
         backgroundColor:
           background && background !== "rgba(0, 0, 0, 0)" ? background : "#0d1117",
         filter: (node) =>
-          node.nodeType !== 1 || !node.matches(CPR_EXCLUDED_FROM_CAPTURE),
+          node.nodeType !== 1 ||
+          !(
+            node.matches(CPR_EXCLUDED_FROM_CAPTURE) ||
+            (!cprIncludeValues && node.matches(".wm-cpr-value"))
+          ),
       });
     } finally {
       console.error = originalConsoleError;
@@ -12675,7 +12696,23 @@ const MY_USERNAME = "xxx";
       }
     });
 
-    actions.append(copyBtn, saveBtn);
+    const valuesLabel = document.createElement("label");
+    valuesLabel.className = "wm-cpr-values";
+    valuesLabel.title = "Inclure les valeurs estimées du récapitulatif dans l'image (le nombre de cartes par rareté reste toujours)";
+    const valuesBox = document.createElement("input");
+    valuesBox.type = "checkbox";
+    valuesBox.checked = cprIncludeValues;
+    valuesBox.addEventListener("change", () => {
+      cprIncludeValues = valuesBox.checked;
+      try {
+        localStorage.setItem(CPR_VALUES_KEY, cprIncludeValues ? "1" : "0");
+      } catch {
+        // Unwritable storage: the choice just won't stick
+      }
+    });
+    valuesLabel.append(valuesBox, " Valeurs");
+
+    actions.append(valuesLabel, copyBtn, saveBtn);
     return actions;
   }
 
@@ -12743,7 +12780,16 @@ const MY_USERNAME = "xxx";
       }
       .wm-cpr-actions {
         display: inline-flex;
+        align-items: center;
         gap: 0.4rem;
+      }
+      .wm-cpr-values {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+        font-size: 0.75rem;
+        opacity: 0.85;
+        cursor: pointer;
       }
       .wm-cpr-btn {
         padding: 0.15rem 0.55rem;
