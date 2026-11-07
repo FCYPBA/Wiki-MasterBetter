@@ -3941,6 +3941,10 @@ const MY_USERNAME = "xxx";
       id: "feature-ach",
       label: "Historique des prix de la carte (d'après l'archive) sur sa page d'enchère",
     },
+    {
+      id: "feature-cpr",
+      label: "Récapitulatif de la page de collection (nombre et valeur par rareté), copiable en image",
+    },
   ];
 
   function readFeatureFlags() {
@@ -4371,6 +4375,10 @@ const MY_USERNAME = "xxx";
     {
       title: "Historique des prix d'une carte",
       text: "Sur la page d'une enchère, un bloc « Historique de la carte (archive) » sous le panneau de mise trace les prix des ventes précédentes de la même carte (archivées par la fonctionnalité d'archive des enchères) : un point par vente, une ligne pointillée pour la médiane et, dès 4 ventes, une courbe de tendance lissée. Survolez un point pour voir sa date et son prix. Rien ne s'affiche tant que la carte n'a jamais été archivée.",
+    },
+    {
+      title: "Récapitulatif de la page de collection",
+      text: "En haut de la collection, une barre résume la page affichée : nombre de cartes, valeur estimée totale et, pour chaque rareté (L, UR, SR, R, PC, C), le nombre de cartes et leur valeur. Seules les estimations déjà connues comptent : les cartes sans estimation sont signalées à part. Le bouton 📷 copie le récapitulatif et les cartes de la page comme image (à coller dans une discussion), le bouton 💾 la télécharge en PNG, nommé d'après l'étiquette choisie, la recherche, la page et la date. Il suffit d'un clic, sans capture d'écran ni autorisation. Seule la page affichée est comptée : passez à la page suivante pour obtenir son récapitulatif.",
     },
   ];
 
@@ -9731,7 +9739,7 @@ const MY_USERNAME = "xxx";
       // harmless noise, filtered out (only that message, only during the capture)
       const originalConsoleError = console.error;
       console.error = (...args) => {
-        if (String(args[0]).includes("Error while reading CSS rules")) return;
+        if (/Error while reading CSS rules|Error inlining remote css file/.test(String(args[0]))) return;
         originalConsoleError.apply(console, args);
       };
       const blobPromise = htmlToImage
@@ -12334,6 +12342,320 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Feature CPR: recap of the collection page on display, to share it as a picture. On /collection, a bar is
+  // inserted as the first child of the block holding the pager and the cards grid (div.scroll-mt-4). It shows the
+  // number of cards of the page, their total estimated value and, per rarity (L, UR, SR, R, PC, C, in the site's
+  // own order and colours), how many cards there are and what they are worth. The value of a card is its estimate
+  // (Feature ETS, "eval-{name}"); a card with no estimate (or the "?" placeholder) is worth nothing in the sums and
+  // is counted apart ("sans estimation"). Only the page on screen is counted, never the other pages of the
+  // collection. The bar follows the page: it is re-computed (debounced) on every DOM mutation, and only touches
+  // the DOM when the numbers changed, so its own update does not retrigger itself.
+  //
+  // Two buttons on the bar render the block (recap + cards, without the pager rows nor the cards' quick-action
+  // buttons, nor the buttons themselves) to a PNG with html-to-image (@require'd in the header, same as Feature
+  // CCL): "📷" copies it to the clipboard, "💾" downloads it, named after the chosen tag, the search and the page
+  // (see cprBuildFileName). A script cannot take a real screenshot without the
+  // browser asking for permission, and cannot write the clipboard without a click; rendering the page's own DOM
+  // needs neither, which is why it takes one click and not a capture dialog. Cards' Wikipedia thumbnails are
+  // fetched with CORS (the site marks them crossorigin="anonymous"); one that can't be loaded is left blank.
+  // ============================================================
+  const CPR_EXCLUDED_FROM_CAPTURE =
+    ".wm-cpr-actions, .wm-quick-action, div.flex.items-center.justify-center.gap-2.py-3";
+  const cprNumberFormat = new Intl.NumberFormat("fr-FR");
+
+  function cprReadCardRarity(card) {
+    const rarityEl = card.querySelector("div.top-2.left-2");
+    if (!rarityEl) return null;
+    if (rarityEl.dataset.wmBaseRarity) return rarityEl.dataset.wmBaseRarity;
+    // Before Feature ETS tags it, the badge only holds the rarity code (then possibly its appendix span)
+    const own = Array.from(rarityEl.childNodes).find((n) => n.nodeType === 3);
+    return (own ?? rarityEl).textContent.trim() || null;
+  }
+
+  function cprCollectStats(grid) {
+    const stats = { cards: 0, value: 0, unestimated: 0, byRarity: new Map() };
+    Array.from(grid.children).forEach((card) => {
+      if (!card.querySelector("h3")) return;
+      const rarity = cprReadCardRarity(card) ?? "?";
+      const value = getCardEvalValue(card);
+      if (!stats.byRarity.has(rarity)) {
+        stats.byRarity.set(rarity, { cards: 0, value: 0, estimated: 0 });
+      }
+      const entry = stats.byRarity.get(rarity);
+
+      stats.cards++;
+      entry.cards++;
+      if (value === null) {
+        stats.unestimated++;
+      } else {
+        stats.value += value;
+        entry.value += value;
+        entry.estimated++;
+      }
+    });
+    return stats;
+  }
+
+  function cprRarityOrder(codes) {
+    const known = EVL_RARITIES.filter((code) => codes.includes(code));
+    return [...known, ...codes.filter((code) => !EVL_RARITIES.includes(code))];
+  }
+
+  function cprRenderSummary(summaryEl, stats) {
+    const cardsLabel = `${stats.cards} carte${stats.cards > 1 ? "s" : ""}`;
+    const head = document.createElement("span");
+    head.className = "wm-cpr-head";
+    const cards = document.createElement("strong");
+    cards.textContent = cardsLabel;
+    const value = document.createElement("span");
+    value.textContent = ` · valeur estimée : ${cprNumberFormat.format(Math.round(stats.value))}`;
+    head.append(cards, value);
+    if (stats.unestimated > 0) {
+      const missing = document.createElement("span");
+      missing.className = "wm-cpr-missing";
+      missing.textContent = ` (${stats.unestimated} sans estimation)`;
+      head.append(missing);
+    }
+
+    const chips = cprRarityOrder([...stats.byRarity.keys()]).map((code) => {
+      const entry = stats.byRarity.get(code);
+      const chip = document.createElement("span");
+      chip.className = "wm-cpr-chip";
+      chip.style.setProperty("--wm-cpr-color", `var(--color-rarity-${code.toLowerCase()}, currentColor)`);
+      const worth = entry.estimated > 0 ? cprNumberFormat.format(Math.round(entry.value)) : "—";
+      chip.textContent = `${code} ×${entry.cards} · ${worth}`;
+      return chip;
+    });
+
+    summaryEl.replaceChildren(head, ...chips);
+  }
+
+  // Name of the saved PNG: "{tag filter}_{search}_page-{n}_{date}.png". The tag filter and the search are left
+  // out when empty. The tag filter is read off the site's tag dropdown trigger (a button that has aria-haspopup
+  // and aria-expanded, other than our own dialog openers), whose label is "Toutes les étiquettes" when no tag is
+  // chosen; the search is the collection's search field (input.rounded-lg, as in Rule 28).
+  function cprReadChosenTag() {
+    const trigger = document.querySelector(
+      'button[aria-haspopup][aria-expanded]:not([aria-haspopup="dialog"])',
+    );
+    const label = (trigger?.textContent ?? "")
+      .trim()
+      .replace(TAG_COUNT_REGEX, "")
+      .trim()
+      .replace(/^#/, "")
+      .trim();
+    return /^toutes les étiquettes$/i.test(label) ? "" : label;
+  }
+
+  function cprFileNamePart(text) {
+    return text
+      // Characters a file name can't hold on some systems, and control characters
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 40)
+      .trim();
+  }
+
+  function cprBuildFileName() {
+    const indicator = findCollectionPageIndicator();
+    const page = indicator ? readCollectionPageIndicator(indicator).current : 1;
+    const search = document.querySelector("input.rounded-lg")?.value ?? "";
+    return `${[
+      cprFileNamePart(cprReadChosenTag()),
+      cprFileNamePart(search),
+      `page-${page}`,
+      new Date().toISOString().slice(0, 10),
+    ]
+      .filter(Boolean)
+      .join("_")}.png`;
+  }
+
+  // The recap block is the one that holds the pager rows and the grid, so the capture shows the recap above the cards
+  function cprFindBlock(grid) {
+    return grid.closest("div.scroll-mt-4") ?? grid.parentElement?.parentElement ?? null;
+  }
+
+  async function cprRenderBlob(target) {
+    // html-to-image logs console errors for each cross-origin stylesheet it can't read while embedding fonts
+    // ("Error while reading CSS rules", "Error inlining remote css file", both caused by a "Not allowed to access
+    // cross-origin stylesheet" DOMException): harmless noise, filtered out (only those, only during the capture)
+    const originalConsoleError = console.error;
+    console.error = (...args) => {
+      if (/Error while reading CSS rules|Error inlining remote css file/.test(String(args[0]))) return;
+      originalConsoleError.apply(console, args);
+    };
+    try {
+      const background = getComputedStyle(document.body).backgroundColor;
+      return await htmlToImage.toBlob(target, {
+        pixelRatio: 2,
+        backgroundColor:
+          background && background !== "rgba(0, 0, 0, 0)" ? background : "#0d1117",
+        filter: (node) =>
+          node.nodeType !== 1 || !node.matches(CPR_EXCLUDED_FROM_CAPTURE),
+      });
+    } finally {
+      console.error = originalConsoleError;
+    }
+  }
+
+  function cprBuildActions(getTarget) {
+    const actions = document.createElement("span");
+    actions.className = "wm-cpr-actions";
+
+    const makeButton = (icon, title) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "wm-cpr-btn";
+      button.textContent = icon;
+      button.title = title;
+      button.setAttribute("aria-label", title);
+      return button;
+    };
+    const flash = (button, icon, result) => {
+      button.textContent = result;
+      setTimeout(() => {
+        button.textContent = icon;
+        button.disabled = false;
+      }, 1500);
+    };
+    const available = () => typeof htmlToImage !== "undefined";
+
+    const copyBtn = makeButton("📷", "Copier le récapitulatif et les cartes de la page comme image");
+    copyBtn.addEventListener("click", () => {
+      const target = getTarget();
+      if (!target || !available() || !navigator.clipboard?.write) {
+        flash(copyBtn, "📷", "❌");
+        return;
+      }
+      copyBtn.disabled = true;
+      copyBtn.textContent = "⏳";
+      // The blob is handed over as a promise so the clipboard write happens inside the click's user gesture
+      navigator.clipboard
+        .write([new ClipboardItem({ "image/png": cprRenderBlob(target) })])
+        .then(() => flash(copyBtn, "📷", "✅"))
+        .catch((error) => {
+          console.error("[WMB-CPR]", error);
+          flash(copyBtn, "📷", "❌");
+        });
+    });
+
+    const saveBtn = makeButton("💾", "Télécharger le récapitulatif et les cartes de la page en PNG");
+    saveBtn.addEventListener("click", async () => {
+      const target = getTarget();
+      if (!target || !available()) {
+        flash(saveBtn, "💾", "❌");
+        return;
+      }
+      saveBtn.disabled = true;
+      saveBtn.textContent = "⏳";
+      try {
+        const blob = await cprRenderBlob(target);
+        aarDownload(blob, cprBuildFileName(), "image/png");
+        flash(saveBtn, "💾", "✅");
+      } catch (error) {
+        console.error("[WMB-CPR]", error);
+        flash(saveBtn, "💾", "❌");
+      }
+    });
+
+    actions.append(copyBtn, saveBtn);
+    return actions;
+  }
+
+  function updateCollectionRecap() {
+    const grid = document.querySelector("div.gap-3.justify-center");
+    const block = grid && cprFindBlock(grid);
+    if (!window.location.pathname.startsWith("/collection") || !block) {
+      document.querySelectorAll(".wm-cpr-bar").forEach((bar) => bar.remove());
+      return;
+    }
+
+    let bar = block.querySelector(":scope > .wm-cpr-bar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.className = "wm-cpr-bar";
+      const summary = document.createElement("div");
+      summary.className = "wm-cpr-summary";
+      bar.append(summary, cprBuildActions(() => block));
+      block.prepend(bar);
+    }
+
+    const stats = cprCollectStats(grid);
+    const signature = JSON.stringify([
+      stats.cards,
+      stats.value,
+      stats.unestimated,
+      [...stats.byRarity],
+    ]);
+    if (bar.dataset.wmCprSignature === signature) return;
+    bar.dataset.wmCprSignature = signature;
+    cprRenderSummary(bar.querySelector(".wm-cpr-summary"), stats);
+  }
+
+  function watchCollectionRecap() {
+    GM_addStyle(`
+      .wm-cpr-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 0.5rem 1rem;
+        padding: 0.6rem 0.9rem;
+        border: 1px solid var(--color-border);
+        border-radius: 0.75rem;
+        background: var(--color-surface-light);
+        font-size: 0.85rem;
+      }
+      .wm-cpr-summary {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 0.4rem 0.6rem;
+      }
+      .wm-cpr-missing {
+        opacity: 0.6;
+      }
+      .wm-cpr-chip {
+        padding: 0.1rem 0.55rem;
+        border: 1px solid var(--wm-cpr-color);
+        border-radius: 999px;
+        color: var(--wm-cpr-color);
+        font-size: 0.75rem;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+      .wm-cpr-actions {
+        display: inline-flex;
+        gap: 0.4rem;
+      }
+      .wm-cpr-btn {
+        padding: 0.15rem 0.55rem;
+        border: 1px solid var(--color-border);
+        border-radius: 0.5rem;
+        background: transparent;
+        cursor: pointer;
+        opacity: 0.75;
+        transition: opacity 0.2s ease;
+      }
+      .wm-cpr-btn:hover:not(:disabled) {
+        opacity: 1;
+      }
+    `);
+
+    let debounceId = null;
+    const scheduleUpdate = () => {
+      clearTimeout(debounceId);
+      debounceId = setTimeout(updateCollectionRecap, 300);
+    };
+    scheduleUpdate();
+    new MutationObserver(scheduleUpdate).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   function main() {
@@ -12429,6 +12751,7 @@ const MY_USERNAME = "xxx";
     run("feature-evl", watchEstimationsDrawer);
     run("feature-aar", watchAuctionArchive);
     run("feature-ach", watchCardPriceHistory);
+    run("feature-cpr", watchCollectionRecap);
 
     watchFeatureConfigButton();
     watchTutorialButton();
