@@ -3941,6 +3941,10 @@ const MY_USERNAME = "xxx";
       id: "feature-ach",
       label: "Historique des prix de la carte (d'après l'archive) sur sa page d'enchère",
     },
+    {
+      id: "feature-cpr",
+      label: "Récapitulatif de la page de collection (nombre et valeur par rareté), copiable en image",
+    },
   ];
 
   function readFeatureFlags() {
@@ -4366,11 +4370,15 @@ const MY_USERNAME = "xxx";
     },
     {
       title: "Archiver des enchères en direct",
-      text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau) : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée, avec le détail des mises. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON, et un export JSON se réimporte (« Importer (JSON) ») pour transférer l'archive vers un autre navigateur ou ordinateur : les enchères sont fusionnées, rien n'est supprimé ; « Compacter » supprime le détail des mises des enchères de plus de 30 jours pour gagner de la place.",
+      text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau), et/ou cochez « Légendaires » pour archiver toutes les enchères de cartes Légendaires sans terme : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée, avec le détail des mises. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON, et un export JSON se réimporte (« Importer (JSON) ») pour transférer l'archive vers un autre navigateur ou ordinateur : les enchères sont fusionnées, rien n'est supprimé ; « Compacter » supprime le détail des mises des enchères de plus de 30 jours pour gagner de la place.",
     },
     {
       title: "Historique des prix d'une carte",
       text: "Sur la page d'une enchère, un bloc « Historique de la carte (archive) » sous le panneau de mise trace les prix des ventes précédentes de la même carte (archivées par la fonctionnalité d'archive des enchères) : un point par vente, une ligne pointillée pour la médiane et, dès 4 ventes, une courbe de tendance lissée. Survolez un point pour voir sa date et son prix. Rien ne s'affiche tant que la carte n'a jamais été archivée.",
+    },
+    {
+      title: "Récapitulatif de la page de collection",
+      text: "En haut de la collection, une barre résume la page affichée : nombre de cartes, valeur estimée totale et, pour chaque rareté (L, UR, SR, R, PC, C), le nombre de cartes et leur valeur. Seules les estimations déjà connues comptent : les cartes sans estimation sont signalées à part. Le bouton 📷 copie le récapitulatif et les cartes de la page comme image (à coller dans une discussion), le bouton 💾 la télécharge en PNG, nommé d'après l'étiquette choisie, la recherche, la page et la date. Il suffit d'un clic, sans capture d'écran ni autorisation. Seule la page affichée est comptée : passez à la page suivante pour obtenir son récapitulatif.",
     },
   ];
 
@@ -9731,7 +9739,7 @@ const MY_USERNAME = "xxx";
       // harmless noise, filtered out (only that message, only during the capture)
       const originalConsoleError = console.error;
       console.error = (...args) => {
-        if (String(args[0]).includes("Error while reading CSS rules")) return;
+        if (/Error while reading CSS rules|Error inlining remote css file/.test(String(args[0]))) return;
         originalConsoleError.apply(console, args);
       };
       const blobPromise = htmlToImage
@@ -10637,10 +10645,14 @@ const MY_USERNAME = "xxx";
   // upgrade, and aarBackfill re-fetches them in the background, newest first, AAR_BACKFILL_PER_TICK per pass,
   // after the regular resolutions.
   //
+  // A ribbon with a checkbox ("Légendaires", localStorage "wm-auction-archive-legendary") adds one more source to
+  // the discovery: GET /api/marketplace?page=N&limit=50&sort=recent&rarity=L, crawled exactly like a term (same stop
+  // rule) and stored in the records' "terms" under the label AAR_LEGENDARY_LABEL ("rarity:L"). It works with no term.
+  //
   // Collection, in a loop that only ever runs in ONE tab (a Web Lock, "wmb-auction-archive-crawler": the other
   // tabs queue on it and take over when the leader tab closes). It needs a wiki-masters.com tab left open: a
   // closed tab, or one the browser discarded to save memory, collects nothing. Every 5 minutes it:
-  //   1. Discovers — for each term, pages through GET /api/marketplace?page=N&limit=50&sort=recent&q={term}
+  //   1. Discovers — for each term (and the Legendary source), pages through GET /api/marketplace?page=N&limit=50&sort=recent&q={term}
   //      (newest first) and upserts every auction. It stops at the first page that holds nothing new for that
   //      term, so a regular pass costs one request per term; the first pass of a new term walks the whole list
   //      (AAR_MAX_PAGES at most). An auction already known has its end time refreshed (it may be extended).
@@ -10662,6 +10674,9 @@ const MY_USERNAME = "xxx";
   const AAR_STORE = "auctions";
   const AAR_TERMS_KEY = "wm-auction-archive-terms";
   const AAR_STATUS_KEY = "wm-auction-archive-status";
+  const AAR_LEGENDARY_KEY = "wm-auction-archive-legendary";
+  // Stored in a record's "terms" for the auctions found by the Legendary toggle (no search term involved)
+  const AAR_LEGENDARY_LABEL = "rarity:L";
   const AAR_LOCK_NAME = "wmb-auction-archive-crawler";
   const AAR_CHANNEL_NAME = "wmb-auction-archive";
   const AAR_TICK_MS = 5 * 60 * 1000;
@@ -10747,6 +10762,15 @@ const MY_USERNAME = "xxx";
         : [];
     } catch {
       return [];
+    }
+  }
+
+  // The "Légendaires" toggle: every Legendary auction is archived, whatever the search terms
+  function aarReadLegendary() {
+    try {
+      return localStorage.getItem(AAR_LEGENDARY_KEY) === "1";
+    } catch {
+      return false;
     }
   }
 
@@ -11026,29 +11050,30 @@ const MY_USERNAME = "xxx";
     return record;
   }
 
-  async function aarCrawlTerm(term) {
+  // label is what gets stored in the records' "terms"; filter is the query string part that selects the auctions
+  async function aarCrawlSource(label, filter) {
     for (let page = 1; page <= AAR_MAX_PAGES; page++) {
       const data = await aarFetchJson(
-        `/api/marketplace?page=${page}&limit=${AAR_PAGE_SIZE}&sort=recent&q=${encodeURIComponent(term)}`,
+        `/api/marketplace?page=${page}&limit=${AAR_PAGE_SIZE}&sort=recent&${filter}`,
       );
       const items = Array.isArray(data?.auctions) ? data.auctions : [];
       const now = Date.now();
       const known = await aarGetMany(items.map((item) => item.id));
 
-      let newForTerm = 0;
+      let newForSource = 0;
       const records = items.map((item, index) => {
         const existing = known[index];
         if (!existing) {
-          newForTerm++;
-          return aarRecordFromListing(item, term, now);
+          newForSource++;
+          return aarRecordFromListing(item, label, now);
         }
-        if (!existing.terms.includes(term)) newForTerm++;
-        return aarMergeListing(existing, item, term, now);
+        if (!existing.terms.includes(label)) newForSource++;
+        return aarMergeListing(existing, item, label, now);
       });
       await aarPutMany(records);
 
       // Newest first: a page with nothing new means everything after it is already archived
-      if (!data?.hasMore || items.length === 0 || newForTerm === 0) break;
+      if (!data?.hasMore || items.length === 0 || newForSource === 0) break;
       await aarSleep(AAR_REQUEST_PACING_MS);
     }
   }
@@ -11206,8 +11231,13 @@ const MY_USERNAME = "xxx";
 
     try {
       const terms = aarReadTerms();
+      const legendary = aarReadLegendary();
       for (const term of terms) {
-        await aarCrawlTerm(term);
+        await aarCrawlSource(term, `q=${encodeURIComponent(term)}`);
+        await aarSleep(AAR_REQUEST_PACING_MS);
+      }
+      if (legendary) {
+        await aarCrawlSource(AAR_LEGENDARY_LABEL, "rarity=L");
         await aarSleep(AAR_REQUEST_PACING_MS);
       }
       await aarResolveDue(started + AAR_RESOLVE_BUDGET_MS);
@@ -11216,7 +11246,9 @@ const MY_USERNAME = "xxx";
       aarSetStatus({ lastError: null, rateLimitedUntil: null });
 
       const counts = await aarCounts();
-      if (terms.length === 0 && counts.open === 0) return AAR_IDLE_MS;
+      if (terms.length === 0 && !legendary && counts.open === 0) {
+        return AAR_IDLE_MS;
+      }
       return Math.max(AAR_MIN_GAP_MS, AAR_TICK_MS - (Date.now() - started));
     } catch (error) {
       if (error instanceof AarRateLimitError) {
@@ -11536,8 +11568,14 @@ const MY_USERNAME = "xxx";
         `Espace utilisé par le site dans le navigateur : ${aarFormatBytes(storage.usage)}${storage.quota ? ` sur ${aarFormatBytes(storage.quota)} disponibles` : ""}`,
       );
     }
-    if (aarReadTerms().length === 0 && !termsInput.value.trim()) {
-      lines.push("Aucun terme : saisissez-en un pour démarrer la collecte.");
+    if (
+      aarReadTerms().length === 0 &&
+      !termsInput.value.trim() &&
+      !aarReadLegendary()
+    ) {
+      lines.push(
+        "Aucun terme : saisissez-en un (ou activez les Légendaires) pour démarrer la collecte.",
+      );
     }
     if (status.lastTickStartedAt) {
       lines.push(
@@ -11610,6 +11648,20 @@ const MY_USERNAME = "xxx";
 
     termsRow.append(termsInput, saveBtn);
 
+    // Ribbon: archives every Legendary auction too, with no search term
+    const legendaryRibbon = document.createElement("label");
+    legendaryRibbon.className = "wm-aar-ribbon";
+
+    const legendaryToggle = document.createElement("input");
+    legendaryToggle.type = "checkbox";
+    legendaryToggle.checked = aarReadLegendary();
+
+    const legendaryText = document.createElement("span");
+    legendaryText.textContent =
+      "Légendaires : archiver aussi toutes les enchères de cartes Légendaires (sans terme de recherche)";
+
+    legendaryRibbon.append(legendaryToggle, legendaryText);
+
     const statusBox = document.createElement("div");
     statusBox.className = "wm-aar-status";
 
@@ -11641,6 +11693,21 @@ const MY_USERNAME = "xxx";
     saveBtn.addEventListener("click", save);
     termsInput.addEventListener("keydown", (event) => {
       if (event.key === "Enter") save();
+    });
+    legendaryToggle.addEventListener("change", () => {
+      try {
+        localStorage.setItem(
+          AAR_LEGENDARY_KEY,
+          legendaryToggle.checked ? "1" : "0",
+        );
+      } catch {
+        // Unwritable storage: the toggle just won't stick
+      }
+      if (legendaryToggle.checked) {
+        navigator.storage?.persist?.().catch(() => {});
+        aarWake();
+      }
+      refresh();
     });
 
     actions.append(
@@ -11680,7 +11747,7 @@ const MY_USERNAME = "xxx";
       }),
     );
 
-    modal.append(header, hint, termsRow, statusBox, actions);
+    modal.append(header, hint, termsRow, legendaryRibbon, statusBox, actions);
     overlay.appendChild(modal);
 
     refresh();
@@ -11792,6 +11859,26 @@ const MY_USERNAME = "xxx";
       }
       .wm-aar-btn:hover {
         background: color-mix(in srgb, var(--color-accent) 20%, transparent);
+      }
+      .wm-aar-ribbon {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        margin: 0.5rem 0;
+        padding: 0.5rem 0.75rem;
+        border-radius: 0.5rem;
+        border: 1px solid #f59e0b;
+        background: color-mix(in srgb, #f59e0b 12%, transparent);
+        font-size: 0.8rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .wm-aar-ribbon input {
+        flex: none;
+        width: 1rem;
+        height: 1rem;
+        accent-color: #f59e0b;
+        cursor: pointer;
       }
       .wm-aar-status {
         margin: 0.5rem 0;
@@ -12255,6 +12342,320 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Feature CPR: recap of the collection page on display, to share it as a picture. On /collection, a bar is
+  // inserted as the first child of the block holding the pager and the cards grid (div.scroll-mt-4). It shows the
+  // number of cards of the page, their total estimated value and, per rarity (L, UR, SR, R, PC, C, in the site's
+  // own order and colours), how many cards there are and what they are worth. The value of a card is its estimate
+  // (Feature ETS, "eval-{name}"); a card with no estimate (or the "?" placeholder) is worth nothing in the sums and
+  // is counted apart ("sans estimation"). Only the page on screen is counted, never the other pages of the
+  // collection. The bar follows the page: it is re-computed (debounced) on every DOM mutation, and only touches
+  // the DOM when the numbers changed, so its own update does not retrigger itself.
+  //
+  // Two buttons on the bar render the block (recap + cards, without the pager rows nor the cards' quick-action
+  // buttons, nor the buttons themselves) to a PNG with html-to-image (@require'd in the header, same as Feature
+  // CCL): "📷" copies it to the clipboard, "💾" downloads it, named after the chosen tag, the search and the page
+  // (see cprBuildFileName). A script cannot take a real screenshot without the
+  // browser asking for permission, and cannot write the clipboard without a click; rendering the page's own DOM
+  // needs neither, which is why it takes one click and not a capture dialog. Cards' Wikipedia thumbnails are
+  // fetched with CORS (the site marks them crossorigin="anonymous"); one that can't be loaded is left blank.
+  // ============================================================
+  const CPR_EXCLUDED_FROM_CAPTURE =
+    ".wm-cpr-actions, .wm-quick-action, div.flex.items-center.justify-center.gap-2.py-3";
+  const cprNumberFormat = new Intl.NumberFormat("fr-FR");
+
+  function cprReadCardRarity(card) {
+    const rarityEl = card.querySelector("div.top-2.left-2");
+    if (!rarityEl) return null;
+    if (rarityEl.dataset.wmBaseRarity) return rarityEl.dataset.wmBaseRarity;
+    // Before Feature ETS tags it, the badge only holds the rarity code (then possibly its appendix span)
+    const own = Array.from(rarityEl.childNodes).find((n) => n.nodeType === 3);
+    return (own ?? rarityEl).textContent.trim() || null;
+  }
+
+  function cprCollectStats(grid) {
+    const stats = { cards: 0, value: 0, unestimated: 0, byRarity: new Map() };
+    Array.from(grid.children).forEach((card) => {
+      if (!card.querySelector("h3")) return;
+      const rarity = cprReadCardRarity(card) ?? "?";
+      const value = getCardEvalValue(card);
+      if (!stats.byRarity.has(rarity)) {
+        stats.byRarity.set(rarity, { cards: 0, value: 0, estimated: 0 });
+      }
+      const entry = stats.byRarity.get(rarity);
+
+      stats.cards++;
+      entry.cards++;
+      if (value === null) {
+        stats.unestimated++;
+      } else {
+        stats.value += value;
+        entry.value += value;
+        entry.estimated++;
+      }
+    });
+    return stats;
+  }
+
+  function cprRarityOrder(codes) {
+    const known = EVL_RARITIES.filter((code) => codes.includes(code));
+    return [...known, ...codes.filter((code) => !EVL_RARITIES.includes(code))];
+  }
+
+  function cprRenderSummary(summaryEl, stats) {
+    const cardsLabel = `${stats.cards} carte${stats.cards > 1 ? "s" : ""}`;
+    const head = document.createElement("span");
+    head.className = "wm-cpr-head";
+    const cards = document.createElement("strong");
+    cards.textContent = cardsLabel;
+    const value = document.createElement("span");
+    value.textContent = ` · valeur estimée : ${cprNumberFormat.format(Math.round(stats.value))}`;
+    head.append(cards, value);
+    if (stats.unestimated > 0) {
+      const missing = document.createElement("span");
+      missing.className = "wm-cpr-missing";
+      missing.textContent = ` (${stats.unestimated} sans estimation)`;
+      head.append(missing);
+    }
+
+    const chips = cprRarityOrder([...stats.byRarity.keys()]).map((code) => {
+      const entry = stats.byRarity.get(code);
+      const chip = document.createElement("span");
+      chip.className = "wm-cpr-chip";
+      chip.style.setProperty("--wm-cpr-color", `var(--color-rarity-${code.toLowerCase()}, currentColor)`);
+      const worth = entry.estimated > 0 ? cprNumberFormat.format(Math.round(entry.value)) : "—";
+      chip.textContent = `${code} ×${entry.cards} · ${worth}`;
+      return chip;
+    });
+
+    summaryEl.replaceChildren(head, ...chips);
+  }
+
+  // Name of the saved PNG: "{tag filter}_{search}_page-{n}_{date}.png". The tag filter and the search are left
+  // out when empty. The tag filter is read off the site's tag dropdown trigger (a button that has aria-haspopup
+  // and aria-expanded, other than our own dialog openers), whose label is "Toutes les étiquettes" when no tag is
+  // chosen; the search is the collection's search field (input.rounded-lg, as in Rule 28).
+  function cprReadChosenTag() {
+    const trigger = document.querySelector(
+      'button[aria-haspopup][aria-expanded]:not([aria-haspopup="dialog"])',
+    );
+    const label = (trigger?.textContent ?? "")
+      .trim()
+      .replace(TAG_COUNT_REGEX, "")
+      .trim()
+      .replace(/^#/, "")
+      .trim();
+    return /^toutes les étiquettes$/i.test(label) ? "" : label;
+  }
+
+  function cprFileNamePart(text) {
+    return text
+      // Characters a file name can't hold on some systems, and control characters
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 40)
+      .trim();
+  }
+
+  function cprBuildFileName() {
+    const indicator = findCollectionPageIndicator();
+    const page = indicator ? readCollectionPageIndicator(indicator).current : 1;
+    const search = document.querySelector("input.rounded-lg")?.value ?? "";
+    return `${[
+      cprFileNamePart(cprReadChosenTag()),
+      cprFileNamePart(search),
+      `page-${page}`,
+      new Date().toISOString().slice(0, 10),
+    ]
+      .filter(Boolean)
+      .join("_")}.png`;
+  }
+
+  // The recap block is the one that holds the pager rows and the grid, so the capture shows the recap above the cards
+  function cprFindBlock(grid) {
+    return grid.closest("div.scroll-mt-4") ?? grid.parentElement?.parentElement ?? null;
+  }
+
+  async function cprRenderBlob(target) {
+    // html-to-image logs console errors for each cross-origin stylesheet it can't read while embedding fonts
+    // ("Error while reading CSS rules", "Error inlining remote css file", both caused by a "Not allowed to access
+    // cross-origin stylesheet" DOMException): harmless noise, filtered out (only those, only during the capture)
+    const originalConsoleError = console.error;
+    console.error = (...args) => {
+      if (/Error while reading CSS rules|Error inlining remote css file/.test(String(args[0]))) return;
+      originalConsoleError.apply(console, args);
+    };
+    try {
+      const background = getComputedStyle(document.body).backgroundColor;
+      return await htmlToImage.toBlob(target, {
+        pixelRatio: 2,
+        backgroundColor:
+          background && background !== "rgba(0, 0, 0, 0)" ? background : "#0d1117",
+        filter: (node) =>
+          node.nodeType !== 1 || !node.matches(CPR_EXCLUDED_FROM_CAPTURE),
+      });
+    } finally {
+      console.error = originalConsoleError;
+    }
+  }
+
+  function cprBuildActions(getTarget) {
+    const actions = document.createElement("span");
+    actions.className = "wm-cpr-actions";
+
+    const makeButton = (icon, title) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "wm-cpr-btn";
+      button.textContent = icon;
+      button.title = title;
+      button.setAttribute("aria-label", title);
+      return button;
+    };
+    const flash = (button, icon, result) => {
+      button.textContent = result;
+      setTimeout(() => {
+        button.textContent = icon;
+        button.disabled = false;
+      }, 1500);
+    };
+    const available = () => typeof htmlToImage !== "undefined";
+
+    const copyBtn = makeButton("📷", "Copier le récapitulatif et les cartes de la page comme image");
+    copyBtn.addEventListener("click", () => {
+      const target = getTarget();
+      if (!target || !available() || !navigator.clipboard?.write) {
+        flash(copyBtn, "📷", "❌");
+        return;
+      }
+      copyBtn.disabled = true;
+      copyBtn.textContent = "⏳";
+      // The blob is handed over as a promise so the clipboard write happens inside the click's user gesture
+      navigator.clipboard
+        .write([new ClipboardItem({ "image/png": cprRenderBlob(target) })])
+        .then(() => flash(copyBtn, "📷", "✅"))
+        .catch((error) => {
+          console.error("[WMB-CPR]", error);
+          flash(copyBtn, "📷", "❌");
+        });
+    });
+
+    const saveBtn = makeButton("💾", "Télécharger le récapitulatif et les cartes de la page en PNG");
+    saveBtn.addEventListener("click", async () => {
+      const target = getTarget();
+      if (!target || !available()) {
+        flash(saveBtn, "💾", "❌");
+        return;
+      }
+      saveBtn.disabled = true;
+      saveBtn.textContent = "⏳";
+      try {
+        const blob = await cprRenderBlob(target);
+        aarDownload(blob, cprBuildFileName(), "image/png");
+        flash(saveBtn, "💾", "✅");
+      } catch (error) {
+        console.error("[WMB-CPR]", error);
+        flash(saveBtn, "💾", "❌");
+      }
+    });
+
+    actions.append(copyBtn, saveBtn);
+    return actions;
+  }
+
+  function updateCollectionRecap() {
+    const grid = document.querySelector("div.gap-3.justify-center");
+    const block = grid && cprFindBlock(grid);
+    if (!window.location.pathname.startsWith("/collection") || !block) {
+      document.querySelectorAll(".wm-cpr-bar").forEach((bar) => bar.remove());
+      return;
+    }
+
+    let bar = block.querySelector(":scope > .wm-cpr-bar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.className = "wm-cpr-bar";
+      const summary = document.createElement("div");
+      summary.className = "wm-cpr-summary";
+      bar.append(summary, cprBuildActions(() => block));
+      block.prepend(bar);
+    }
+
+    const stats = cprCollectStats(grid);
+    const signature = JSON.stringify([
+      stats.cards,
+      stats.value,
+      stats.unestimated,
+      [...stats.byRarity],
+    ]);
+    if (bar.dataset.wmCprSignature === signature) return;
+    bar.dataset.wmCprSignature = signature;
+    cprRenderSummary(bar.querySelector(".wm-cpr-summary"), stats);
+  }
+
+  function watchCollectionRecap() {
+    GM_addStyle(`
+      .wm-cpr-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 0.5rem 1rem;
+        padding: 0.6rem 0.9rem;
+        border: 1px solid var(--color-border);
+        border-radius: 0.75rem;
+        background: var(--color-surface-light);
+        font-size: 0.85rem;
+      }
+      .wm-cpr-summary {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 0.4rem 0.6rem;
+      }
+      .wm-cpr-missing {
+        opacity: 0.6;
+      }
+      .wm-cpr-chip {
+        padding: 0.1rem 0.55rem;
+        border: 1px solid var(--wm-cpr-color);
+        border-radius: 999px;
+        color: var(--wm-cpr-color);
+        font-size: 0.75rem;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+      .wm-cpr-actions {
+        display: inline-flex;
+        gap: 0.4rem;
+      }
+      .wm-cpr-btn {
+        padding: 0.15rem 0.55rem;
+        border: 1px solid var(--color-border);
+        border-radius: 0.5rem;
+        background: transparent;
+        cursor: pointer;
+        opacity: 0.75;
+        transition: opacity 0.2s ease;
+      }
+      .wm-cpr-btn:hover:not(:disabled) {
+        opacity: 1;
+      }
+    `);
+
+    let debounceId = null;
+    const scheduleUpdate = () => {
+      clearTimeout(debounceId);
+      debounceId = setTimeout(updateCollectionRecap, 300);
+    };
+    scheduleUpdate();
+    new MutationObserver(scheduleUpdate).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   function main() {
@@ -12350,6 +12751,7 @@ const MY_USERNAME = "xxx";
     run("feature-evl", watchEstimationsDrawer);
     run("feature-aar", watchAuctionArchive);
     run("feature-ach", watchCardPriceHistory);
+    run("feature-cpr", watchCollectionRecap);
 
     watchFeatureConfigButton();
     watchTutorialButton();
