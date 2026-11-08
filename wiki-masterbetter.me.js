@@ -3945,6 +3945,10 @@ const MY_USERNAME = "xxx";
       id: "feature-cpr",
       label: "Récapitulatif de la page de collection (nombre et valeur par rareté), copiable en image",
     },
+    {
+      id: "feature-mlm",
+      label: "Liste des enchères : filtre « mise de départ seulement » et médiane des ventes (d'après l'archive) sur chaque carte",
+    },
   ];
 
   function readFeatureFlags() {
@@ -4379,6 +4383,10 @@ const MY_USERNAME = "xxx";
     {
       title: "Récapitulatif de la page de collection",
       text: "En haut de la collection, une barre résume la page affichée : nombre de cartes, valeur estimée totale et, pour chaque rareté (L, UR, SR, R, PC, C), le nombre de cartes et leur valeur. Seules les estimations déjà connues comptent : les cartes sans estimation sont signalées à part. Le bouton 📷 copie le récapitulatif et les cartes de la page comme image (à coller dans une discussion), la case « Valeurs » décide si les valeurs estimées du récapitulatif figurent dans l'image (décochée, seul le nombre de cartes par rareté reste), le bouton 💾 la télécharge en PNG, nommé d'après l'étiquette choisie, la recherche, la page et la date. Il suffit d'un clic, sans capture d'écran ni autorisation. Seule la page affichée est comptée : passez à la page suivante pour obtenir son récapitulatif.",
+    },
+    {
+      title: "Liste des enchères : mises de départ et médiane",
+      text: "Au-dessus de la liste des enchères du marché, le bouton « Mise de départ seulement » masque les cartes sur lesquelles quelqu'un a déjà enchéri : il ne reste que celles qui n'ont encore aucune mise. Il suit les cartes qui s'ajoutent avec « Charger la suite ». Sous chaque carte, une ligne « médiane … · n ventes » donne le prix médian des ventes de cette carte (même rareté) d'après votre archive des enchères (bouton 📦) ; rien ne s'affiche si la carte n'y a jamais été vendue.",
     },
   ];
 
@@ -12037,8 +12045,8 @@ const MY_USERNAME = "xxx";
   // Feature ACH: price history of the card on its bid page, drawn from the auction archive (Feature AAR).
   // On a bid page (/marketplace/{UUID}), a small "Historique de la carte" block is appended at the end of the column
   // holding the card's name and the bid panel (the closest .space-y-4 around h1.flex-1). It plots, as a small inline
-  // SVG, the final price of every archived sale of the same card (same wikipedia_title, same shiny flag; the auction
-  // on screen is left out) over time, with the median as a dashed line and, from 4 sales, a smoothed trend line (a
+  // SVG, the final price of every archived sale of the same card (same wikipedia_title, same shiny flag and same rarity,
+  // a card can exist in several; the auction on screen is left out) over time, with the median as a dashed line and, from 4 sales, a smoothed trend line (a
   // Gaussian-weighted moving average, geometric when the axis is logarithmic; broken where sales are too sparse).
   // Hovering a dot shows its date and price (native tooltip). Under the chart: number of sales, share of auctions
   // that sold, median and range. With a single sale only the text is shown.
@@ -12086,13 +12094,15 @@ const MY_USERNAME = "xxx";
     return sorted[low] + (sorted[high] - sorted[low]) * (position - low);
   }
 
-  // Sales of one card (same shiny flag) out of its archived auctions, oldest first, plus how many ended unsold
-  function achSummarize(records, currentId, shiny) {
+  // Sales of one card (same shiny flag, and same rarity when known) out of its archived auctions, oldest first,
+  // plus how many ended unsold
+  function achSummarize(records, currentId, shiny, rarity) {
     const sales = [];
     let unsold = 0;
     for (const record of records) {
       if (record.id === currentId || record.state !== "done") continue;
       if (Boolean(record.isShiny) !== shiny) continue;
+      if (rarity && record.rarity !== rarity) continue;
       if (record.status === "settled_unsold") {
         unsold++;
       } else if (record.status === "settled_sold" && record.finalPrice > 0) {
@@ -12120,7 +12130,11 @@ const MY_USERNAME = "xxx";
   async function achIdentifyCard(uuid) {
     const [record] = await aarGetMany([uuid]);
     if (record?.cardName) {
-      return { name: record.cardName, shiny: Boolean(record.isShiny) };
+      return {
+        name: record.cardName,
+        shiny: Boolean(record.isShiny),
+        rarity: record.rarity ?? null,
+      };
     }
     const data = await aarFetchJson(`/api/marketplace/${uuid}`);
     const auction = data?.auction;
@@ -12128,6 +12142,7 @@ const MY_USERNAME = "xxx";
     return {
       name: auction.card.wikipedia_title,
       shiny: Boolean(auction.is_shiny ?? auction.card.is_shiny),
+      rarity: auction.snapshot_rarity ?? auction.card.rarity ?? null,
     };
   }
 
@@ -12348,7 +12363,12 @@ const MY_USERNAME = "xxx";
     if (!card) return null;
 
     const records = await achGetCardRecords(card.name);
-    const { sales, unsold } = achSummarize(records, uuid, card.shiny);
+    const { sales, unsold } = achSummarize(
+      records,
+      uuid,
+      card.shiny,
+      card.rarity,
+    );
     if (!sales.length && !unsold) return null;
 
     const widget = document.createElement("div");
@@ -12818,6 +12838,231 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Feature MLM: on the marketplace's auction list (/marketplace, every card is a div[id^="marketplace-auction-"]),
+  // two helps. (1) A "Mise de départ seulement" toggle button, in a small bar above the cards, hides the auctions
+  // that already have bids, keeping the ones whose card still shows the "Mise de départ" label (a card with bids
+  // shows another label). Hiding is a CSS class on the card (never removing it, so React's list stays consistent);
+  // cards that appear later ("Charger la suite") are handled by the page observer. The choice is kept in
+  // localStorage ("wm-mlm-start-only"). (2) A "médiane {prix} · {n} ventes" line is added at the bottom of each
+  // card: the median final price of the card's archived sales (Feature AAR) with the same name and the same rarity
+  // (read off the badge, as Feature CPR does), shiny sales apart. A card that looks shiny (✨ or "shiny" in its text)
+  // gets no line, the median of the plain card being misleading for it. Nothing is shown when the card has no
+  // archived sale. Archive lookups are cached per card name for MLM_STATS_TTL_MS. Not shown on the "Historique" and
+  // "Gagnées" tabs (the cards there are finished auctions). Reads only the archive.
+  // ============================================================
+  const MLM_START_LABEL = "Mise de départ";
+  const MLM_STORAGE_KEY = "wm-mlm-start-only";
+  const MLM_STATS_TTL_MS = 60 * 1000;
+  const MLM_CARD_SELECTOR = 'div[id^="marketplace-auction-"]';
+  const mlmStatsByName = new Map();
+  let mlmStartOnly = (() => {
+    try {
+      return localStorage.getItem(MLM_STORAGE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  })();
+
+  function mlmIsFinishedTab() {
+    const labels = Object.values(BEST_TRADE_KINDS).map((kind) => kind.tabLabel);
+    return Array.from(document.querySelectorAll("button")).some(
+      (button) =>
+        button.classList.contains("border-b-2") &&
+        labels.some((label) => button.textContent.trim().startsWith(label)),
+    );
+  }
+
+  function mlmHasStartBid(card) {
+    return Array.from(card.querySelectorAll("span.uppercase")).some(
+      (span) => span.textContent.trim() === MLM_START_LABEL,
+    );
+  }
+
+  // Median, range and count of the plain (non shiny) sales of each rarity of a card name, from the archive
+  function mlmLoadStats(name) {
+    const cached = mlmStatsByName.get(name);
+    if (cached && Date.now() - cached.at < MLM_STATS_TTL_MS) {
+      return cached.promise;
+    }
+    const promise = achGetCardRecords(name).then((records) => {
+      const pricesByRarity = new Map();
+      for (const record of records) {
+        if (
+          record.isShiny ||
+          record.state !== "done" ||
+          record.status !== "settled_sold" ||
+          !(record.finalPrice > 0)
+        ) {
+          continue;
+        }
+        const prices = pricesByRarity.get(record.rarity) ?? [];
+        prices.push(record.finalPrice);
+        pricesByRarity.set(record.rarity, prices);
+      }
+      const stats = new Map();
+      for (const [rarity, prices] of pricesByRarity) {
+        prices.sort((a, b) => a - b);
+        stats.set(rarity, {
+          count: prices.length,
+          median: achQuantile(prices, 0.5),
+          min: prices[0],
+          max: prices[prices.length - 1],
+        });
+      }
+      return stats;
+    });
+    mlmStatsByName.set(name, { at: Date.now(), promise });
+    promise.catch(() => mlmStatsByName.delete(name));
+    return promise;
+  }
+
+  function mlmSetMedianLine(card, stat) {
+    let line = card.querySelector(".wm-mlm-median");
+    if (!stat) {
+      line?.remove();
+      return;
+    }
+    if (!line) {
+      line = document.createElement("div");
+      line.className = "wm-mlm-median";
+      (card.querySelector(":scope > a") ?? card).append(line);
+    }
+    const text = `médiane ${achNumberFormat.format(Math.round(stat.median))} · ${stat.count} vente${stat.count > 1 ? "s" : ""}`;
+    if (line.textContent !== text) line.textContent = text;
+    const title = `Ventes archivées de cette carte : de ${achNumberFormat.format(stat.min)} à ${achNumberFormat.format(stat.max)}`;
+    if (line.title !== title) line.title = title;
+  }
+
+  async function mlmUpdateMedian(card) {
+    const name = card.querySelector("h3")?.textContent.trim();
+    const rarity = cprReadCardRarity(card);
+    const key = `${name}|${rarity}`;
+    // Same card, looked up less than a TTL ago (even with no result): nothing to do
+    if (
+      card.dataset.wmMlmKey === key &&
+      Date.now() - Number(card.dataset.wmMlmAt) < MLM_STATS_TTL_MS
+    ) {
+      return;
+    }
+    card.dataset.wmMlmKey = key;
+    card.dataset.wmMlmAt = String(Date.now());
+    if (!name || !rarity || /✨|shiny/i.test(card.textContent)) {
+      mlmSetMedianLine(card, null);
+      return;
+    }
+    try {
+      const stats = await mlmLoadStats(name);
+      if (card.isConnected && card.dataset.wmMlmKey === key) {
+        mlmSetMedianLine(card, stats.get(rarity) ?? null);
+      }
+    } catch (error) {
+      console.error("[WMB-MLM]", error);
+    }
+  }
+
+  function mlmEnsureBar(grid) {
+    let bar = document.querySelector(".wm-mlm-bar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.className = "wm-mlm-bar";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "wm-mlm-btn";
+      button.title =
+        "Masquer les enchères qui ont déjà reçu des mises : ne garder que celles qui affichent « Mise de départ »";
+      button.addEventListener("click", () => {
+        mlmStartOnly = !mlmStartOnly;
+        try {
+          localStorage.setItem(MLM_STORAGE_KEY, mlmStartOnly ? "1" : "0");
+        } catch {
+          // Unwritable storage: the choice just won't stick
+        }
+        updateMarketplaceList();
+      });
+      bar.append(button);
+    }
+    if (bar.nextElementSibling !== grid) grid.before(bar);
+    return bar;
+  }
+
+  function updateMarketplaceList() {
+    const cards = Array.from(document.querySelectorAll(MLM_CARD_SELECTOR));
+    const onList = /^\/marketplace\/?$/.test(window.location.pathname);
+    if (!onList || cards.length === 0 || mlmIsFinishedTab()) {
+      document.querySelectorAll(".wm-mlm-bar").forEach((bar) => bar.remove());
+      cards.forEach((card) => card.classList.remove("wm-mlm-hidden"));
+      return;
+    }
+
+    const bar = mlmEnsureBar(cards[0].parentElement);
+    let hidden = 0;
+    for (const card of cards) {
+      const hide = mlmStartOnly && !mlmHasStartBid(card);
+      if (hide) hidden++;
+      if (card.classList.contains("wm-mlm-hidden") !== hide) {
+        card.classList.toggle("wm-mlm-hidden", hide);
+      }
+      mlmUpdateMedian(card);
+    }
+
+    const button = bar.querySelector(".wm-mlm-btn");
+    const label = `${mlmStartOnly ? "✅" : "☐"} Mise de départ seulement${mlmStartOnly && hidden ? ` (${hidden} masquée${hidden > 1 ? "s" : ""})` : ""}`;
+    if (button.textContent !== label) button.textContent = label;
+    if (button.getAttribute("aria-pressed") !== String(mlmStartOnly)) {
+      button.setAttribute("aria-pressed", String(mlmStartOnly));
+    }
+  }
+
+  function watchMarketplaceList() {
+    GM_addStyle(`
+      .wm-mlm-hidden {
+        display: none !important;
+      }
+      .wm-mlm-bar {
+        display: flex;
+        justify-content: center;
+        padding: 0.25rem 0 0.75rem;
+      }
+      .wm-mlm-btn {
+        padding: 0.3rem 0.8rem;
+        border: 1px solid var(--color-border);
+        border-radius: 999px;
+        background: transparent;
+        font-size: 0.8rem;
+        cursor: pointer;
+        opacity: 0.8;
+        transition: opacity 0.2s ease;
+      }
+      .wm-mlm-btn:hover,
+      .wm-mlm-btn[aria-pressed="true"] {
+        opacity: 1;
+      }
+      .wm-mlm-btn[aria-pressed="true"] {
+        border-color: var(--color-accent);
+        color: var(--color-accent);
+      }
+      .wm-mlm-median {
+        width: 100%;
+        margin-top: 0.15rem;
+        font-size: 10px;
+        font-weight: 600;
+        color: var(--color-accent);
+      }
+    `);
+
+    let debounceId = null;
+    const scheduleUpdate = () => {
+      clearTimeout(debounceId);
+      debounceId = setTimeout(updateMarketplaceList, 300);
+    };
+    scheduleUpdate();
+    new MutationObserver(scheduleUpdate).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   function main() {
@@ -12914,6 +13159,7 @@ const MY_USERNAME = "xxx";
     run("feature-aar", watchAuctionArchive);
     run("feature-ach", watchCardPriceHistory);
     run("feature-cpr", watchCollectionRecap);
+    run("feature-mlm", watchMarketplaceList);
 
     watchFeatureConfigButton();
     watchTutorialButton();
