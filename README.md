@@ -111,6 +111,11 @@ Je ne liste que celles qui change quelque chose de significatif pour l'utilisate
   - Le fichier est nommé d'après l'étiquette choisie, la recherche, le numéro de page et la date (ex. : `Aero - Almanach_avion_page-1_2026-11-07.png`)
   - Seule la page affichée est comptée, pas toute la collection
 - **Liste des enchères : mises de départ et médiane** : Sur `/marketplace`, un bouton « Mise de départ seulement » au-dessus des cartes masque celles qui ont déjà reçu des mises, et suit les cartes qui s'ajoutent avec « Charger la suite ». Chaque carte affiche aussi une ligne « médiane … · n ventes » : le prix médian des ventes archivées de cette carte, à rareté égale (rien si elle n'a jamais été vendue dans votre archive). Pas affiché sur les onglets « Historique » et « Gagnées »
+- **Suivi d'enchères** : Sur la page d'une enchère, l'étoile ☆ à gauche du nom de la carte la met en suivi (★ quand elle est suivie). Sur le marché, un onglet « Suivi » s'ajoute à la suite des onglets existants et liste les enchères suivies : rareté, nom, mise actuelle (ou prix final une fois vendue) et compte à rebours en direct, la plus proche de sa fin en tête. Un clic sur une ligne ouvre l'enchère dans un nouvel onglet du navigateur
+  - Le nombre d'enchères en cours s'affiche dans l'onglet, qui passe en orange quand l'une se termine dans moins de 10 minutes
+  - Les onglets du site ne sont pas modifiés : « Suivi » masque simplement leur contenu, et un clic sur l'un d'eux le fait réapparaître tel quel
+  - Les données sont relevées à l'ouverture de l'onglet (puis toutes les 2 minutes tant qu'il reste affiché) ou avec « Actualiser », jamais en arrière-plan
+  - « Retirer les terminées » nettoie la liste ; les enchères finies depuis plus de 14 jours sont retirées automatiquement
 
 ### 📊 Tableau de bord des enchères
 
