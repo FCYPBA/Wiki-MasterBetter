@@ -3953,6 +3953,10 @@ const MY_USERNAME = "xxx";
       id: "feature-awl",
       label: "Suivi d'enchères : bouton ☆ sur la page d'une enchère et onglet « Suivi » dans le marché listant les enchères suivies",
     },
+    {
+      id: "feature-eta",
+      label: "Heure de fin estimée des enchères qui ont encore plus d'une heure à courir (liste et page d'enchère)",
+    },
   ];
 
   function readFeatureFlags() {
@@ -4395,6 +4399,10 @@ const MY_USERNAME = "xxx";
     {
       title: "Suivi d'enchères",
       text: "Sur la page d'une enchère, l'étoile ☆ à gauche du nom de la carte la met en suivi (★ quand elle est suivie ; un second clic la retire). Sur le marché, l'onglet « Suivi », à la suite de « Parcourir », « Mes ventes », « Mes enchères »…, liste les enchères suivies : rareté, nom, mise actuelle (ou prix final une fois terminée) et compte à rebours en direct, les enchères en cours d'abord, la plus proche de sa fin en tête. Cliquer sur une ligne ouvre l'enchère dans un nouvel onglet du navigateur ; ✕ la retire de la liste, et « Retirer les terminées » nettoie les enchères finies. Le nombre d'enchères en cours s'affiche dans l'onglet, qui passe en orange quand l'une se termine dans moins de 10 minutes. Les données sont relevées à l'ouverture de l'onglet (puis toutes les 2 minutes tant qu'il reste affiché, et avec « Actualiser »), pas en arrière-plan ; les enchères terminées depuis plus de 14 jours sont retirées toutes seules.",
+    },
+    {
+      title: "Heure de fin estimée des enchères",
+      text: "Quand il reste plus d'une heure à une enchère, une heure de fin estimée (« ≈ 18:42 », « ≈ demain 02:15 », « ≈ sam. 02:15 »…) s'affiche sous sa durée dans la liste du marché, et à côté du compte à rebours sur la page de l'enchère ; le survol donne la date complète. Le site n'indiquant la durée restante qu'à la minute près, l'heure est une estimation. Elle disparaît quand il reste moins d'une heure.",
     },
   ];
 
@@ -13810,6 +13818,147 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Feature ETA: estimated end time of the auctions that still have more than 1h to go.
+  //   - The site only shows what is left ("4h 37m", "1h 07m", on a bid page "Se termine dans 1h 07m"): the
+  //     duration element (span.tabular-nums, the first span.tabular-nums.font-medium on a bid page, the same one
+  //     Feature PNB reads) is parsed (days j/d, h, m, s) and, when 1h or more is left, a "≈ 18:42" label is added
+  //     next to it: "demain 02:15" for tomorrow, "sam. 02:15" further on (with the date beyond a week). The tooltip
+  //     gives the full date. Under 1h, or once finished ("Terminée"), the label is removed.
+  //   - On /marketplace (every tab) it is appended to the column holding the duration on each card
+  //     (div[id^="marketplace-auction-"]); on a bid page it is inserted right after the duration element.
+  //   - The site rounds what is left to the minute, and the estimate is computed from it, so it would flicker by a
+  //     minute as the text ticks: the first estimate is kept in the label (data-end) and only replaced when a fresh
+  //     one differs by more than 2 minutes (e.g. an end time pushed back).
+  //   - React-safety: only the foreign label is added, moved never, removed when no longer needed; written only when
+  //     its text changed.
+  // ============================================================
+  const ETA_MIN_REMAINING_MS = 3600 * 1000;
+  const ETA_TOLERANCE_MS = 2 * 60 * 1000;
+
+  // "1h 07m" / "Se termine dans 2j 3h" -> ms, null when the text is not a duration
+  function etaParseRemaining(text) {
+    const match = /^(?:.*\bdans\s+)?((?:\d+\s*[jdhms]\s*)+)$/i.exec(text.trim());
+    if (!match) return null;
+    const unitMs = { j: 86400000, d: 86400000, h: 3600000, m: 60000, s: 1000 };
+    let total = 0;
+    for (const part of match[1].matchAll(/(\d+)\s*([jdhms])/gi)) {
+      total += Number(part[1]) * unitMs[part[2].toLowerCase()];
+    }
+    return total;
+  }
+
+  function etaFormat(end, now) {
+    const date = new Date(end);
+    const time = date.toLocaleTimeString("fr-FR", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    const startOfDay = (value) => new Date(value).setHours(0, 0, 0, 0);
+    const dayDiff = Math.round((startOfDay(end) - startOfDay(now)) / 86400000);
+    if (dayDiff <= 0) return `≈ ${time}`;
+    if (dayDiff === 1) return `≈ demain ${time}`;
+    const day = date.toLocaleDateString("fr-FR", { weekday: "short" });
+    if (dayDiff < 7) return `≈ ${day} ${time}`;
+    const dm = date.toLocaleDateString("fr-FR", { day: "2-digit", month: "2-digit" });
+    return `≈ ${day} ${dm} ${time}`;
+  }
+
+  // Shows, updates or removes the label of one duration element. `existing` is its label if already there,
+  // `insert` puts a new one in place
+  function etaApply(timer, existing, insert) {
+    const remaining = etaParseRemaining(timer.textContent);
+    if (remaining === null || remaining < ETA_MIN_REMAINING_MS) {
+      existing?.remove();
+      return;
+    }
+
+    const now = Date.now();
+    // The shown duration is cut to the minute: aim at the middle of that minute, on a whole minute
+    const fresh = Math.round((now + remaining + 30000) / 60000) * 60000;
+    let end = Number(existing?.dataset.end);
+    if (!Number.isFinite(end) || Math.abs(end - fresh) > ETA_TOLERANCE_MS) {
+      end = fresh;
+    }
+
+    let label = existing;
+    if (!label) {
+      label = document.createElement("span");
+      label.className = "wm-eta";
+      insert(label);
+    }
+    if (label.dataset.end !== String(end)) label.dataset.end = String(end);
+    const text = etaFormat(end, now);
+    if (label.textContent !== text) label.textContent = text;
+    const title = `Fin estimée : ${new Date(end).toLocaleString("fr-FR", {
+      dateStyle: "full",
+      timeStyle: "short",
+    })}`;
+    if (label.title !== title) label.title = title;
+  }
+
+  function updateEndEstimates() {
+    const path = window.location.pathname;
+
+    if (/^\/marketplace\/?$/.test(path)) {
+      document
+        .querySelectorAll('div[id^="marketplace-auction-"]')
+        .forEach((card) => {
+          const timer = card.querySelector("span.tabular-nums");
+          const column = timer?.parentElement;
+          if (!column) return;
+          etaApply(
+            timer,
+            column.querySelector(":scope > .wm-eta"),
+            (label) => column.append(label),
+          );
+        });
+      return;
+    }
+
+    if (MARKETPLACE_BID_PATH_REGEX.test(path)) {
+      const timer = document.querySelector("span.tabular-nums.font-medium");
+      if (!timer) return;
+      const next = timer.nextElementSibling;
+      etaApply(
+        timer,
+        next?.classList.contains("wm-eta") ? next : null,
+        (label) => {
+          label.classList.add("wm-eta-inline");
+          timer.after(label);
+        },
+      );
+    }
+  }
+
+  function watchEndEstimates() {
+    GM_addStyle(`
+      .wm-eta {
+        display: block;
+        font-size: 10px;
+        font-weight: 600;
+        white-space: nowrap;
+        color: var(--color-accent);
+      }
+      .wm-eta.wm-eta-inline {
+        display: inline;
+        margin-left: 0.5rem;
+        font-size: 0.8em;
+      }
+    `);
+
+    let debounceId = null;
+    const scheduleUpdate = () => {
+      clearTimeout(debounceId);
+      debounceId = setTimeout(updateEndEstimates, 300);
+    };
+    scheduleUpdate();
+    new MutationObserver(scheduleUpdate).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   function main() {
@@ -13908,6 +14057,7 @@ const MY_USERNAME = "xxx";
     run("feature-cpr", watchCollectionRecap);
     run("feature-mlm", watchMarketplaceList);
     run("feature-awl", watchAuctionWatchlist);
+    run("feature-eta", watchEndEstimates);
 
     watchFeatureConfigButton();
     watchTutorialButton();

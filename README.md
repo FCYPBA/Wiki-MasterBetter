@@ -116,6 +116,9 @@ Je ne liste que celles qui change quelque chose de significatif pour l'utilisate
   - Les onglets du site ne sont pas modifiés : « Suivi » masque simplement leur contenu, et un clic sur l'un d'eux le fait réapparaître tel quel
   - Les données sont relevées à l'ouverture de l'onglet (puis toutes les 2 minutes tant qu'il reste affiché) ou avec « Actualiser », jamais en arrière-plan
   - « Retirer les terminées » nettoie la liste ; les enchères finies depuis plus de 14 jours sont retirées automatiquement
+- **Heure de fin estimée** : Quand il reste plus d'une heure à une enchère, une heure de fin estimée (« ≈ 18:42 », « ≈ demain 02:15 »…) s'affiche sous sa durée dans la liste du marché, et à côté du compte à rebours sur la page de l'enchère
+  - Le site ne donnant la durée restante qu'à la minute près, c'est une estimation, qui reste stable pendant que le compte à rebours avance
+  - Elle disparaît quand il reste moins d'une heure ou une fois l'enchère terminée ; le survol donne la date complète
 
 ### 📊 Tableau de bord des enchères
 
