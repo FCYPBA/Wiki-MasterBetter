@@ -3945,6 +3945,18 @@ const MY_USERNAME = "xxx";
       id: "feature-cpr",
       label: "Récapitulatif de la page de collection (nombre et valeur par rareté), copiable en image",
     },
+    {
+      id: "feature-mlm",
+      label: "Liste des enchères : filtre « mise de départ seulement » et médiane des ventes (d'après l'archive) sur chaque carte",
+    },
+    {
+      id: "feature-awl",
+      label: "Suivi d'enchères : bouton ☆ sur la page d'une enchère et onglet « Suivi » dans le marché listant les enchères suivies",
+    },
+    {
+      id: "feature-eta",
+      label: "Heure de fin estimée des enchères qui ont encore plus d'une heure à courir (liste et page d'enchère)",
+    },
   ];
 
   function readFeatureFlags() {
@@ -4379,6 +4391,18 @@ const MY_USERNAME = "xxx";
     {
       title: "Récapitulatif de la page de collection",
       text: "En haut de la collection, une barre résume la page affichée : nombre de cartes, valeur estimée totale et, pour chaque rareté (L, UR, SR, R, PC, C), le nombre de cartes et leur valeur. Seules les estimations déjà connues comptent : les cartes sans estimation sont signalées à part. Le bouton 📷 copie le récapitulatif et les cartes de la page comme image (à coller dans une discussion), la case « Valeurs » décide si les valeurs estimées du récapitulatif figurent dans l'image (décochée, seul le nombre de cartes par rareté reste), le bouton 💾 la télécharge en PNG, nommé d'après l'étiquette choisie, la recherche, la page et la date. Il suffit d'un clic, sans capture d'écran ni autorisation. Seule la page affichée est comptée : passez à la page suivante pour obtenir son récapitulatif.",
+    },
+    {
+      title: "Liste des enchères : mises de départ et médiane",
+      text: "Au-dessus de la liste des enchères du marché, le bouton « Mise de départ seulement » masque les cartes sur lesquelles quelqu'un a déjà enchéri : il ne reste que celles qui n'ont encore aucune mise. Il suit les cartes qui s'ajoutent avec « Charger la suite ». Sous chaque carte, une ligne « médiane … · n ventes » donne le prix médian des ventes de cette carte (même rareté) d'après votre archive des enchères (bouton 📦) ; rien ne s'affiche si la carte n'y a jamais été vendue.",
+    },
+    {
+      title: "Suivi d'enchères",
+      text: "Sur la page d'une enchère, l'étoile ☆ à gauche du nom de la carte la met en suivi (★ quand elle est suivie ; un second clic la retire). Sur le marché, l'onglet « Suivi », à la suite de « Parcourir », « Mes ventes », « Mes enchères »…, liste les enchères suivies : rareté, nom, mise actuelle (ou prix final une fois terminée) et compte à rebours en direct, les enchères en cours d'abord, la plus proche de sa fin en tête. Cliquer sur une ligne ouvre l'enchère dans un nouvel onglet du navigateur ; ✕ la retire de la liste, et « Retirer les terminées » nettoie les enchères finies. Le nombre d'enchères en cours s'affiche dans l'onglet, qui passe en orange quand l'une se termine dans moins de 10 minutes. Les données sont relevées à l'ouverture de l'onglet (puis toutes les 2 minutes tant qu'il reste affiché, et avec « Actualiser »), pas en arrière-plan ; les enchères terminées depuis plus de 14 jours sont retirées toutes seules.",
+    },
+    {
+      title: "Heure de fin estimée des enchères",
+      text: "Quand il reste plus d'une heure à une enchère, une heure de fin estimée (« ≈ 18:42 », « ≈ demain 02:15 », « ≈ sam. 02:15 »…) s'affiche sous sa durée dans la liste du marché, et à côté du compte à rebours sur la page de l'enchère ; le survol donne la date complète. Le site n'indiquant la durée restante qu'à la minute près, l'heure est une estimation. Elle disparaît quand il reste moins d'une heure.",
     },
   ];
 
@@ -12037,8 +12061,8 @@ const MY_USERNAME = "xxx";
   // Feature ACH: price history of the card on its bid page, drawn from the auction archive (Feature AAR).
   // On a bid page (/marketplace/{UUID}), a small "Historique de la carte" block is appended at the end of the column
   // holding the card's name and the bid panel (the closest .space-y-4 around h1.flex-1). It plots, as a small inline
-  // SVG, the final price of every archived sale of the same card (same wikipedia_title, same shiny flag; the auction
-  // on screen is left out) over time, with the median as a dashed line and, from 4 sales, a smoothed trend line (a
+  // SVG, the final price of every archived sale of the same card (same wikipedia_title, same shiny flag and same rarity,
+  // a card can exist in several; the auction on screen is left out) over time, with the median as a dashed line and, from 4 sales, a smoothed trend line (a
   // Gaussian-weighted moving average, geometric when the axis is logarithmic; broken where sales are too sparse).
   // Hovering a dot shows its date and price (native tooltip). Under the chart: number of sales, share of auctions
   // that sold, median and range. With a single sale only the text is shown.
@@ -12086,13 +12110,15 @@ const MY_USERNAME = "xxx";
     return sorted[low] + (sorted[high] - sorted[low]) * (position - low);
   }
 
-  // Sales of one card (same shiny flag) out of its archived auctions, oldest first, plus how many ended unsold
-  function achSummarize(records, currentId, shiny) {
+  // Sales of one card (same shiny flag, and same rarity when known) out of its archived auctions, oldest first,
+  // plus how many ended unsold
+  function achSummarize(records, currentId, shiny, rarity) {
     const sales = [];
     let unsold = 0;
     for (const record of records) {
       if (record.id === currentId || record.state !== "done") continue;
       if (Boolean(record.isShiny) !== shiny) continue;
+      if (rarity && record.rarity !== rarity) continue;
       if (record.status === "settled_unsold") {
         unsold++;
       } else if (record.status === "settled_sold" && record.finalPrice > 0) {
@@ -12120,7 +12146,11 @@ const MY_USERNAME = "xxx";
   async function achIdentifyCard(uuid) {
     const [record] = await aarGetMany([uuid]);
     if (record?.cardName) {
-      return { name: record.cardName, shiny: Boolean(record.isShiny) };
+      return {
+        name: record.cardName,
+        shiny: Boolean(record.isShiny),
+        rarity: record.rarity ?? null,
+      };
     }
     const data = await aarFetchJson(`/api/marketplace/${uuid}`);
     const auction = data?.auction;
@@ -12128,6 +12158,7 @@ const MY_USERNAME = "xxx";
     return {
       name: auction.card.wikipedia_title,
       shiny: Boolean(auction.is_shiny ?? auction.card.is_shiny),
+      rarity: auction.snapshot_rarity ?? auction.card.rarity ?? null,
     };
   }
 
@@ -12348,7 +12379,12 @@ const MY_USERNAME = "xxx";
     if (!card) return null;
 
     const records = await achGetCardRecords(card.name);
-    const { sales, unsold } = achSummarize(records, uuid, card.shiny);
+    const { sales, unsold } = achSummarize(
+      records,
+      uuid,
+      card.shiny,
+      card.rarity,
+    );
     if (!sales.length && !unsold) return null;
 
     const widget = document.createElement("div");
@@ -12818,6 +12854,1111 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Feature MLM: on the marketplace's auction list (/marketplace, every card is a div[id^="marketplace-auction-"]),
+  // two helps. (1) A "Mise de départ seulement" toggle button, in a small bar above the cards, hides the auctions
+  // that already have bids, keeping the ones whose card still shows the "Mise de départ" label (a card with bids
+  // shows another label). Hiding is a CSS class on the card (never removing it, so React's list stays consistent);
+  // cards that appear later ("Charger la suite") are handled by the page observer. The choice is kept in
+  // localStorage ("wm-mlm-start-only"). (2) A "médiane {prix} · {n} ventes" line is added at the bottom of each
+  // card: the median final price of the card's archived sales (Feature AAR) with the same name and the same rarity
+  // (read off the badge, as Feature CPR does), shiny sales apart. A card that looks shiny (✨ or "shiny" in its text)
+  // gets no line, the median of the plain card being misleading for it. Nothing is shown when the card has no
+  // archived sale. Archive lookups are cached per card name for MLM_STATS_TTL_MS. Not shown on the "Historique" and
+  // "Gagnées" tabs (the cards there are finished auctions). Reads only the archive.
+  // ============================================================
+  const MLM_START_LABEL = "Mise de départ";
+  const MLM_STORAGE_KEY = "wm-mlm-start-only";
+  const MLM_STATS_TTL_MS = 60 * 1000;
+  const MLM_CARD_SELECTOR = 'div[id^="marketplace-auction-"]';
+  const mlmStatsByName = new Map();
+  let mlmStartOnly = (() => {
+    try {
+      return localStorage.getItem(MLM_STORAGE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  })();
+
+  function mlmIsFinishedTab() {
+    const labels = Object.values(BEST_TRADE_KINDS).map((kind) => kind.tabLabel);
+    return Array.from(document.querySelectorAll("button")).some(
+      (button) =>
+        button.classList.contains("border-b-2") &&
+        labels.some((label) => button.textContent.trim().startsWith(label)),
+    );
+  }
+
+  function mlmHasStartBid(card) {
+    return Array.from(card.querySelectorAll("span.uppercase")).some(
+      (span) => span.textContent.trim() === MLM_START_LABEL,
+    );
+  }
+
+  // Median, range and count of the plain (non shiny) sales of each rarity of a card name, from the archive
+  function mlmLoadStats(name) {
+    const cached = mlmStatsByName.get(name);
+    if (cached && Date.now() - cached.at < MLM_STATS_TTL_MS) {
+      return cached.promise;
+    }
+    const promise = achGetCardRecords(name).then((records) => {
+      const pricesByRarity = new Map();
+      for (const record of records) {
+        if (
+          record.isShiny ||
+          record.state !== "done" ||
+          record.status !== "settled_sold" ||
+          !(record.finalPrice > 0)
+        ) {
+          continue;
+        }
+        const prices = pricesByRarity.get(record.rarity) ?? [];
+        prices.push(record.finalPrice);
+        pricesByRarity.set(record.rarity, prices);
+      }
+      const stats = new Map();
+      for (const [rarity, prices] of pricesByRarity) {
+        prices.sort((a, b) => a - b);
+        stats.set(rarity, {
+          count: prices.length,
+          median: achQuantile(prices, 0.5),
+          min: prices[0],
+          max: prices[prices.length - 1],
+        });
+      }
+      return stats;
+    });
+    mlmStatsByName.set(name, { at: Date.now(), promise });
+    promise.catch(() => mlmStatsByName.delete(name));
+    return promise;
+  }
+
+  function mlmSetMedianLine(card, stat) {
+    let line = card.querySelector(".wm-mlm-median");
+    if (!stat) {
+      line?.remove();
+      return;
+    }
+    if (!line) {
+      line = document.createElement("div");
+      line.className = "wm-mlm-median";
+      (card.querySelector(":scope > a") ?? card).append(line);
+    }
+    const text = `médiane ${achNumberFormat.format(Math.round(stat.median))} · ${stat.count} vente${stat.count > 1 ? "s" : ""}`;
+    if (line.textContent !== text) line.textContent = text;
+    const title = `Ventes archivées de cette carte : de ${achNumberFormat.format(stat.min)} à ${achNumberFormat.format(stat.max)}`;
+    if (line.title !== title) line.title = title;
+  }
+
+  async function mlmUpdateMedian(card) {
+    const name = card.querySelector("h3")?.textContent.trim();
+    const rarity = cprReadCardRarity(card);
+    const key = `${name}|${rarity}`;
+    // Same card, looked up less than a TTL ago (even with no result): nothing to do
+    if (
+      card.dataset.wmMlmKey === key &&
+      Date.now() - Number(card.dataset.wmMlmAt) < MLM_STATS_TTL_MS
+    ) {
+      return;
+    }
+    card.dataset.wmMlmKey = key;
+    card.dataset.wmMlmAt = String(Date.now());
+    if (!name || !rarity || /✨|shiny/i.test(card.textContent)) {
+      mlmSetMedianLine(card, null);
+      return;
+    }
+    try {
+      const stats = await mlmLoadStats(name);
+      if (card.isConnected && card.dataset.wmMlmKey === key) {
+        mlmSetMedianLine(card, stats.get(rarity) ?? null);
+      }
+    } catch (error) {
+      console.error("[WMB-MLM]", error);
+    }
+  }
+
+  function mlmEnsureBar(grid) {
+    let bar = document.querySelector(".wm-mlm-bar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.className = "wm-mlm-bar";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "wm-mlm-btn";
+      button.title =
+        "Masquer les enchères qui ont déjà reçu des mises : ne garder que celles qui affichent « Mise de départ »";
+      button.addEventListener("click", () => {
+        mlmStartOnly = !mlmStartOnly;
+        try {
+          localStorage.setItem(MLM_STORAGE_KEY, mlmStartOnly ? "1" : "0");
+        } catch {
+          // Unwritable storage: the choice just won't stick
+        }
+        updateMarketplaceList();
+      });
+      bar.append(button);
+    }
+    if (bar.nextElementSibling !== grid) grid.before(bar);
+    return bar;
+  }
+
+  function updateMarketplaceList() {
+    const cards = Array.from(document.querySelectorAll(MLM_CARD_SELECTOR));
+    const onList = /^\/marketplace\/?$/.test(window.location.pathname);
+    if (!onList || cards.length === 0 || mlmIsFinishedTab()) {
+      document.querySelectorAll(".wm-mlm-bar").forEach((bar) => bar.remove());
+      cards.forEach((card) => card.classList.remove("wm-mlm-hidden"));
+      return;
+    }
+
+    const bar = mlmEnsureBar(cards[0].parentElement);
+    let hidden = 0;
+    for (const card of cards) {
+      const hide = mlmStartOnly && !mlmHasStartBid(card);
+      if (hide) hidden++;
+      if (card.classList.contains("wm-mlm-hidden") !== hide) {
+        card.classList.toggle("wm-mlm-hidden", hide);
+      }
+      mlmUpdateMedian(card);
+    }
+
+    const button = bar.querySelector(".wm-mlm-btn");
+    const label = `${mlmStartOnly ? "✅" : "☐"} Mise de départ seulement${mlmStartOnly && hidden ? ` (${hidden} masquée${hidden > 1 ? "s" : ""})` : ""}`;
+    if (button.textContent !== label) button.textContent = label;
+    if (button.getAttribute("aria-pressed") !== String(mlmStartOnly)) {
+      button.setAttribute("aria-pressed", String(mlmStartOnly));
+    }
+  }
+
+  function watchMarketplaceList() {
+    GM_addStyle(`
+      .wm-mlm-hidden {
+        display: none !important;
+      }
+      .wm-mlm-bar {
+        display: flex;
+        justify-content: center;
+        padding: 0.25rem 0 0.75rem;
+      }
+      .wm-mlm-btn {
+        padding: 0.3rem 0.8rem;
+        border: 1px solid var(--color-border);
+        border-radius: 999px;
+        background: transparent;
+        font-size: 0.8rem;
+        cursor: pointer;
+        opacity: 0.8;
+        transition: opacity 0.2s ease;
+      }
+      .wm-mlm-btn:hover,
+      .wm-mlm-btn[aria-pressed="true"] {
+        opacity: 1;
+      }
+      .wm-mlm-btn[aria-pressed="true"] {
+        border-color: var(--color-accent);
+        color: var(--color-accent);
+      }
+      .wm-mlm-median {
+        width: 100%;
+        margin-top: 0.15rem;
+        font-size: 10px;
+        font-weight: 600;
+        color: var(--color-accent);
+      }
+    `);
+
+    let debounceId = null;
+    const scheduleUpdate = () => {
+      clearTimeout(debounceId);
+      debounceId = setTimeout(updateMarketplaceList, 300);
+    };
+    scheduleUpdate();
+    new MutationObserver(scheduleUpdate).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  // ============================================================
+  // Feature AWL: watchlist of auctions.
+  //   - On a bid page (/marketplace/{UUID}), a ☆/★ button is prepended into the card's name heading (h1.flex-1, same
+  //     place and same re-insertion strategy as Feature CNC's 📋 button: the heading's children are re-rendered by
+  //     the site, so the button is put back whenever it is missing, and the card name is read from the heading's own
+  //     text nodes only). Clicking it adds the auction to the watchlist, or removes it.
+  //   - On the market page (/marketplace), a "Suivi" tab is appended to the tab bar (the div.overflow-x-auto.border-b
+  //     holding "Parcourir", "Mes ventes"..., recognised by its "Parcourir" button). Its button is cloned from an
+  //     inactive tab and marked with its own class, never border-b-2, which other features read as "the site's
+  //     active tab". Its label shows how many watched auctions are still running ("Suivi (3)") and turns amber when
+  //     one ends in less than 10 minutes.
+  //   - Selecting it shows a view right under the bar: rarity badge, name (a link to the auction; the whole row is
+  //     clickable) — both open the auction in a new browser tab, current bid or result, live countdown, a ✕ to stop watching, plus "Actualiser" and "Retirer les
+  //     terminées". Running auctions come first, soonest end first, then the finished ones, latest first.
+  //   - React-safety: the site's content and its idea of the active tab are never touched. The bar gets the classes
+  //     wm-awl-tabbar (always) and wm-awl-tabbar-on (while our tab is selected); CSS then makes the site's active tab
+  //     look inactive and hides the bar's following siblings, except our view. Clicking any site tab unselects ours
+  //     (a click handler on the bar), revealing the site's content as it was. Leaving the page resets to "not
+  //     selected"; if the site rebuilds the bar meanwhile, our tab is put back on the new one and stays selected.
+  //     Only foreign nodes are added, and every DOM write is done only
+  //     when the value changed, so the observer settles.
+  //   - Storage: localStorage "wm-awl-items", a JSON array of { id, name, rarity, shiny, startPrice, topBid,
+  //     bidCount, endAt (ms), status, finalPrice, addedAt, checkedAt }. Other tabs follow through the "storage"
+  //     event. Finished auctions are dropped 14 days after their end.
+  //   - Data: GET /api/marketplace/{id} (same answer as Feature AAR's results), sent through Feature AAR's paced
+  //     gate so the watchlist shares the crawler's request budget and rate-limit pause. It runs when the tab is
+  //     selected (then every 2 minutes while it stays selected, and on its "Actualiser" button) for the auctions
+  //     whose result is not known yet, when an auction is added, and once per page load when a watched auction's
+  //     page is visited. Nothing is polled while the tab is not shown.
+  // ============================================================
+  const AWL_STORAGE_KEY = "wm-awl-items";
+  const AWL_KEEP_AFTER_END_MS = 14 * 24 * 3600 * 1000;
+  const AWL_SOON_MS = 10 * 60 * 1000;
+  const AWL_RESULT_WAIT_MS = 3600 * 1000;
+  const awlListeners = new Set();
+  const awlVisitedIds = new Set();
+  let awlRefreshing = false;
+
+  function awlRead() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(AWL_STORAGE_KEY) ?? "[]");
+      return Array.isArray(parsed)
+        ? parsed.filter((item) => item && typeof item.id === "string")
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function awlNotify() {
+    awlListeners.forEach((listener) => listener());
+  }
+
+  function awlWrite(items) {
+    try {
+      localStorage.setItem(AWL_STORAGE_KEY, JSON.stringify(items));
+    } catch {
+      // Storage full or blocked: the watchlist just won't persist
+    }
+    awlNotify();
+  }
+
+  function awlUpdateItem(id, update) {
+    const items = awlRead();
+    const index = items.findIndex((item) => item.id === id);
+    if (index === -1) return;
+    items[index] = update(items[index]);
+    awlWrite(items);
+  }
+
+  // Over = its end time has passed, or the site no longer reports it as running
+  function awlIsOver(item, now = Date.now()) {
+    if (item.status && item.status !== "active") return true;
+    return typeof item.endAt === "number" && item.endAt <= now;
+  }
+
+  // A running status is only worth asking again until a while after the end: the result is settled by then
+  function awlNeedsRefresh(item, now = Date.now()) {
+    if (item.status && item.status !== "active") return false;
+    return typeof item.endAt !== "number" || now < item.endAt + AWL_RESULT_WAIT_MS;
+  }
+
+  function awlPrune() {
+    const now = Date.now();
+    const items = awlRead();
+    const kept = items.filter(
+      (item) =>
+        !(
+          awlIsOver(item, now) &&
+          typeof item.endAt === "number" &&
+          item.endAt < now - AWL_KEEP_AFTER_END_MS
+        ),
+    );
+    if (kept.length !== items.length) awlWrite(kept);
+  }
+
+  function awlApplyAuction(item, data) {
+    const auction = data?.auction;
+    if (!auction) return item;
+    const bids = Array.isArray(data.bids) ? data.bids : [];
+    const topBid = bids.reduce(
+      (max, bid) => Math.max(max, Number(bid.amount) || 0),
+      0,
+    );
+    return {
+      ...item,
+      name: auction.card?.wikipedia_title ?? item.name,
+      rarity:
+        auction.snapshot_rarity ?? auction.card?.rarity ?? item.rarity ?? null,
+      shiny: Boolean(auction.is_shiny ?? auction.card?.is_shiny ?? item.shiny),
+      startPrice:
+        auction.listing_base_amount ??
+        auction.base_amount ??
+        item.startPrice ??
+        null,
+      endAt: aarParseTime(auction.end_at) ?? item.endAt ?? null,
+      status: auction.status ?? item.status ?? "active",
+      finalPrice: auction.final_price ?? null,
+      bidCount: bids.length,
+      topBid: topBid || null,
+      checkedAt: Date.now(),
+    };
+  }
+
+  // Asks the site about one watched auction. Resolves "ok", "gone" (404) or "rate-limited"; other failures are
+  // "error" and leave the item as it was
+  async function awlRefreshOne(id) {
+    let data;
+    try {
+      data = await aarFetchPaced(`/api/marketplace/${id}`);
+    } catch (error) {
+      if (error instanceof AarRateLimitError) {
+        aarEnterCooldown();
+        return "rate-limited";
+      }
+      if (error instanceof AarHttpError && error.status === 404) {
+        awlUpdateItem(id, (item) => ({
+          ...item,
+          status: "not_found",
+          checkedAt: Date.now(),
+        }));
+        return "gone";
+      }
+      return "error";
+    }
+    awlUpdateItem(id, (item) => awlApplyAuction(item, data));
+    return "ok";
+  }
+
+  async function awlRefreshAll(onProgress) {
+    if (awlRefreshing) return "busy";
+    awlRefreshing = true;
+    let outcome = "ok";
+    try {
+      const ids = awlRead()
+        .filter((item) => awlNeedsRefresh(item))
+        .map((item) => item.id);
+      for (let i = 0; i < ids.length; i++) {
+        onProgress?.(i + 1, ids.length);
+        const result = await awlRefreshOne(ids[i]);
+        if (result === "rate-limited") {
+          outcome = result;
+          break;
+        }
+      }
+    } finally {
+      awlRefreshing = false;
+    }
+    return outcome;
+  }
+
+  function awlAdd(id, name) {
+    const items = awlRead();
+    if (items.some((item) => item.id === id)) return;
+    items.push({
+      id,
+      name: name || null,
+      rarity: null,
+      status: "active",
+      endAt: null,
+      addedAt: Date.now(),
+    });
+    awlWrite(items);
+    awlRefreshOne(id);
+  }
+
+  function awlRemove(id) {
+    awlWrite(awlRead().filter((item) => item.id !== id));
+  }
+
+  function awlFormatNumber(value) {
+    return Number(value).toLocaleString("fr-FR");
+  }
+
+  function awlTimeText(item, now = Date.now()) {
+    if (awlIsOver(item, now)) return "Terminée";
+    if (typeof item.endAt !== "number") return "…";
+    const total = Math.max(0, Math.floor((item.endAt - now) / 1000));
+    const days = Math.floor(total / 86400);
+    const hours = Math.floor((total % 86400) / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const seconds = total % 60;
+    if (days > 0) return `${days}j ${hours}h`;
+    if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+    if (minutes > 0) return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+    return `${seconds}s`;
+  }
+
+  function awlInfoText(item) {
+    const bids = item.bidCount
+      ? ` · ${item.bidCount} mise${item.bidCount > 1 ? "s" : ""}`
+      : "";
+    if (item.status === "not_found") return "Enchère introuvable";
+    if (awlIsOver(item)) {
+      if (item.finalPrice > 0) return `Vendue ${awlFormatNumber(item.finalPrice)}${bids}`;
+      return item.status && item.status !== "active"
+        ? `Non vendue${bids}`
+        : "Terminée, résultat en attente";
+    }
+    if (item.topBid > 0) return `Mise actuelle ${awlFormatNumber(item.topBid)}${bids}`;
+    if (item.startPrice != null) return `Mise de départ ${awlFormatNumber(item.startPrice)}`;
+    return "Données en attente";
+  }
+
+  function awlSorted(items, now = Date.now()) {
+    const rank = (item) => (awlIsOver(item, now) ? 1 : 0);
+    const end = (item) =>
+      typeof item.endAt === "number" ? item.endAt : Number.POSITIVE_INFINITY;
+    return [...items].sort((a, b) => {
+      if (rank(a) !== rank(b)) return rank(a) - rank(b);
+      if (rank(a) === 0) return end(a) - end(b);
+      return (
+        (typeof b.endAt === "number" ? b.endAt : 0) -
+        (typeof a.endAt === "number" ? a.endAt : 0)
+      );
+    });
+  }
+
+  // ---- Bid page: the ☆/★ button ----
+  function awlCurrentBidId() {
+    return window.location.pathname.match(MARKETPLACE_BID_PATH_REGEX)?.[1] ?? null;
+  }
+
+  function awlReadHeadingName(nameEl) {
+    return Array.from(nameEl.childNodes)
+      .filter((node) => node.nodeType === Node.TEXT_NODE)
+      .map((node) => node.textContent)
+      .join("")
+      .trim();
+  }
+
+  function awlSyncWatchButton(btn) {
+    const id = awlCurrentBidId();
+    const watched = id !== null && awlRead().some((item) => item.id === id);
+    const text = watched ? "★" : "☆";
+    if (btn.textContent !== text) btn.textContent = text;
+    const pressed = String(watched);
+    if (btn.getAttribute("aria-pressed") !== pressed) {
+      btn.setAttribute("aria-pressed", pressed);
+    }
+    const title = watched
+      ? "Enchère suivie (cliquer pour ne plus la suivre)"
+      : "Suivre cette enchère (la retrouver dans « Suivi », dans le menu)";
+    if (btn.title !== title) btn.title = title;
+  }
+
+  function awlEnsureWatchButton() {
+    const id = awlCurrentBidId();
+    const nameEl = id ? document.querySelector("h1.flex-1") : null;
+    if (!nameEl) return;
+
+    let btn = nameEl.querySelector(":scope > .wm-awl-watch");
+    if (!btn) {
+      btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "wm-awl-watch";
+      btn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const currentId = awlCurrentBidId();
+        if (!currentId) return;
+        if (awlRead().some((item) => item.id === currentId)) {
+          awlRemove(currentId);
+        } else {
+          const heading = document.querySelector("h1.flex-1");
+          awlAdd(currentId, heading ? awlReadHeadingName(heading) : null);
+        }
+      });
+      nameEl.prepend(btn);
+    }
+    awlSyncWatchButton(btn);
+
+    // Once per page load, a watched auction's page refreshes its entry (its price moved, or it ended)
+    if (!awlVisitedIds.has(id)) {
+      awlVisitedIds.add(id);
+      const item = awlRead().find((entry) => entry.id === id);
+      if (item && awlNeedsRefresh(item)) awlRefreshOne(id);
+    }
+  }
+
+  // ---- Market page: the "Suivi" tab ----
+  const AWL_MARKET_PATH_REGEX = /^\/marketplace\/?$/;
+  const AWL_VIEW_REFRESH_MS = 120000;
+  let awlTabActive = false;
+  let awlView = null;
+
+  function awlCountRunning(now = Date.now()) {
+    const running = awlRead().filter((item) => !awlIsOver(item, now));
+    const soon = running.some(
+      (item) => typeof item.endAt === "number" && item.endAt - now < AWL_SOON_MS,
+    );
+    return { count: running.length, soon };
+  }
+
+  // The tab bar holding "Parcourir", "Mes ventes", "Mes enchères"... (the guild page has a similar bar)
+  function awlFindTabBar() {
+    return Array.from(
+      document.querySelectorAll("div.overflow-x-auto.border-b"),
+    ).find((bar) =>
+      Array.from(bar.querySelectorAll(":scope > button")).some((button) =>
+        button.textContent.trim().startsWith("Parcourir"),
+      ),
+    );
+  }
+
+  function awlUpdateTab() {
+    const btn = document.querySelector("button.wm-awl-tab");
+    if (!btn) return;
+    const { count, soon } = awlCountRunning();
+    const text = count > 0 ? `Suivi (${count})` : "Suivi";
+    if (btn.textContent !== text) btn.textContent = text;
+    if (btn.classList.contains("wm-awl-soon") !== soon) {
+      btn.classList.toggle("wm-awl-soon", soon);
+    }
+    const title = soon
+      ? "Enchères suivies : l'une se termine dans moins de 10 minutes"
+      : "Enchères suivies";
+    if (btn.title !== title) btn.title = title;
+  }
+
+  function awlTeardownView() {
+    awlView?.destroy();
+    awlView = null;
+  }
+
+  function awlSetActive(active) {
+    if (awlTabActive === active) return;
+    awlTabActive = active;
+    awlEnsureTab();
+  }
+
+  // Adds the tab to the bar (once), and shows or removes our view. Hiding the site's own content is done in CSS
+  // (the bar's class wm-awl-tabbar-on hides the bar's following siblings but our view): the site's nodes, and its
+  // idea of the active tab, are left untouched, so switching back to one of its tabs finds it as it was.
+  function awlEnsureTab() {
+    const bar = AWL_MARKET_PATH_REGEX.test(window.location.pathname)
+      ? awlFindTabBar()
+      : null;
+    if (!bar) {
+      awlTeardownView();
+      awlTabActive = false;
+      return;
+    }
+
+    if (!bar.classList.contains("wm-awl-tabbar")) {
+      bar.classList.add("wm-awl-tabbar");
+      bar.addEventListener("click", (event) => {
+        const button = event.target.closest("button");
+        if (button && !button.classList.contains("wm-awl-tab")) {
+          awlSetActive(false);
+        }
+      });
+    }
+
+    let btn = bar.querySelector(":scope > .wm-awl-tab");
+    if (!btn) {
+      const template = Array.from(bar.querySelectorAll(":scope > button")).find(
+        (button) => !button.classList.contains("border-b-2"),
+      );
+      btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `${
+        template?.className ??
+        "px-4 py-3 text-sm font-medium whitespace-nowrap cursor-pointer"
+      } wm-awl-tab`;
+      btn.addEventListener("click", () => awlSetActive(true));
+      bar.append(btn);
+    }
+    if (btn.classList.contains("wm-awl-on") !== awlTabActive) {
+      btn.classList.toggle("wm-awl-on", awlTabActive);
+      btn.setAttribute("aria-selected", String(awlTabActive));
+    }
+    if (bar.classList.contains("wm-awl-tabbar-on") !== awlTabActive) {
+      bar.classList.toggle("wm-awl-tabbar-on", awlTabActive);
+    }
+
+    if (awlTabActive) {
+      awlView ??= awlBuildView();
+      if (awlView.element.previousElementSibling !== bar) {
+        bar.after(awlView.element);
+      }
+    } else {
+      awlTeardownView();
+    }
+    awlUpdateTab();
+  }
+
+  // ---- The view shown under the tab bar ----
+  function awlBuildView() {
+    awlPrune();
+
+    const element = document.createElement("div");
+    element.className = "wm-awl-view animate-fade-in-up";
+
+    const toolbar = document.createElement("div");
+    toolbar.className = "wm-awl-toolbar";
+    const makeButton = (label, onClick) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "wm-awl-btn";
+      button.textContent = label;
+      button.addEventListener("click", onClick);
+      return button;
+    };
+    const note = document.createElement("span");
+    note.className = "wm-awl-note";
+
+    const setNote = (text) => {
+      if (note.textContent !== text) note.textContent = text;
+    };
+    const refresh = async () => {
+      if (awlRefreshing) return;
+      const outcome = await awlRefreshAll((done, total) =>
+        setNote(`Actualisation… ${done}/${total}`),
+      );
+      setNote(
+        outcome === "rate-limited"
+          ? "Limite du site atteinte : réessayez dans quelques minutes."
+          : "",
+      );
+    };
+    toolbar.append(
+      makeButton("Actualiser", refresh),
+      makeButton("Retirer les terminées", () =>
+        awlWrite(awlRead().filter((item) => !awlIsOver(item))),
+      ),
+      note,
+    );
+
+    const list = document.createElement("div");
+    list.className = "wm-awl-list";
+
+    const buildRow = (item) => {
+      const href = `/marketplace/${item.id}`;
+      const row = document.createElement("div");
+      row.className = "wm-awl-row";
+      row.dataset.id = item.id;
+      if (awlIsOver(item)) row.classList.add("wm-awl-done");
+      row.addEventListener("click", (event) => {
+        if (event.target.closest("a, button")) return;
+        window.open(href, "_blank", "noopener");
+      });
+
+      const rarity = document.createElement("span");
+      rarity.className = "wm-awl-rarity";
+      if (item.rarity) {
+        rarity.textContent = item.rarity;
+        rarity.style.backgroundColor = `var(--color-rarity-${String(item.rarity).toLowerCase()})`;
+      } else {
+        rarity.classList.add("wm-awl-rarity-unknown");
+        rarity.textContent = "?";
+      }
+
+      const main = document.createElement("div");
+      main.className = "wm-awl-main";
+      const name = document.createElement("a");
+      name.className = "wm-awl-name";
+      name.href = href;
+      name.target = "_blank";
+      name.rel = "noopener";
+      name.textContent = `${item.shiny ? "✨ " : ""}${item.name ?? "Enchère"}`;
+      const info = document.createElement("span");
+      info.className = "wm-awl-info";
+      info.textContent = awlInfoText(item);
+      main.append(name, info);
+
+      const time = document.createElement("span");
+      time.className = "wm-awl-time";
+      time.dataset.id = item.id;
+      time.textContent = awlTimeText(item);
+
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "wm-awl-remove";
+      remove.title = "Ne plus suivre";
+      remove.setAttribute("aria-label", "Ne plus suivre");
+      remove.textContent = "✕";
+      remove.addEventListener("click", () => awlRemove(item.id));
+
+      row.append(rarity, main, time, remove);
+      return row;
+    };
+
+    const render = () => {
+      const items = awlSorted(awlRead());
+      list.replaceChildren();
+      if (!items.length) {
+        const empty = document.createElement("p");
+        empty.className = "wm-awl-empty";
+        empty.textContent =
+          "Aucune enchère suivie. Sur la page d'une enchère, cliquez sur ☆ à côté du nom de la carte pour la suivre.";
+        list.append(empty);
+        return;
+      }
+      items.forEach((item) => list.append(buildRow(item)));
+    };
+
+    // Countdowns (and the "over" state) move every second: only the time cells are rewritten
+    const tick = () => {
+      const now = Date.now();
+      const byId = new Map(awlRead().map((item) => [item.id, item]));
+      let rowFinished = false;
+      list.querySelectorAll(".wm-awl-time").forEach((cell) => {
+        const item = byId.get(cell.dataset.id);
+        if (!item) return;
+        const text = awlTimeText(item, now);
+        if (cell.textContent !== text) cell.textContent = text;
+        const over = awlIsOver(item, now);
+        const soon =
+          !over && typeof item.endAt === "number" && item.endAt - now < AWL_SOON_MS;
+        if (cell.classList.contains("wm-awl-soon") !== soon) {
+          cell.classList.toggle("wm-awl-soon", soon);
+        }
+        const row = cell.closest(".wm-awl-row");
+        if (row && row.classList.contains("wm-awl-done") !== over) {
+          rowFinished = true;
+        }
+      });
+      // An auction just ended: its row moves to the finished ones
+      if (rowFinished) render();
+    };
+
+    element.append(toolbar, list);
+    render();
+    tick();
+    awlListeners.add(render);
+    const tickTimer = setInterval(tick, 1000);
+    const refreshTimer = setInterval(refresh, AWL_VIEW_REFRESH_MS);
+    refresh();
+
+    return {
+      element,
+      destroy() {
+        clearInterval(tickTimer);
+        clearInterval(refreshTimer);
+        awlListeners.delete(render);
+        element.remove();
+      },
+    };
+  }
+
+  function watchAuctionWatchlist() {
+    GM_addStyle(`
+      .wm-awl-watch {
+        background: none;
+        border: none;
+        cursor: pointer;
+        font-size: 1.15rem;
+        line-height: 1;
+        vertical-align: middle;
+        color: inherit;
+        opacity: 0.75;
+        transition: opacity 0.15s ease, color 0.15s ease;
+      }
+      .wm-awl-watch:hover {
+        opacity: 1;
+      }
+      .wm-awl-watch[aria-pressed="true"] {
+        color: var(--color-accent);
+        opacity: 1;
+      }
+      /* The tab: same look as the site's tabs, underlined with a shadow (no border, so no layout shift) */
+      .wm-awl-tab.wm-awl-on {
+        color: var(--color-accent) !important;
+        box-shadow: inset 0 -2px 0 var(--color-accent);
+      }
+      .wm-awl-tab.wm-awl-soon:not(.wm-awl-on) {
+        color: #d97706;
+      }
+      /* Our tab selected: the site's active tab looks inactive, and its content (the bar's next siblings) hides */
+      .wm-awl-tabbar-on > button:not(.wm-awl-tab) {
+        color: color-mix(in srgb, var(--color-foreground) 50%, transparent) !important;
+        border-bottom-color: transparent !important;
+      }
+      .wm-awl-tabbar-on ~ *:not(.wm-awl-view) {
+        display: none !important;
+      }
+      body:has(.wm-awl-tabbar-on) .wm-group-toggle {
+        display: none;
+      }
+      .wm-awl-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 1rem;
+      }
+      .wm-awl-btn {
+        padding: 0.3rem 0.75rem;
+        border-radius: 999px;
+        border: 1px solid var(--color-border);
+        background: transparent;
+        color: var(--color-foreground);
+        font-size: 0.75rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background-color 0.2s ease;
+      }
+      .wm-awl-btn:hover {
+        background: var(--color-surface-light);
+      }
+      .wm-awl-note {
+        font-size: 0.75rem;
+        opacity: 0.7;
+      }
+      .wm-awl-list {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(min(100%, 22rem), 1fr));
+        gap: 0.6rem;
+      }
+      .wm-awl-empty {
+        grid-column: 1 / -1;
+        font-size: 0.85rem;
+        opacity: 0.6;
+      }
+      .wm-awl-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.65rem 0.8rem;
+        border: 1px solid var(--color-border);
+        border-radius: 0.75rem;
+        background-color: var(--color-surface-light);
+        cursor: pointer;
+        transition: border-color 0.2s ease;
+      }
+      .wm-awl-row:hover {
+        border-color: color-mix(in srgb, var(--color-accent) 60%, transparent);
+      }
+      .wm-awl-row.wm-awl-done {
+        opacity: 0.6;
+      }
+      .wm-awl-rarity {
+        flex-shrink: 0;
+        min-width: 2rem;
+        padding: 0.1rem 0.4rem;
+        border-radius: 0.4rem;
+        text-align: center;
+        font-size: 0.7rem;
+        font-weight: 700;
+        color: rgb(13, 17, 23);
+      }
+      .wm-awl-rarity-unknown {
+        background: var(--color-border);
+        color: var(--color-foreground);
+      }
+      .wm-awl-main {
+        display: flex;
+        flex: 1 1 auto;
+        flex-direction: column;
+        min-width: 0;
+      }
+      .wm-awl-name {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: inherit;
+        text-decoration: none;
+      }
+      .wm-awl-name:hover {
+        color: var(--color-accent);
+      }
+      .wm-awl-info {
+        font-size: 0.72rem;
+        opacity: 0.65;
+      }
+      .wm-awl-time {
+        flex-shrink: 0;
+        font-size: 0.8rem;
+        font-variant-numeric: tabular-nums;
+        font-weight: 600;
+      }
+      .wm-awl-time.wm-awl-soon {
+        color: #d97706;
+      }
+      .wm-awl-remove {
+        flex-shrink: 0;
+        border: none;
+        background: transparent;
+        color: var(--color-foreground);
+        opacity: 0.4;
+        cursor: pointer;
+        font-size: 0.85rem;
+        line-height: 1;
+        padding: 0.25rem;
+      }
+      .wm-awl-remove:hover {
+        opacity: 1;
+      }
+    `);
+
+    awlListeners.add(awlUpdateTab);
+    awlListeners.add(() =>
+      document.querySelectorAll(".wm-awl-watch").forEach(awlSyncWatchButton),
+    );
+    window.addEventListener("storage", (event) => {
+      if (event.key === AWL_STORAGE_KEY) awlNotify();
+    });
+
+    const update = () => {
+      awlEnsureTab();
+      awlEnsureWatchButton();
+    };
+    let debounceId = null;
+    const scheduleUpdate = () => {
+      clearTimeout(debounceId);
+      debounceId = setTimeout(update, 300);
+    };
+    scheduleUpdate();
+    new MutationObserver(scheduleUpdate).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+    // The countdown that decides "ends soon" moves without any DOM change
+    setInterval(awlUpdateTab, 30000);
+  }
+
+  // ============================================================
+  // Feature ETA: estimated end time of the auctions that still have more than 1h to go.
+  //   - The site only shows what is left ("4h 37m", "1h 07m", on a bid page "Se termine dans 1h 07m"): the
+  //     duration element (span.tabular-nums, the first span.tabular-nums.font-medium on a bid page, the same one
+  //     Feature PNB reads) is parsed (days j/d, h, m, s) and, when 1h or more is left, a "≈ 18:42" label is added
+  //     next to it: "demain 02:15" for tomorrow, "sam. 02:15" further on (with the date beyond a week). The tooltip
+  //     gives the full date. Under 1h, or once finished ("Terminée"), the label is removed.
+  //   - On /marketplace (every tab) it is appended to the column holding the duration on each card
+  //     (div[id^="marketplace-auction-"]); on a bid page it is inserted right after the duration element.
+  //   - The site rounds what is left to the minute, and the estimate is computed from it, so it would flicker by a
+  //     minute as the text ticks: the first estimate is kept in the label (data-end) and only replaced when a fresh
+  //     one differs by more than 2 minutes (e.g. an end time pushed back).
+  //   - React-safety: only the foreign label is added, moved never, removed when no longer needed; written only when
+  //     its text changed.
+  // ============================================================
+  const ETA_MIN_REMAINING_MS = 3600 * 1000;
+  const ETA_TOLERANCE_MS = 2 * 60 * 1000;
+
+  // "1h 07m" / "Se termine dans 2j 3h" -> ms, null when the text is not a duration
+  function etaParseRemaining(text) {
+    const match = /^(?:.*\bdans\s+)?((?:\d+\s*[jdhms]\s*)+)$/i.exec(text.trim());
+    if (!match) return null;
+    const unitMs = { j: 86400000, d: 86400000, h: 3600000, m: 60000, s: 1000 };
+    let total = 0;
+    for (const part of match[1].matchAll(/(\d+)\s*([jdhms])/gi)) {
+      total += Number(part[1]) * unitMs[part[2].toLowerCase()];
+    }
+    return total;
+  }
+
+  function etaFormat(end, now) {
+    const date = new Date(end);
+    const time = date.toLocaleTimeString("fr-FR", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    const startOfDay = (value) => new Date(value).setHours(0, 0, 0, 0);
+    const dayDiff = Math.round((startOfDay(end) - startOfDay(now)) / 86400000);
+    if (dayDiff <= 0) return `≈ ${time}`;
+    if (dayDiff === 1) return `≈ demain ${time}`;
+    const day = date.toLocaleDateString("fr-FR", { weekday: "short" });
+    if (dayDiff < 7) return `≈ ${day} ${time}`;
+    const dm = date.toLocaleDateString("fr-FR", { day: "2-digit", month: "2-digit" });
+    return `≈ ${day} ${dm} ${time}`;
+  }
+
+  // Shows, updates or removes the label of one duration element. `existing` is its label if already there,
+  // `insert` puts a new one in place
+  function etaApply(timer, existing, insert) {
+    const remaining = etaParseRemaining(timer.textContent);
+    if (remaining === null || remaining < ETA_MIN_REMAINING_MS) {
+      existing?.remove();
+      return;
+    }
+
+    const now = Date.now();
+    // The shown duration is cut to the minute: aim at the middle of that minute, on a whole minute
+    const fresh = Math.round((now + remaining + 30000) / 60000) * 60000;
+    let end = Number(existing?.dataset.end);
+    if (!Number.isFinite(end) || Math.abs(end - fresh) > ETA_TOLERANCE_MS) {
+      end = fresh;
+    }
+
+    let label = existing;
+    if (!label) {
+      label = document.createElement("span");
+      label.className = "wm-eta";
+      insert(label);
+    }
+    if (label.dataset.end !== String(end)) label.dataset.end = String(end);
+    const text = etaFormat(end, now);
+    if (label.textContent !== text) label.textContent = text;
+    const title = `Fin estimée : ${new Date(end).toLocaleString("fr-FR", {
+      dateStyle: "full",
+      timeStyle: "short",
+    })}`;
+    if (label.title !== title) label.title = title;
+  }
+
+  function updateEndEstimates() {
+    const path = window.location.pathname;
+
+    if (/^\/marketplace\/?$/.test(path)) {
+      document
+        .querySelectorAll('div[id^="marketplace-auction-"]')
+        .forEach((card) => {
+          const timer = card.querySelector("span.tabular-nums");
+          const column = timer?.parentElement;
+          if (!column) return;
+          etaApply(
+            timer,
+            column.querySelector(":scope > .wm-eta"),
+            (label) => column.append(label),
+          );
+        });
+      return;
+    }
+
+    if (MARKETPLACE_BID_PATH_REGEX.test(path)) {
+      const timer = document.querySelector("span.tabular-nums.font-medium");
+      if (!timer) return;
+      const next = timer.nextElementSibling;
+      etaApply(
+        timer,
+        next?.classList.contains("wm-eta") ? next : null,
+        (label) => {
+          label.classList.add("wm-eta-inline");
+          timer.after(label);
+        },
+      );
+    }
+  }
+
+  function watchEndEstimates() {
+    GM_addStyle(`
+      .wm-eta {
+        display: block;
+        font-size: 10px;
+        font-weight: 600;
+        white-space: nowrap;
+        color: var(--color-accent);
+      }
+      .wm-eta.wm-eta-inline {
+        display: inline;
+        margin-left: 0.5rem;
+        font-size: 0.8em;
+      }
+    `);
+
+    let debounceId = null;
+    const scheduleUpdate = () => {
+      clearTimeout(debounceId);
+      debounceId = setTimeout(updateEndEstimates, 300);
+    };
+    scheduleUpdate();
+    new MutationObserver(scheduleUpdate).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   function main() {
@@ -12914,6 +14055,9 @@ const MY_USERNAME = "xxx";
     run("feature-aar", watchAuctionArchive);
     run("feature-ach", watchCardPriceHistory);
     run("feature-cpr", watchCollectionRecap);
+    run("feature-mlm", watchMarketplaceList);
+    run("feature-awl", watchAuctionWatchlist);
+    run("feature-eta", watchEndEstimates);
 
     watchFeatureConfigButton();
     watchTutorialButton();
