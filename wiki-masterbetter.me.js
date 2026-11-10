@@ -3947,7 +3947,7 @@ const MY_USERNAME = "xxx";
     },
     {
       id: "feature-mlm",
-      label: "Liste des enchères : filtre « mise de départ seulement » et médiane des ventes (d'après l'archive) sur chaque carte",
+      label: "Liste des enchères : interrupteurs (mise de départ, atténuer / masquer les cartes possédées) et médiane des ventes (d'après l'archive) sur chaque carte",
     },
     {
       id: "feature-awl",
@@ -4394,7 +4394,7 @@ const MY_USERNAME = "xxx";
     },
     {
       title: "Liste des enchères : mises de départ et médiane",
-      text: "Au-dessus de la liste des enchères du marché, le bouton « Mise de départ seulement » masque les cartes sur lesquelles quelqu'un a déjà enchéri : il ne reste que celles qui n'ont encore aucune mise. Il suit les cartes qui s'ajoutent avec « Charger la suite ». Sous chaque carte, une ligne « médiane … · n ventes » donne le prix médian des ventes de cette carte (même rareté) d'après votre archive des enchères (bouton 📦) ; rien ne s'affiche si la carte n'y a jamais été vendue.",
+      text: "En haut du marché (onglet « Parcourir »), à côté du titre, trois interrupteurs (survolez-les pour le détail) : « Mise de départ » masque les cartes sur lesquelles quelqu'un a déjà enchéri (il ne reste que celles qui n'ont encore aucune mise) ; « Atténuer possédées » rend presque transparentes les cartes que vous possédez déjà ; « Masquer possédées » les retire de la liste. Ils suivent les cartes qui s'ajoutent avec « Charger la suite ». Sous chaque carte, une ligne « médiane … · n ventes » donne le prix médian des ventes de cette carte (même rareté) d'après votre archive des enchères (bouton 📦) ; rien ne s'affiche si la carte n'y a jamais été vendue.",
     },
     {
       title: "Suivi d'enchères",
@@ -8306,31 +8306,73 @@ const MY_USERNAME = "xxx";
   // goes to the ones still worth looking at. Ownership is read off the "Possédée" tag (span.bg-emerald-600\/90) a
   // card carries (Rule 25 relies on the same tag): on /marketplace the card is its closest
   // div[id^="marketplace-auction-"], on /global-collection its direct child of the card list (div.gap-3.justify-center).
-  // The card gets the "wm-owned-dimmed" class, which CSS turns into a low opacity that comes back on hover. The
-  // class is only ever added, never removed, and re-checked on every DOM mutation since both pages repopulate
-  // their lists as filters change.
+  // The card gets the "wm-owned-dimmed" class, which CSS turns into a low opacity that comes back on hover. Both
+  // pages repopulate their lists as filters change, so the cards are re-checked on every DOM mutation.
+  // On /marketplace the dimming only applies to the "Parcourir" tab (the other tabs — "Mes ventes", "Mes enchères",
+  // "Gagnées", "Historique", "Suivi" — show the cards untouched), and the class is removed from the cards when the
+  // tab changes. Feature MLM adds a switch to the bar above the list that turns the dimming off and on
+  // (localStorage "wm-owned-dim", on by default); the switch only exists while this rule is enabled, which is
+  // what ownedDimRuleOn tells. /global-collection is always dimmed (class only ever added there).
   // ============================================================
+  const OWNED_DIM_KEY = "wm-owned-dim";
+  const OWNED_TAG_SELECTOR = "span.bg-emerald-600\\/90";
+  let ownedDimRuleOn = false;
+  let ownedDimEnabled = (() => {
+    try {
+      return localStorage.getItem(OWNED_DIM_KEY) !== "0";
+    } catch {
+      return true;
+    }
+  })();
+
+  function setOwnedDimEnabled(enabled) {
+    ownedDimEnabled = enabled;
+    try {
+      localStorage.setItem(OWNED_DIM_KEY, enabled ? "1" : "0");
+    } catch {
+      // Unwritable storage: the choice just won't stick
+    }
+  }
+
+  // True when the market's active tab is "Parcourir" (the site's active tab is the one with border-b-2; the
+  // "Suivi" tab of Feature AWL never has it)
+  function marketIsBrowseTab() {
+    const bar = awlFindTabBar();
+    const active = bar
+      ? Array.from(bar.querySelectorAll(":scope > button")).find((button) =>
+          button.classList.contains("border-b-2"),
+        )
+      : null;
+    return !!active && active.textContent.trim().startsWith("Parcourir");
+  }
+
   function dimOwnedCards() {
     const path = window.location.pathname;
-    const onMarketplace = path.startsWith("/marketplace");
-    const onGlobalCollection = path.startsWith("/global-collection");
-    if (!onMarketplace && !onGlobalCollection) return;
+    if (/^\/marketplace\/?$/.test(path)) {
+      const dim = ownedDimEnabled && marketIsBrowseTab();
+      document
+        .querySelectorAll('div[id^="marketplace-auction-"]')
+        .forEach((card) => {
+          const shouldDim = dim && !!card.querySelector(OWNED_TAG_SELECTOR);
+          if (card.classList.contains("wm-owned-dimmed") !== shouldDim) {
+            card.classList.toggle("wm-owned-dimmed", shouldDim);
+          }
+        });
+      return;
+    }
+    if (!path.startsWith("/global-collection")) return;
 
-    document.querySelectorAll("span.bg-emerald-600\\/90").forEach((tag) => {
-      let card = null;
-      if (onMarketplace) {
-        card = tag.closest('div[id^="marketplace-auction-"]');
-      } else {
-        const list = tag.closest("div.gap-3.justify-center");
-        card = list
-          ? Array.from(list.children).find((child) => child.contains(tag))
-          : null;
-      }
+    document.querySelectorAll(OWNED_TAG_SELECTOR).forEach((tag) => {
+      const list = tag.closest("div.gap-3.justify-center");
+      const card = list
+        ? Array.from(list.children).find((child) => child.contains(tag))
+        : null;
       if (card) card.classList.add("wm-owned-dimmed");
     });
   }
 
   function watchOwnedCardsDimming() {
+    ownedDimRuleOn = true;
     GM_addStyle(`
       .wm-owned-dimmed {
         opacity: 0.05;
@@ -12855,11 +12897,20 @@ const MY_USERNAME = "xxx";
 
   // ============================================================
   // Feature MLM: on the marketplace's auction list (/marketplace, every card is a div[id^="marketplace-auction-"]),
-  // two helps. (1) A "Mise de départ seulement" toggle button, in a small bar above the cards, hides the auctions
-  // that already have bids, keeping the ones whose card still shows the "Mise de départ" label (a card with bids
-  // shows another label). Hiding is a CSS class on the card (never removing it, so React's list stays consistent);
-  // cards that appear later ("Charger la suite") are handled by the page observer. The choice is kept in
-  // localStorage ("wm-mlm-start-only"). (2) A "médiane {prix} · {n} ventes" line is added at the bottom of each
+  // two helps. (1) A bar of compact switches (short label + a small version of the site's own settings switch,
+  // the explanation being in the tooltip), put in the page header between the title block and the "Sélectionner"
+  // button — at the top of the page, outside the list, which the site re-renders — and only shown on the
+  // "Parcourir" tab (so not on "Mes ventes", "Mes enchères", "Gagnées", "Historique", nor on Feature AWL's
+  // "Suivi", which a CSS rule hides it for). On narrow screens it wraps under the title. It holds:
+  //   - "Mise de départ": hides the auctions that already have bids, keeping the ones whose card still
+  //     shows the "Mise de départ" label (a card with bids shows another label); localStorage "wm-mlm-start-only".
+  //   - "Atténuer possédées" (only while Rule 41 is enabled): turns Rule 41's dimming of the owned cards off and
+  //     on; localStorage "wm-owned-dim" (on by default).
+  //   - "Masquer possédées": removes the owned cards (the ones carrying the "Possédée" tag) from the view;
+  //     localStorage "wm-mlm-hide-owned" (off by default).
+  // Hiding is a CSS class on the card (never removing it, so React's list stays consistent); cards that appear
+  // later ("Charger la suite") are handled by the page observer. A switch that hides cards shows how many.
+  // (2) A "médiane {prix} · {n} ventes" line is added at the bottom of each
   // card: the median final price of the card's archived sales (Feature AAR) with the same name and the same rarity
   // (read off the badge, as Feature CPR does), shiny sales apart. A card that looks shiny (✨ or "shiny" in its text)
   // gets no line, the median of the plain card being misleading for it. Nothing is shown when the card has no
@@ -12868,16 +12919,26 @@ const MY_USERNAME = "xxx";
   // ============================================================
   const MLM_START_LABEL = "Mise de départ";
   const MLM_STORAGE_KEY = "wm-mlm-start-only";
+  const MLM_HIDE_OWNED_KEY = "wm-mlm-hide-owned";
   const MLM_STATS_TTL_MS = 60 * 1000;
   const MLM_CARD_SELECTOR = 'div[id^="marketplace-auction-"]';
   const mlmStatsByName = new Map();
-  let mlmStartOnly = (() => {
+  const mlmReadFlag = (key) => {
     try {
-      return localStorage.getItem(MLM_STORAGE_KEY) === "1";
+      return localStorage.getItem(key) === "1";
     } catch {
       return false;
     }
-  })();
+  };
+  const mlmWriteFlag = (key, value) => {
+    try {
+      localStorage.setItem(key, value ? "1" : "0");
+    } catch {
+      // Unwritable storage: the choice just won't stick
+    }
+  };
+  let mlmStartOnly = mlmReadFlag(MLM_STORAGE_KEY);
+  let mlmHideOwned = mlmReadFlag(MLM_HIDE_OWNED_KEY);
 
   function mlmIsFinishedTab() {
     const labels = Object.values(BEST_TRADE_KINDS).map((kind) => kind.tabLabel);
@@ -12976,56 +13037,158 @@ const MY_USERNAME = "xxx";
     }
   }
 
-  function mlmEnsureBar(grid) {
+  // One compact item of the bar: a short label and a switch (the site's switch look, scaled down), the
+  // explanation being in the tooltip. The whole item is clickable; the switch inside stays focusable for the
+  // keyboard (its click bubbles up to the item).
+  function mlmBuildSwitchItem(key, label, tooltip, ariaLabel, onToggle) {
+    const item = document.createElement("div");
+    item.className = "wm-mlm-item";
+    item.dataset.wmMlm = key;
+    item.dataset.wmMlmLabel = label;
+    item.dataset.wmMlmTip = tooltip;
+    item.title = tooltip;
+
+    const text = document.createElement("span");
+    text.className = "wm-mlm-label";
+    text.textContent = label;
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "wm-mlm-switch";
+    button.setAttribute("role", "switch");
+    button.setAttribute("aria-checked", "false");
+    button.setAttribute("aria-label", ariaLabel);
+    const knob = document.createElement("span");
+    knob.className = "wm-mlm-knob";
+    button.append(knob);
+
+    item.addEventListener("click", onToggle);
+    item.append(text, button);
+    return item;
+  }
+
+  // The page header (div.flex.items-start.justify-between holding the h1 "Marché" and the "Sélectionner" button)
+  function mlmFindHeader(tabBar) {
+    return Array.from(tabBar.parentElement.children).find(
+      (el) =>
+        el.matches("div.flex.items-start.justify-between") &&
+        el.querySelector("h1"),
+    );
+  }
+
+  function mlmEnsureBar(tabBar) {
+    const header = mlmFindHeader(tabBar);
+    if (!header) return null;
+
     let bar = document.querySelector(".wm-mlm-bar");
     if (!bar) {
       bar = document.createElement("div");
       bar.className = "wm-mlm-bar";
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "wm-mlm-btn";
-      button.title =
-        "Masquer les enchères qui ont déjà reçu des mises : ne garder que celles qui affichent « Mise de départ »";
-      button.addEventListener("click", () => {
-        mlmStartOnly = !mlmStartOnly;
-        try {
-          localStorage.setItem(MLM_STORAGE_KEY, mlmStartOnly ? "1" : "0");
-        } catch {
-          // Unwritable storage: the choice just won't stick
-        }
-        updateMarketplaceList();
-      });
-      bar.append(button);
+
+      bar.append(
+        mlmBuildSwitchItem(
+          "start",
+          "Mise de départ",
+          "Mise de départ seulement : masque les enchères qui ont déjà reçu des mises",
+          "Afficher seulement les enchères sans mise",
+          () => {
+            mlmStartOnly = !mlmStartOnly;
+            mlmWriteFlag(MLM_STORAGE_KEY, mlmStartOnly);
+            updateMarketplaceList();
+          },
+        ),
+      );
+
+      if (ownedDimRuleOn) {
+        bar.append(
+          mlmBuildSwitchItem(
+            "dim",
+            "Atténuer possédées",
+            "Rend presque transparentes les cartes que vous possédez déjà (pleine visibilité au survol)",
+            "Atténuer les cartes déjà possédées",
+            () => {
+              setOwnedDimEnabled(!ownedDimEnabled);
+              dimOwnedCards();
+              updateMarketplaceList();
+            },
+          ),
+        );
+      }
+
+      bar.append(
+        mlmBuildSwitchItem(
+          "hide",
+          "Masquer possédées",
+          "Retire de la liste les cartes que vous possédez déjà",
+          "Masquer les cartes déjà possédées",
+          () => {
+            mlmHideOwned = !mlmHideOwned;
+            mlmWriteFlag(MLM_HIDE_OWNED_KEY, mlmHideOwned);
+            updateMarketplaceList();
+          },
+        ),
+      );
     }
-    if (bar.nextElementSibling !== grid) grid.before(bar);
+    // Between the title block and the "Sélectionner" button, once (React never moves foreign nodes)
+    if (!header.classList.contains("wm-mlm-header")) {
+      header.classList.add("wm-mlm-header");
+    }
+    if (bar.parentElement !== header) header.firstElementChild.after(bar);
     return bar;
+  }
+
+  // "hidden" is the number of cards the switch hides: shown after the label and in the tooltip while it is on
+  function mlmSyncItem(bar, key, on, hidden) {
+    const item = bar.querySelector(`.wm-mlm-item[data-wm-mlm="${key}"]`);
+    if (!item) return;
+    const button = item.querySelector(".wm-mlm-switch");
+    if (button.getAttribute("aria-checked") !== String(on)) {
+      button.setAttribute("aria-checked", String(on));
+    }
+    const shown = on && hidden > 0;
+    const label = `${item.dataset.wmMlmLabel}${shown ? ` · ${hidden}` : ""}`;
+    const labelEl = item.querySelector(".wm-mlm-label");
+    if (labelEl.textContent !== label) labelEl.textContent = label;
+    const tip = `${item.dataset.wmMlmTip}${shown ? ` (${hidden} masquée${hidden > 1 ? "s" : ""})` : ""}`;
+    if (item.title !== tip) item.title = tip;
   }
 
   function updateMarketplaceList() {
     const cards = Array.from(document.querySelectorAll(MLM_CARD_SELECTOR));
     const onList = /^\/marketplace\/?$/.test(window.location.pathname);
-    if (!onList || cards.length === 0 || mlmIsFinishedTab()) {
-      document.querySelectorAll(".wm-mlm-bar").forEach((bar) => bar.remove());
-      cards.forEach((card) => card.classList.remove("wm-mlm-hidden"));
-      return;
+    const tabBar = onList ? awlFindTabBar() : null;
+    const browse = !!tabBar && marketIsBrowseTab();
+
+    // The switches live on top of the page, whatever the number of cards (a search may return none)
+    const bar = browse ? mlmEnsureBar(tabBar) : null;
+    if (!bar) {
+      document.querySelectorAll(".wm-mlm-bar").forEach((el) => el.remove());
     }
 
-    const bar = mlmEnsureBar(cards[0].parentElement);
-    let hidden = 0;
+    // Finished auctions (cards of "Historique" and "Gagnées") get neither a median nor any filtering
+    const listing = onList && cards.length > 0 && !mlmIsFinishedTab();
+    let noBidHidden = 0;
+    let ownedHidden = 0;
     for (const card of cards) {
-      const hide = mlmStartOnly && !mlmHasStartBid(card);
-      if (hide) hidden++;
+      let hide = false;
+      if (listing && browse) {
+        const hideNoBid = mlmStartOnly && !mlmHasStartBid(card);
+        const hideOwn =
+          mlmHideOwned && !!card.querySelector(OWNED_TAG_SELECTOR);
+        if (hideNoBid) noBidHidden++;
+        if (hideOwn) ownedHidden++;
+        hide = hideNoBid || hideOwn;
+      }
       if (card.classList.contains("wm-mlm-hidden") !== hide) {
         card.classList.toggle("wm-mlm-hidden", hide);
       }
-      mlmUpdateMedian(card);
+      if (listing) mlmUpdateMedian(card);
     }
 
-    const button = bar.querySelector(".wm-mlm-btn");
-    const label = `${mlmStartOnly ? "✅" : "☐"} Mise de départ seulement${mlmStartOnly && hidden ? ` (${hidden} masquée${hidden > 1 ? "s" : ""})` : ""}`;
-    if (button.textContent !== label) button.textContent = label;
-    if (button.getAttribute("aria-pressed") !== String(mlmStartOnly)) {
-      button.setAttribute("aria-pressed", String(mlmStartOnly));
+    if (bar) {
+      mlmSyncItem(bar, "start", mlmStartOnly, noBidHidden);
+      mlmSyncItem(bar, "dim", ownedDimEnabled, 0);
+      mlmSyncItem(bar, "hide", mlmHideOwned, ownedHidden);
     }
   }
 
@@ -13034,28 +13197,91 @@ const MY_USERNAME = "xxx";
       .wm-mlm-hidden {
         display: none !important;
       }
+      /* The bar sits in the page header, between the title block and the "Sélectionner" button: compact items
+         (label + small switch) styled after the site's switch (pill, white knob, accent colour when on) */
+      .wm-mlm-header {
+        flex-wrap: wrap;
+      }
+      /* The title block gives way (its subtitle wraps) before the switches drop to a second line */
+      .wm-mlm-header > :first-child {
+        flex: 1 1 12rem;
+        min-width: 0;
+      }
       .wm-mlm-bar {
         display: flex;
-        justify-content: center;
-        padding: 0.25rem 0 0.75rem;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 0.5rem;
+        min-width: 0;
+        margin-left: auto;
       }
-      .wm-mlm-btn {
-        padding: 0.3rem 0.8rem;
+      @media (max-width: 767px) {
+        .wm-mlm-bar {
+          order: 3;
+          flex-basis: 100%;
+          justify-content: flex-start;
+          margin-left: 0;
+        }
+      }
+      /* Hidden while Feature AWL's "Suivi" tab is selected (the site's active tab is still "Parcourir" then) */
+      body:has(.wm-awl-tabbar-on) .wm-mlm-bar {
+        display: none;
+      }
+      .wm-mlm-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.375rem 0.75rem;
         border: 1px solid var(--color-border);
-        border-radius: 999px;
-        background: transparent;
-        font-size: 0.8rem;
+        border-radius: 0.5rem;
+        font-size: 0.8125rem;
+        line-height: 1.25rem;
+        color: color-mix(in srgb, var(--color-foreground) 80%, transparent);
         cursor: pointer;
-        opacity: 0.8;
-        transition: opacity 0.2s ease;
+        user-select: none;
+        transition: background-color 0.2s;
       }
-      .wm-mlm-btn:hover,
-      .wm-mlm-btn[aria-pressed="true"] {
-        opacity: 1;
+      .wm-mlm-item:hover {
+        background: var(--color-surface-light);
       }
-      .wm-mlm-btn[aria-pressed="true"] {
-        border-color: var(--color-accent);
-        color: var(--color-accent);
+      .wm-mlm-label {
+        white-space: nowrap;
+      }
+      .wm-mlm-switch {
+        position: relative;
+        flex-shrink: 0;
+        width: 2.25rem;
+        height: 1.25rem;
+        padding: 0;
+        border: 0;
+        border-radius: 999px;
+        background: var(--color-border);
+        cursor: pointer;
+        transition: background-color 0.3s;
+      }
+      .wm-mlm-switch[aria-checked="true"] {
+        background: var(--color-accent);
+      }
+      .wm-mlm-switch:focus {
+        outline: none;
+      }
+      .wm-mlm-switch:focus-visible {
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 50%, transparent);
+      }
+      .wm-mlm-knob {
+        position: absolute;
+        top: 0.125rem;
+        left: 0.125rem;
+        width: 1rem;
+        height: 1rem;
+        border-radius: 999px;
+        background: #fff;
+        box-shadow: 0 1px 3px rgb(0 0 0 / 0.3);
+        transition: transform 0.3s;
+      }
+      .wm-mlm-switch[aria-checked="true"] .wm-mlm-knob {
+        transform: translateX(1rem);
       }
       .wm-mlm-median {
         width: 100%;
