@@ -4315,7 +4315,7 @@ const MY_USERNAME = "xxx";
     },
     {
       id: "feature-mlm",
-      label: "Liste des enchères : interrupteurs (mise de départ, atténuer / masquer les cartes possédées) et médiane des ventes (d'après l'archive) sur chaque carte",
+      label: "Liste des enchères : interrupteurs (mise de départ, atténuer / masquer les cartes possédées) et médiane des ventes (d'après l'archive) sur chaque carte, avec une teinte discrète sur les cartes dont la mise la dépasse (aussi sur la page d'une enchère)",
     },
     {
       id: "feature-awl",
@@ -4766,7 +4766,7 @@ const MY_USERNAME = "xxx";
     },
     {
       title: "Liste des enchères : mises de départ et médiane",
-      text: "En haut du marché (onglet « Parcourir »), à côté du titre, trois interrupteurs (survolez-les pour le détail) : « Mise de départ » masque les cartes sur lesquelles quelqu'un a déjà enchéri (il ne reste que celles qui n'ont encore aucune mise) ; « Atténuer possédées » rend presque transparentes les cartes que vous possédez déjà ; « Masquer possédées » les retire de la liste. Ils suivent les cartes qui s'ajoutent avec « Charger la suite ». Sous chaque carte, une ligne « médiane … · n ventes » donne le prix médian des ventes de cette carte (même rareté) d'après votre archive des enchères (bouton 📦) ; rien ne s'affiche si la carte n'y a jamais été vendue.",
+      text: "En haut du marché (onglet « Parcourir »), à côté du titre, trois interrupteurs (survolez-les pour le détail) : « Mise de départ » masque les cartes sur lesquelles quelqu'un a déjà enchéri (il ne reste que celles qui n'ont encore aucune mise) ; « Atténuer possédées » rend presque transparentes les cartes que vous possédez déjà ; « Masquer possédées » les retire de la liste. Ils suivent les cartes qui s'ajoutent avec « Charger la suite ». Sous chaque carte, une ligne « médiane … · n ventes » donne le prix médian des ventes de cette carte (même rareté) d'après votre archive des enchères (bouton 📦) ; rien ne s'affiche si la carte n'y a jamais été vendue. Quand la mise affichée dépasse cette médiane, la carte devient discrète : elle s'estompe et se délave sous une légère teinte selon l'écart (jaune dès +1 %, orange dès +25 %, rouge dès +75 %, rouge foncé dès +150 %), pour que les cartes au bon prix ressortent par contraste ; il faut lire la carte pour connaître l'écart (survolez la ligne « médiane »). Elle reprend son aspect normal au survol ; aucune indication si la mise est au niveau de la médiane ou en dessous. Sur la page d'une enchère en cours, l'image de la carte reste intacte et le panneau de mise l'indique, bien visiblement : une ligne « ▲ +140 % au-dessus de la médiane… » en haut, et une bordure et un fond de la couleur du niveau.",
     },
     {
       title: "Suivi d'enchères",
@@ -13272,13 +13272,24 @@ const MY_USERNAME = "xxx";
   // gets no line, the median of the plain card being misleading for it. Nothing is shown when the card has no
   // archived sale. Archive lookups are cached per card name for MLM_STATS_TTL_MS. Not shown on the "Historique" and
   // "Gagnées" tabs (the cards there are finished auctions). Reads only the archive.
+  // When the card's displayed price (start bid or current bid) is above that median, the card is made discreet: a
+  // CSS filter fades it and takes its colour away, under a tint of a 4-step scale by price / median
+  // (MLM_PREMIUM_LEVELS): from +1 % yellow, +25 % orange, +75 % red, +150 % deep red, the further, the fainter. No badge
+  // and no coloured price: the fair-priced cards stand out by contrast, and whoever wants the figure reads the card
+  // (the median line's tooltip gives the percentage). Back to normal on hover. Nothing at or below the median. The
+  // price is re-read on every pass (it moves with the bids); the level is a data attribute on the card's div.
+  // On a bid page the hint is given another way (see mlmUpdateDetail): in the bid panel, in plain sight.
   // ============================================================
   const MLM_START_LABEL = "Mise de départ";
   const MLM_STORAGE_KEY = "wm-mlm-start-only";
   const MLM_HIDE_OWNED_KEY = "wm-mlm-hide-owned";
+  const MLM_CURRENT_LABEL = "Mise actuelle";
+  // Price / median ratios from which each level of the "above the median" colour scale starts (+1 %, +25 %, +75 %, +150 %)
+  const MLM_PREMIUM_LEVELS = [1.0001, 1.25, 1.75, 2.5];
   const MLM_STATS_TTL_MS = 60 * 1000;
   const MLM_CARD_SELECTOR = 'div[id^="marketplace-auction-"]';
   const mlmStatsByName = new Map();
+  const mlmStatByCard = new WeakMap();
   const mlmReadFlag = (key) => {
     try {
       return localStorage.getItem(key) === "1";
@@ -13349,21 +13360,86 @@ const MY_USERNAME = "xxx";
     return promise;
   }
 
+  // The card's displayed price (start bid or current bid) and the label above it, null when it can't be read. The
+  // price span follows the label ("Mise de départ" / "Mise actuelle") and holds an icon and the figure.
+  function mlmReadPrice(card) {
+    for (const label of card.querySelectorAll("span.uppercase")) {
+      const text = label.textContent.trim();
+      if (text !== MLM_START_LABEL && text !== MLM_CURRENT_LABEL) continue;
+      const span = label.nextElementSibling;
+      const digits = (span?.textContent ?? "").replace(/\D/g, "");
+      if (!span || !digits) return null;
+      return { label: text, span, price: Number(digits) };
+    }
+    return null;
+  }
+
+  // How far above the median a price is: the level (1 to MLM_PREMIUM_LEVELS.length, 0 = not above it) and the
+  // rounded percentage
+  function mlmPremium(price, median) {
+    if (!(median > 0) || !(price > median)) return { level: 0, percent: 0 };
+    const ratio = price / median;
+    let level = 0;
+    MLM_PREMIUM_LEVELS.forEach((from, index) => {
+      if (ratio >= from) level = index + 1;
+    });
+    return { level, percent: Math.round((ratio - 1) * 100) };
+  }
+
+  // The hint that the price is above the median, deliberately discreet: the card is made less visible, and tinted
+  // with the colour of its level (a data attribute on the card, a CSS filter and tint do the rest), so that the
+  // reasonably priced cards stand out by contrast and nothing is highlighted. The figures are only in the tooltip
+  // of the median line. Cheap, and re-run on every pass since the price changes as bids come in. The card's stat
+  // was stored by mlmSetMedianLine.
+  function mlmApplyPremium(card) {
+    const stat = mlmStatByCard.get(card) ?? null;
+    const read = stat ? mlmReadPrice(card) : null;
+    const { level, percent } = read
+      ? mlmPremium(read.price, stat.median)
+      : { level: 0, percent: 0 };
+
+    const value = level > 0 ? String(level) : null;
+    if ((card.dataset.wmMlmPremium ?? null) !== value) {
+      if (value) card.dataset.wmMlmPremium = value;
+      else delete card.dataset.wmMlmPremium;
+    }
+
+    const line = card.querySelector(".wm-mlm-median");
+    if (!line) return;
+    let title = line.dataset.wmBaseTitle ?? "";
+    if (level > 0) {
+      const what =
+        read.label === MLM_START_LABEL ? "La mise de départ" : "La mise actuelle";
+      title += `\n${what} (${achNumberFormat.format(read.price)}) est ${achNumberFormat.format(percent)} % au-dessus de la médiane`;
+    }
+    if (line.title !== title) line.title = title;
+  }
+
   function mlmSetMedianLine(card, stat) {
     let line = card.querySelector(".wm-mlm-median");
     if (!stat) {
+      mlmStatByCard.delete(card);
       line?.remove();
+      mlmApplyPremium(card);
       return;
     }
+    mlmStatByCard.set(card, stat);
     if (!line) {
       line = document.createElement("div");
       line.className = "wm-mlm-median";
       (card.querySelector(":scope > a") ?? card).append(line);
     }
+    let label = line.querySelector(".wm-mlm-median-text");
+    if (!label) {
+      label = document.createElement("span");
+      label.className = "wm-mlm-median-text";
+      line.prepend(label);
+    }
     const text = `médiane ${achNumberFormat.format(Math.round(stat.median))} · ${stat.count} vente${stat.count > 1 ? "s" : ""}`;
-    if (line.textContent !== text) line.textContent = text;
+    if (label.textContent !== text) label.textContent = text;
     const title = `Ventes archivées de cette carte : de ${achNumberFormat.format(stat.min)} à ${achNumberFormat.format(stat.max)}`;
-    if (line.title !== title) line.title = title;
+    line.dataset.wmBaseTitle = title;
+    mlmApplyPremium(card);
   }
 
   async function mlmUpdateMedian(card) {
@@ -13377,6 +13453,7 @@ const MY_USERNAME = "xxx";
     ) {
       return;
     }
+    if (card.dataset.wmMlmKey !== key) mlmStatByCard.delete(card);
     card.dataset.wmMlmKey = key;
     card.dataset.wmMlmAt = String(Date.now());
     if (!name || !rarity || /✨|shiny/i.test(card.textContent)) {
@@ -13391,6 +13468,101 @@ const MY_USERNAME = "xxx";
     } catch (error) {
       console.error("[WMB-MLM]", error);
     }
+  }
+
+  // The hint on a bid page (/marketplace/{UUID}), for a live auction (the bid field is there) of a card that is not
+  // shiny. Here the card's picture is left alone and the hint is plainly visible, in the bid panel (the card-frame
+  // holding the bid field): a line "▲ +140 % au-dessus de la médiane des ventes archivées (50)" is put at its top, and
+  // its border and background take the colour of the level (same scale as the list). The price is the page's
+  // span.text-2xl; the median comes from the same archive lookup as the list's; the card is read off the page (name:
+  // heading's own text; rarity: the badge). Nothing is requested.
+  let mlmDetailKey = null;
+  let mlmDetailStat = null;
+
+  function mlmClearDetail() {
+    mlmDetailKey = null;
+    mlmDetailStat = null;
+    document.querySelectorAll(".wm-mlm-panel").forEach((panel) => {
+      panel.classList.remove("wm-mlm-panel");
+      delete panel.dataset.wmMlmPremium;
+      panel.querySelector(":scope > .wm-mlm-panel-note")?.remove();
+    });
+  }
+
+  function mlmApplyDetail(panel, priceSpan) {
+    const price = Number((priceSpan?.textContent ?? "").replace(/\D/g, ""));
+    const { level, percent } =
+      mlmDetailStat && price > 0
+        ? mlmPremium(price, mlmDetailStat.median)
+        : { level: 0, percent: 0 };
+
+    let note = panel.querySelector(":scope > .wm-mlm-panel-note");
+    if (level === 0) {
+      note?.remove();
+      delete panel.dataset.wmMlmPremium;
+      panel.classList.remove("wm-mlm-panel");
+      return;
+    }
+
+    if (!panel.classList.contains("wm-mlm-panel")) {
+      panel.classList.add("wm-mlm-panel");
+    }
+    if (panel.dataset.wmMlmPremium !== String(level)) {
+      panel.dataset.wmMlmPremium = String(level);
+    }
+    if (!note) {
+      note = document.createElement("p");
+      note.className = "wm-mlm-panel-note";
+    }
+    if (panel.firstElementChild !== note) panel.prepend(note);
+    const text = `▲ +${achNumberFormat.format(percent)} % au-dessus de la médiane des ventes archivées (${achNumberFormat.format(Math.round(mlmDetailStat.median))})`;
+    if (note.textContent !== text) note.textContent = text;
+  }
+
+  function mlmUpdateDetail() {
+    const field = document.querySelector(
+      'input[aria-label="Montant de la mise"], input.min-w-0',
+    );
+    const panel = field?.closest(".card-frame") ?? null;
+    const badgeHost = document.querySelector("div.top-2.left-2")?.parentElement;
+    const heading = document.querySelector("h1.flex-1");
+    const priceSpan = document.querySelector("span.text-2xl");
+    const name = heading
+      ? Array.from(heading.childNodes)
+          .filter((node) => node.nodeType === Node.TEXT_NODE)
+          .map((node) => node.textContent)
+          .join("")
+          .trim()
+      : "";
+    const rarity = badgeHost ? cprReadCardRarity(badgeHost) : null;
+    if (
+      !panel ||
+      !badgeHost ||
+      !priceSpan ||
+      !name ||
+      !rarity ||
+      /✨|shiny/i.test(badgeHost.textContent)
+    ) {
+      mlmClearDetail();
+      return;
+    }
+
+    const key = `${name}|${rarity}`;
+    if (key !== mlmDetailKey) {
+      mlmDetailKey = key;
+      mlmDetailStat = null;
+    }
+    mlmLoadStats(name)
+      .then((stats) => {
+        if (mlmDetailKey !== key) return;
+        const stat = stats.get(rarity) ?? null;
+        if (stat?.median !== mlmDetailStat?.median) {
+          mlmDetailStat = stat;
+          mlmApplyDetail(panel, priceSpan);
+        }
+      })
+      .catch((error) => console.error("[WMB-MLM]", error));
+    mlmApplyDetail(panel, priceSpan);
   }
 
   // One compact item of the bar: a short label and a switch (the site's switch look, scaled down), the
@@ -13510,6 +13682,11 @@ const MY_USERNAME = "xxx";
   }
 
   function updateMarketplaceList() {
+    if (MARKETPLACE_BID_PATH_REGEX.test(window.location.pathname)) {
+      mlmUpdateDetail();
+    } else if (mlmDetailKey !== null || document.querySelector(".wm-mlm-panel")) {
+      mlmClearDetail();
+    }
     const cards = Array.from(document.querySelectorAll(MLM_CARD_SELECTOR));
     const onList = /^\/marketplace\/?$/.test(window.location.pathname);
     const tabBar = onList ? awlFindTabBar() : null;
@@ -13538,7 +13715,10 @@ const MY_USERNAME = "xxx";
       if (card.classList.contains("wm-mlm-hidden") !== hide) {
         card.classList.toggle("wm-mlm-hidden", hide);
       }
-      if (listing) mlmUpdateMedian(card);
+      if (listing) {
+        mlmUpdateMedian(card);
+        mlmApplyPremium(card);
+      }
     }
 
     if (bar) {
@@ -13645,6 +13825,72 @@ const MY_USERNAME = "xxx";
         font-size: 10px;
         font-weight: 600;
         color: var(--color-accent);
+      }
+      /* "Above the median" scale, deliberately discreet: the card fades and loses colour, under a tint of its level's
+         colour (yellow, orange, red, deep red); the fair prices stand out by contrast. Back to normal on hover,
+         like Rule 41's dimming. The tint is a pseudo-element: no node is added to the site's markup. */
+      [data-wm-mlm-premium="1"] {
+        --wm-premium-color: #facc15;
+        --wm-premium-tint: rgb(250 204 21 / 0.14);
+        --wm-premium-filter: saturate(0.6);
+        --wm-premium-opacity: 0.72;
+      }
+      [data-wm-mlm-premium="2"] {
+        --wm-premium-color: #fb923c;
+        --wm-premium-tint: rgb(251 146 60 / 0.2);
+        --wm-premium-filter: saturate(0.4);
+        --wm-premium-opacity: 0.52;
+      }
+      [data-wm-mlm-premium="3"] {
+        --wm-premium-color: #f87171;
+        --wm-premium-tint: rgb(248 113 113 / 0.28);
+        --wm-premium-filter: saturate(0.2) brightness(0.9);
+        --wm-premium-opacity: 0.33;
+      }
+      [data-wm-mlm-premium="4"] {
+        --wm-premium-color: #f43f5e;
+        --wm-premium-tint: rgb(244 63 94 / 0.36);
+        --wm-premium-filter: saturate(0) brightness(0.8);
+        --wm-premium-opacity: 0.17;
+      }
+      /* In the list, what fades is the card's link */
+      [data-wm-mlm-premium] > a {
+        position: relative;
+        filter: var(--wm-premium-filter);
+        opacity: var(--wm-premium-opacity);
+        transition: filter 0.2s ease, opacity 0.2s ease, border-color 0.2s ease;
+      }
+      [data-wm-mlm-premium] > a::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        pointer-events: none;
+        z-index: 40;
+        background: var(--wm-premium-tint);
+        transition: opacity 0.2s ease;
+      }
+      [data-wm-mlm-premium] > a:hover {
+        filter: none;
+        opacity: 1;
+      }
+      [data-wm-mlm-premium] > a:hover::after {
+        opacity: 0;
+      }
+      /* On a bid page, the bid panel is the one that shows the level: border and background in its colour, plus a
+         line of text at its top. Plainly visible, there. */
+      .wm-mlm-panel[data-wm-mlm-premium] {
+        border-color: var(--wm-premium-color);
+        background-image: linear-gradient(
+          color-mix(in srgb, var(--wm-premium-color) 12%, transparent),
+          color-mix(in srgb, var(--wm-premium-color) 12%, transparent)
+        );
+      }
+      .wm-mlm-panel-note {
+        font-size: 0.8125rem;
+        font-weight: 600;
+        line-height: 1.25rem;
+        color: var(--wm-premium-color);
       }
     `);
 
