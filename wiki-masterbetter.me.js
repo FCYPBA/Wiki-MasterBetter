@@ -2538,7 +2538,7 @@ const MY_USERNAME = "xxx";
   // Feature BSP (cont'd) — seller's own sale: when the auction just sold ("Vendue") and the seller (p.text-sm.mt-1's
   // username) is MY_USERNAME, the tag instead grades how good a SALE it was — the mirror image of the buyer-facing
   // grading: a price above 120% of the reference value is an "excellente" sale, above 100% "agréable", above 80%
-  // "tolérable", below that "décevante". The reference here is the ETS eval price (localStorage "eval-{name}"),
+  // "tolérable", below that "décevante". The reference here is the ETS eval price (Feature ETS's store),
   // not the "observed-" BSP average: recordSoldBidPrice never logs the seller's own sales there (see its own
   // comment), so that cache is essentially always empty for a card you just sold. With no eval price cached
   // either, it falls back to the same "NEW ENTRY" (white) tag, worded for a sale instead.
@@ -2903,7 +2903,7 @@ const MY_USERNAME = "xxx";
   // ============================================================
   // Feature BSP (cont'd): on the user's own profile (/profile), dump every card's stored sold prices into a grid,
   // inserted as a sibling right after div.grid; each entry gets a "✕" button to clear its stored data. Next to
-  // "Vider le cache", an import/export pill copies/restores every "observed-"/"eval-" localStorage entry as JSON.
+  // "Vider le cache", an import/export pill copies/restores every "observed-"/"eval-" entry (the latter from Feature ETS's store) as CSV.
   // Entries are sorted by descending "Objectif" (trimmed average price); entries with no computable average sort last.
   // ============================================================
   function collectStoredBidPrices() {
@@ -2982,13 +2982,15 @@ const MY_USERNAME = "xxx";
   }
 
   // Feature BSP/ETS (cont'd): an import/export pill next to "Vider le cache" carries every "observed-" (Feature
-  // BSP) and "eval-" (Feature ETS) localStorage entry as a downloadable "key,value" CSV file, so that cache can be
+  // BSP) and "eval-" (Feature ETS, kept in IndexedDB) entry as a downloadable "key,value" CSV file, so that cache can be
   // moved to another browser/device. Values are carried as their raw stored strings (not re-parsed), since Feature
   // BSP's entries are JSON-encoded arrays while Feature ETS's are plain strings; both are CSV-quoted as needed.
   // Feature FOL's followed-users list is carried too, and so are the cards' base rarities ("wm-rarity-{name}", see
   // Feature ETS (cont'd)), which Feature EVL's drawer needs to tint and filter the estimates: without them a
   // freshly imported cache would show every card without its rarity until its collection page is displayed again.
-  // The cards' tags ("wm-tags-{name}") travel for the same reason (Feature EVL's tag filter).
+  // The cards' tags ("wm-tags-{name}") travel for the same reason (Feature EVL's tag filter), and so does the date
+  // of each estimate ("wm-evalat-{name}", ms since epoch). The estimates, rarities, tags and dates are read from
+  // (and, on import, merged into) Feature ETS's store rather than from localStorage, which they left.
   // Feature EVL's drawer offers the same Exporter / Importer buttons (the pill below only exists on /profile, and
   // only once some prices were observed, so it can't be used to restore a cache on a brand-new browser).
   const TAGGED_CACHE_PREFIXES = [BSP_KEY_PREFIX, "eval-"];
@@ -3001,6 +3003,7 @@ const MY_USERNAME = "xxx";
       key === FOLLOWED_USERS_KEY ||
       key.startsWith(RARITY_KEY_PREFIX) ||
       key.startsWith(TAGS_KEY_PREFIX) ||
+      key.startsWith(EVAL_AT_KEY_PREFIX) ||
       TAGGED_CACHE_PREFIXES.some((prefix) => key.startsWith(prefix))
     );
   }
@@ -3010,11 +3013,24 @@ const MY_USERNAME = "xxx";
 
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
-      if (!key || !isTaggedCacheKey(key)) continue;
+      // Estimates, dates, rarities and tags come from the Feature ETS store below, wherever it keeps them
+      if (
+        !key ||
+        !isTaggedCacheKey(key) ||
+        ETS_LEGACY_FIELDS.some(({ prefix }) => key.startsWith(prefix))
+      )
+        continue;
 
       const raw = localStorage.getItem(key);
       if (raw !== null) entries[key] = raw;
     }
+    etsRecords.forEach((record, name) => {
+      if (record.value !== null) entries[`${EVAL_KEY_PREFIX}${name}`] = record.value;
+      if (record.rarity !== null) entries[`${RARITY_KEY_PREFIX}${name}`] = record.rarity;
+      if (record.tags !== null)
+        entries[`${TAGS_KEY_PREFIX}${name}`] = record.tags.join(TAGS_SEPARATOR);
+      if (record.at !== null) entries[`${EVAL_AT_KEY_PREFIX}${name}`] = String(record.at);
+    });
 
     return entries;
   }
@@ -3116,9 +3132,15 @@ const MY_USERNAME = "xxx";
       if (!file) return;
 
       const reader = new FileReader();
-      reader.onload = () => {
+      reader.onload = async () => {
         const rows = parseCsvRows(String(reader.result ?? ""));
         let importedCount = 0;
+        // Pieces of the Feature ETS records, gathered per card and merged once the whole file is read
+        const patches = new Map();
+        const patchOf = (name) => {
+          if (!patches.has(name)) patches.set(name, {});
+          return patches.get(name);
+        };
 
         rows.forEach(([key, value]) => {
           if (typeof key !== "string" || typeof value !== "string") return;
@@ -3141,15 +3163,23 @@ const MY_USERNAME = "xxx";
             return;
           }
 
-          // A rarity is a short code ("UR"); anything else is not one of ours
-          if (key.startsWith(RARITY_KEY_PREFIX) && (!value || value.length > 20))
-            return;
-
-          if (key.startsWith(TAGS_KEY_PREFIX) && value.length > 2000) return;
-
-          localStorage.setItem(key, value);
+          const piece = ETS_LEGACY_FIELDS.find(({ prefix }) => key.startsWith(prefix));
+          if (piece) {
+            const name = key.slice(piece.prefix.length);
+            if (!name) return;
+            // A rarity is a short code ("UR"); anything else is not one of ours
+            if (piece.field === "rarity" && (!value || value.length > 20)) return;
+            if (piece.field === "tags" && value.length > 2000) return;
+            const parsed = piece.parse(value);
+            if (parsed === null) return;
+            patchOf(name)[piece.field] = parsed;
+          } else {
+            localStorage.setItem(key, value);
+          }
           importedCount++;
         });
+        patches.forEach((patch, name) => etsImport(name, patch));
+        await etsFlush();
 
         if (importedCount === 0) {
           alert("Le fichier n'est pas un export valide.");
@@ -3440,8 +3470,328 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
-  // Feature ETS: on /pulls and /collection, once span.tabular-nums appears, store its value in localStorage
-  // under "eval-{name}", name being the text content of p.truncate. If it's missing but div.mb-5 p.mt-1\.5 reads
+  // Feature ETS (storage): everything the script knows about a card of your collection lives in IndexedDB
+  // ("wmb-estimations", store "evals", keyPath "name"), not in localStorage: it is one record per card owned, and
+  // localStorage (about 5 MB for the whole site, shared with every other script) is too small for a collection that
+  // keeps growing. Same reasoning as Feature AAR's archive. A record is { name, value, rarity, tags, at }:
+  //  - value: the estimate as the site displays it (a number as text, e.g. "1250", or the "?" placeholder for a card
+  //    with no recorded sale); null for a card known by its rarity/tags only (an import, say);
+  //  - rarity: the card's base rarity ("UR"...) and tags: its tag names (array), both as seen on /collection (Feature
+  //    ETS (cont'd)); null while never seen. An empty tags array means "seen, no tag";
+  //  - at: when the estimate was last seen (ms since epoch); null when unknown (estimates saved before that date
+  //    existed, or imported without it). It is what an "old estimate" alert or an automatic re-estimation will read.
+  // The other per-card entries ("observed-" prices...) stay in localStorage, being small and expendable.
+  // Every reader of these is synchronous (the collection's grid, the sort, the polling of Feature EBC...), so the
+  // whole store is loaded in memory (etsRecords) before any feature starts (main awaits etsLoad), and the ets*
+  // readers read from it. Writes update the memory at once and queue the IndexedDB write behind the previous ones
+  // (etsFlush resolves when the queue is empty: awaited before a reload). Other tabs follow through a
+  // BroadcastChannel. On load, whatever still sits in localStorage — "eval-{name}" (estimate), "wm-rarity-{name}",
+  // "wm-tags-{name}" (tags joined by a tab) and "wm-evalat-{name}" — is moved to IndexedDB, then removed (which also
+  // frees its room); a value already in IndexedDB wins. Should IndexedDB be unavailable (blocked, private mode...),
+  // those four localStorage entries are the storage instead, as they used to be. Errors are logged in the browser
+  // console (lines starting with `[WMB-ETS]`).
+  // ============================================================
+  const EVAL_KEY_PREFIX = "eval-";
+  const RARITY_KEY_PREFIX = "wm-rarity-";
+  const TAGS_KEY_PREFIX = "wm-tags-";
+  const TAGS_SEPARATOR = "\t";
+  const EVAL_AT_KEY_PREFIX = "wm-evalat-";
+  const ETS_DB_NAME = "wmb-estimations";
+  const ETS_DB_VERSION = 1;
+  const ETS_STORE = "evals";
+  const ETS_CHANNEL_NAME = "wmb-estimations";
+  // An estimate seen again unchanged only has its date refreshed when the saved one is older than this (the card's
+  // modal is re-read on every page mutation)
+  const ETS_REFRESH_MS = 60 * 1000;
+  const etsRecords = new Map();
+  let etsDbPromise = null;
+  let etsUsesDb = false;
+  let etsWrites = Promise.resolve();
+  const etsChannel =
+    typeof BroadcastChannel === "function"
+      ? new BroadcastChannel(ETS_CHANNEL_NAME)
+      : null;
+
+  const etsBlank = () => ({ value: null, rarity: null, tags: null, at: null });
+
+  // A stored record, whatever its age (the first version held { name, value } only), as a clean in-memory one
+  function etsNormalize(record) {
+    return {
+      value: typeof record.value === "string" ? record.value : null,
+      rarity: typeof record.rarity === "string" ? record.rarity : null,
+      tags: Array.isArray(record.tags) ? record.tags : null,
+      at: Number.isFinite(record.at) ? record.at : null,
+    };
+  }
+
+  function etsOpenDb() {
+    if (!etsDbPromise) {
+      etsDbPromise = new Promise((resolve, reject) => {
+        if (!window.indexedDB) {
+          reject(new Error("IndexedDB unavailable"));
+          return;
+        }
+        const request = indexedDB.open(ETS_DB_NAME, ETS_DB_VERSION);
+        request.onupgradeneeded = () => {
+          request.result.createObjectStore(ETS_STORE, { keyPath: "name" });
+        };
+        request.onsuccess = () => {
+          const db = request.result;
+          db.onversionchange = () => {
+            db.close();
+            etsDbPromise = null;
+          };
+          resolve(db);
+        };
+        request.onerror = () => {
+          etsDbPromise = null;
+          reject(request.error);
+        };
+      });
+    }
+    return etsDbPromise;
+  }
+
+  // Runs work(store, setResult) in one transaction; resolves with what was passed to setResult once committed
+  async function etsRun(mode, work) {
+    const db = await etsOpenDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(ETS_STORE, mode);
+      let result;
+      tx.oncomplete = () => resolve(result);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error("transaction aborted"));
+      work(tx.objectStore(ETS_STORE), (value) => {
+        result = value;
+      });
+    });
+  }
+
+  // The localStorage keys of the four pieces a record is made of, and how to read each one back
+  const ETS_LEGACY_FIELDS = [
+    { prefix: EVAL_KEY_PREFIX, field: "value", parse: (raw) => raw },
+    { prefix: RARITY_KEY_PREFIX, field: "rarity", parse: (raw) => raw || null },
+    {
+      prefix: TAGS_KEY_PREFIX,
+      field: "tags",
+      parse: (raw) => (raw === "" ? [] : raw.split(TAGS_SEPARATOR)),
+    },
+    {
+      prefix: EVAL_AT_KEY_PREFIX,
+      field: "at",
+      parse: (raw) => (Number.isFinite(Number(raw)) && Number(raw) > 0 ? Number(raw) : null),
+    },
+  ];
+
+  // Every localStorage entry holding a piece of a record, as { key, name, field, value }
+  function etsLegacyEntries() {
+    const entries = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key) continue;
+      const kind = ETS_LEGACY_FIELDS.find(({ prefix }) => key.startsWith(prefix));
+      if (!kind) continue;
+      const raw = localStorage.getItem(key);
+      if (raw === null) continue;
+      entries.push({
+        key,
+        name: key.slice(kind.prefix.length),
+        field: kind.field,
+        value: kind.parse(raw),
+      });
+    }
+    return entries;
+  }
+
+  // Loads every record in memory, first moving the ones still in localStorage into IndexedDB. Never throws.
+  async function etsLoad() {
+    try {
+      const records = await etsRun("readonly", (store, out) => {
+        const request = store.getAll();
+        request.onsuccess = () => out(request.result);
+      });
+      records.forEach((record) => etsRecords.set(record.name, etsNormalize(record)));
+      etsUsesDb = true;
+    } catch (error) {
+      console.error("[WMB-ETS]", error);
+    }
+
+    const legacy = etsLegacyEntries();
+    if (legacy.length === 0) return;
+
+    // What localStorage brings, without replacing what IndexedDB already holds
+    const changed = new Set();
+    legacy.forEach(({ name, field, value }) => {
+      if (value === null) return;
+      const record = etsRecords.get(name) ?? etsBlank();
+      if (record[field] !== null) return;
+      record[field] = value;
+      etsRecords.set(name, record);
+      changed.add(name);
+    });
+    if (!etsUsesDb) return;
+
+    try {
+      await etsRun("readwrite", (store) => {
+        changed.forEach((name) => store.put({ name, ...etsRecords.get(name) }));
+      });
+      // Removed only now that everything is safely in IndexedDB
+      legacy.forEach(({ key }) => localStorage.removeItem(key));
+    } catch (error) {
+      console.error("[WMB-ETS] migration", error);
+    }
+  }
+
+  if (etsChannel) {
+    etsChannel.onmessage = (event) => {
+      const { name, record } = event.data ?? {};
+      if (typeof name !== "string") return;
+      if (record) etsRecords.set(name, etsNormalize(record));
+      else etsRecords.delete(name);
+    };
+  }
+
+  // The localStorage fallback: one entry per piece, absent when the piece is unknown
+  function etsPersistLegacy(name, record) {
+    ETS_LEGACY_FIELDS.forEach(({ prefix, field }) => {
+      const key = `${prefix}${name}`;
+      const piece = record?.[field] ?? null;
+      if (piece === null) {
+        localStorage.removeItem(key);
+      } else {
+        localStorage.setItem(
+          key,
+          field === "tags" ? piece.join(TAGS_SEPARATOR) : String(piece),
+        );
+      }
+    });
+  }
+
+  // Queues the write of the card's record as it is now (a missing record is deleted)
+  function etsQueueWrite(name) {
+    const record = etsRecords.get(name) ?? null;
+    etsChannel?.postMessage({ name, record });
+    etsWrites = etsWrites
+      .then(async () => {
+        if (!etsUsesDb) {
+          etsPersistLegacy(name, record);
+          return;
+        }
+        await etsRun("readwrite", (store) => {
+          if (record) store.put({ name, ...record });
+          else store.delete(name);
+        });
+      })
+      .catch((error) => console.error("[WMB-ETS]", error));
+  }
+
+  function etsUpdate(name, patch) {
+    etsRecords.set(name, { ...(etsRecords.get(name) ?? etsBlank()), ...patch });
+    etsQueueWrite(name);
+  }
+
+  // The card's estimate as stored (a number as text, or "?"), null when there is none
+  function etsGet(cardName) {
+    return etsRecords.get(cardName)?.value ?? null;
+  }
+
+  // When the estimate was last seen (ms), null when there is none or when it is unknown
+  function etsGetDate(cardName) {
+    return etsRecords.get(cardName)?.at ?? null;
+  }
+
+  function etsGetRarity(cardName) {
+    return etsRecords.get(cardName)?.rarity ?? null;
+  }
+
+  function etsGetTags(cardName) {
+    return etsRecords.get(cardName)?.tags ?? null;
+  }
+
+  // Saves an estimate, dated now unless a date is given; the card's rarity and tags are kept
+  function etsSet(cardName, value, at = Date.now()) {
+    etsUpdate(cardName, { value, at });
+  }
+
+  // The estimate is seen again, unchanged: its date moves up to now (at most once per ETS_REFRESH_MS)
+  function etsTouch(cardName) {
+    const at = etsGetDate(cardName);
+    if (at !== null && Date.now() - at < ETS_REFRESH_MS) return;
+    etsUpdate(cardName, { at: Date.now() });
+  }
+
+  function etsSetRarity(cardName, rarity) {
+    if (etsGetRarity(cardName) === rarity) return;
+    etsUpdate(cardName, { rarity });
+  }
+
+  function etsSetTags(cardName, tags) {
+    const current = etsGetTags(cardName);
+    if (current && current.join(TAGS_SEPARATOR) === tags.join(TAGS_SEPARATOR))
+      return;
+    etsUpdate(cardName, { tags: [...tags] });
+  }
+
+  // Empties the estimate (value and date) but keeps the rarity and tags, returning what it was ({ value, at }, or
+  // null when there was none): Feature EBC clears an estimate to see its fresh one land, and puts it back if none does
+  function etsTake(cardName) {
+    const record = etsRecords.get(cardName);
+    if (!record || record.value === null) return null;
+    const taken = { value: record.value, at: record.at };
+    etsUpdate(cardName, { value: null, at: null });
+    return taken;
+  }
+
+  // The whole record (a copy), null when the card is unknown: what Feature EVL puts back after a removal
+  function etsSnapshot(cardName) {
+    const record = etsRecords.get(cardName);
+    return record ? { ...record } : null;
+  }
+
+  function etsRestore(cardName, snapshot) {
+    if (!snapshot) return;
+    etsRecords.set(cardName, { ...snapshot });
+    etsQueueWrite(cardName);
+  }
+
+  // Deletes the card's whole record
+  function etsRemove(cardName) {
+    if (!etsRecords.delete(cardName)) return;
+    etsQueueWrite(cardName);
+  }
+
+  // Names of the cards that have an estimate (the "?" placeholder included)
+  function etsNames() {
+    const names = [];
+    etsRecords.forEach((record, name) => {
+      if (record.value !== null) names.push(name);
+    });
+    return names;
+  }
+
+  // Merges what an import brings ({ value?, rarity?, tags?, at? }, pieces not given are left alone). A new value
+  // without a date has an unknown one, unless it is the very value already stored.
+  function etsImport(cardName, patch) {
+    const record = etsRecords.get(cardName) ?? etsBlank();
+    const next = { ...record };
+    for (const field of ["value", "rarity", "tags", "at"]) {
+      if (patch[field] !== undefined) next[field] = patch[field];
+    }
+    if (patch.at === undefined && patch.value !== undefined && patch.value !== record.value) {
+      next.at = null;
+    }
+    etsRecords.set(cardName, next);
+    etsQueueWrite(cardName);
+  }
+
+  // Resolves once every queued write has landed
+  function etsFlush() {
+    return etsWrites;
+  }
+
+  // ============================================================
+  // Feature ETS: on /pulls and /collection, once span.tabular-nums appears, store its value (see "Feature ETS
+  // (storage)" above: IndexedDB) under the card's name, name being the text content of p.truncate. If it's missing but div.mb-5 p.mt-1\.5 reads
   // "Aucune vente" (no sales recorded yet for that card), stores the "?" placeholder (UNKNOWN_EVAL_VALUE) instead
   // of leaving that card unrecorded. p.truncate's own text node is read directly (rather than its full
   // textContent) since Feature CNC prepends a 📋 button inside that same element — including it here would
@@ -3483,9 +3833,12 @@ const MY_USERNAME = "xxx";
     if (value === UNKNOWN_EVAL_VALUE && wasAutomationLimitedSince(Date.now() - 5000))
       return;
 
-    const key = `eval-${cardName}`;
-    const existingValue = localStorage.getItem(key);
-    if (existingValue === value) return;
+    const existingValue = etsGet(cardName);
+    if (existingValue === value) {
+      // Seen again as it was: the estimate is still current
+      etsTouch(cardName);
+      return;
+    }
     if (
       value === UNKNOWN_EVAL_VALUE &&
       existingValue !== null &&
@@ -3493,7 +3846,7 @@ const MY_USERNAME = "xxx";
     )
       return;
 
-    localStorage.setItem(key, value);
+    etsSet(cardName, value);
   }
 
   function watchTabularNumsRecording() {
@@ -3521,41 +3874,32 @@ const MY_USERNAME = "xxx";
   // "{rarity} ({eval})". The eval value is reformatted first: above 1000,
   // it's abbreviated to "{X,X} K" (French decimal comma); otherwise it's shown as stored — low values included —
   // as well as the "?" placeholder for a card with no recorded sales. While at it, the card's base rarity (the
-  // tag's text before our appendix) is saved under "wm-rarity-{name}" — only for cards that have an estimate, and
+  // tag's text before our appendix) is saved in the card's record (see "Feature ETS (storage)") — only for cards that have an estimate, and
   // only ever as seen on /collection — so that Feature EVL can show it; nothing else records it, hence a card
   // only gets one once its page of the collection has been displayed (Feature EBC's "Estimation complète" walks
   // them all). Part of the cache export (see TAGGED_CACHE_PREFIXES' comment).
   // ============================================================
-  const RARITY_KEY_PREFIX = "wm-rarity-";
-
   function recordCardRarity(cardName, rarity) {
     if (!rarity) return;
 
-    const key = `${RARITY_KEY_PREFIX}${cardName}`;
-    if (localStorage.getItem(key) !== rarity) localStorage.setItem(key, rarity);
+    etsSetRarity(cardName, rarity);
   }
 
   // Feature ETS (cont'd): the card's tags (étiquettes), read from the chips of its card in the grid
   // (div.flex-wrap.shrink-0 > span, text = emoji and name, e.g. "🛫Avions"), saved the same way and for the same
-  // cards as the rarity, under "wm-tags-{name}", for Feature EVL's tag filter. Stored as the tag names joined by a
-  // tab, never as a JSON array: an array (an empty one above all) would be taken by Feature BSP's legacy-key
-  // migration for a list of prices. The empty string means "seen, no tag"; a missing key means "never seen", which
-  // the filter must not mistake for "untagged". Refreshed every time the card is displayed, so re-tagging a card on
+  // cards as the rarity, in the same record, for Feature EVL's tag filter. An empty list means "seen, no tag"; null
+  // means "never seen", which the filter must not mistake for "untagged". (In the cache export and in the
+  // localStorage fallback they are "wm-tags-{name}" entries holding the tag names joined by a tab, never a JSON
+  // array: an array, an empty one above all, would be taken by Feature BSP's legacy-key migration for a list of
+  // prices.) Refreshed every time the card is displayed, so re-tagging a card on
   // the site is picked up. Part of the cache export.
-  const TAGS_KEY_PREFIX = "wm-tags-";
-  const TAGS_SEPARATOR = "\t";
-
   function recordCardTags(cardName, tags) {
-    const key = `${TAGS_KEY_PREFIX}${cardName}`;
-    const value = tags.join(TAGS_SEPARATOR);
-    if (localStorage.getItem(key) !== value) localStorage.setItem(key, value);
+    etsSetTags(cardName, tags);
   }
 
   // The card's saved tags, or null when they were never seen
   function readCardTags(cardName) {
-    const raw = localStorage.getItem(`${TAGS_KEY_PREFIX}${cardName}`);
-    if (raw === null) return null;
-    return raw === "" ? [] : raw.split(TAGS_SEPARATOR);
+    return etsGetTags(cardName);
   }
 
   function readCardTagChips(card) {
@@ -3588,7 +3932,7 @@ const MY_USERNAME = "xxx";
       if (!nameEl || !rarityEl) return;
 
       const cardName = nameEl.textContent.trim();
-      const evalValue = localStorage.getItem(`eval-${cardName}`);
+      const evalValue = etsGet(cardName);
       if (!cardName || !evalValue) return;
 
       const baseRarity =
@@ -5319,8 +5663,7 @@ const MY_USERNAME = "xxx";
   // that count reaches 0 on the current page), and "Ordonner la page par prix" (reorders the grid by
   // each card's raw eval value, unknowns last). The two evaluation
   // buttons show a fixed "Arrêter la reconnaissance" button and, for each targeted card, click its
-  // .wm-quick-action button, wait for Feature ETS to record a fresh value under its "eval-{name}" localStorage
-  // key, then press Escape to close the modal before moving to the next card. The stop button cancels the run
+  // .wm-quick-action button, wait for Feature ETS to record a fresh value for the card, then press Escape to close the modal before moving to the next card. The stop button cancels the run
   // after the current card; the two evaluation buttons disable each other while either is running. Whenever a
   // native rarity filter button (button.px-3.py-1.transition-colors) shows up after "Ré-estimer la page" —
   // e.g. a new rarity tier's filter button getting appended past our own controls — it's moved back in front of
@@ -5474,13 +5817,13 @@ const MY_USERNAME = "xxx";
       const cardName = getCardName(card);
       if (!cardName || getCardLimitedAt(cardName) === null) return false;
 
-      const value = localStorage.getItem(`eval-${cardName}`);
+      const value = etsGet(cardName);
       return value === null || value === UNKNOWN_EVAL_VALUE;
     });
   }
 
-  // Resolves true once a fresh value lands under "eval-{cardName}" (the
-  // caller must have cleared that key beforehand so a stale value already
+  // Resolves true once a fresh value lands in the store for the card (the
+  // caller must have cleared it beforehand so a stale value already
   // present can't be mistaken for a freshly recorded one), or false if
   // stopped/timed out/rate-limited first (the caller tells the latter apart with wasAutomationLimitedSince)
   function waitForCardEvaluation(
@@ -5496,7 +5839,7 @@ const MY_USERNAME = "xxx";
           resolve(false);
           return;
         }
-        if (localStorage.getItem(`eval-${cardName}`) !== null) {
+        if (etsGet(cardName) !== null) {
           resolve(true);
           return;
         }
@@ -5605,9 +5948,9 @@ const MY_USERNAME = "xxx";
       const quickActionBtn = card.querySelector(".wm-quick-action");
       if (!cardName || !quickActionBtn) continue;
 
-      const key = `eval-${cardName}`;
-      const previousValue = localStorage.getItem(key);
-      localStorage.removeItem(key);
+      // The estimate (and its date) is emptied, the card's rarity and tags are kept
+      const previous = etsTake(cardName);
+      const previousValue = previous?.value ?? null;
 
       let limitedRetries = 0;
       let limited = false;
@@ -5631,7 +5974,7 @@ const MY_USERNAME = "xxx";
 
         if (wasAutomationLimitedSince(attemptStart)) {
           // Whatever the modal recorded meanwhile is not a real estimate
-          localStorage.removeItem(key);
+          etsTake(cardName);
           recorded = false;
           pressEscape();
 
@@ -5662,8 +6005,8 @@ const MY_USERNAME = "xxx";
           if (state.pacingMs < 500) state.pacingMs = 0;
         }
         clearCardLimited(cardName);
-      } else if (previousValue !== null) {
-        localStorage.setItem(key, previousValue);
+      } else if (previous) {
+        etsSet(cardName, previous.value, previous.at);
       }
 
       if (limited && (previousValue === null || previousValue === UNKNOWN_EVAL_VALUE)) {
@@ -5810,11 +6153,11 @@ const MY_USERNAME = "xxx";
     });
   }
 
-  // Reads a card's raw eval value straight from localStorage (not its
+  // Reads a card's raw eval value straight from the store (not its
   // formatted rarity-tag appendix, which loses precision to "X K"),
   // returning null when it's missing or the "?" unknown marker
   function getCardEvalValueByName(cardName) {
-    const raw = localStorage.getItem(`eval-${cardName}`);
+    const raw = etsGet(cardName);
     if (raw === null || raw === UNKNOWN_EVAL_VALUE) return null;
 
     const num = parseFloat(raw.replace(/\s/g, "").replace(",", "."));
@@ -6852,26 +7195,18 @@ const MY_USERNAME = "xxx";
 
   // ============================================================
   // Rule 35: on /collection, a "Top {TOP_LIMIT}" text button appended to the h1 inside div.gap-3.animate-fade-in-up
-  // (right after the heading's text) opens a modal listing the TOP_LIMIT (40) largest eval prices cached under
-  // "eval-{name}" (Feature ETS), as a 3-column grid sorted by descending value. Entries whose cached value is the
+  // (right after the heading's text) opens a modal listing the TOP_LIMIT (40) largest eval prices cached
+  // (Feature ETS), as a 3-column grid sorted by descending value. Entries whose cached value is the
   // "?" placeholder (or otherwise non-numeric) are left out. Each entry has a "✕" button that removes that eval
-  // from localStorage and grays the entry out, the same way the "✕" on /profile's sold-prices grid (Feature BSP)
+  // from the cache and grays the entry out, the same way the "✕" on /profile's sold-prices grid (Feature BSP)
   // does. The highest eval is pulled out of the grid and showcased above it with a golden pulsating glow
   // (wm-top-eval-glow). Reuses the settings modal's overlay/header/close styling (.wm-settings-*), fading in on open
   // (wm-top-evals-fade-in); closes on Escape, overlay click or its own close button.
   // ============================================================
   const TOP_LIMIT = 40;
-  const EVAL_KEY_PREFIX = "eval-";
 
   function collectTopEvals() {
-    const names = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (key && key.startsWith(EVAL_KEY_PREFIX))
-        names.push(key.slice(EVAL_KEY_PREFIX.length));
-    }
-
-    return names
+    return etsNames()
       .map((cardName) => ({
         cardName,
         value: getCardEvalValueByName(cardName),
@@ -7054,7 +7389,7 @@ const MY_USERNAME = "xxx";
       entries: collectTopEvals().map(({ cardName, value }) => ({
         cardName,
         valueText: formatEvalValue(String(value)),
-        onClear: () => localStorage.removeItem(`${EVAL_KEY_PREFIX}${cardName}`),
+        onClear: () => etsRemove(cardName),
       })),
     });
   }
@@ -7812,7 +8147,7 @@ const MY_USERNAME = "xxx";
   // ============================================================
   // Rule 38: on /collection, a toggle button is appended right after Rule 35's "Top 40" button (.wm-top-evals-btn,
   // or at the end of the heading when that rule is off). While on, every card of the page that has no eval gets a
-  // light red halo. "No eval" means no "eval-{name}" localStorage entry (Feature ETS): a stored "?" is an eval and
+  // light red halo. "No eval" means no stored estimate (Feature ETS): a stored "?" is an eval and
   // does not count. Cards are re-flagged (debounced) on every DOM mutation, since evals get recorded as cards are
   // opened; the halo itself is driven by a body attribute, so flipping the toggle needs no re-scan. The toggle
   // state is persisted in localStorage under "wm-no-eval-halo".
@@ -7841,7 +8176,7 @@ const MY_USERNAME = "xxx";
       const cardName = card.querySelector("h3")?.textContent.trim();
       if (!cardName) return;
 
-      const hasEval = !!localStorage.getItem(`eval-${cardName}`);
+      const hasEval = !!etsGet(cardName);
       card.classList.toggle("wm-no-eval-card", !hasEval);
     });
   }
@@ -9841,7 +10176,7 @@ const MY_USERNAME = "xxx";
   // own classes, deliberately not the site's "flex-wrap gap-2" ones, which other features use to find the
   // collection's own filter bar. A card whose rarity is unknown (never seen on /collection) has no tint and is
   // hidden by any active filter. The filter is kept in memory only. A 🗑 button on each row removes that card
-  // from the cache — for a card that was sold or traded: its "eval-{name}" estimate and its saved rarity are
+  // from the cache — for a card that was sold or traded: its whole record (estimate, date, rarity and tags) is
   // deleted, the row leaves the list (the following ones move up) and the stale estimate tag is taken off the
   // matching card of the collection grid. A bar under the header then offers an "Annuler" button that puts back
   // the last removed card (until another one is removed or the drawer is closed). The header has a refresh
@@ -9916,21 +10251,27 @@ const MY_USERNAME = "xxx";
     return `var(--color-rarity-${code.toLowerCase()})`;
   }
 
+  // When an estimate was last seen, for a tooltip: "Estimée le 10/11/2026 à 14:32 (il y a 3 j)"
+  function formatEstimationAge(at) {
+    if (at === null) return "Date d'estimation inconnue";
+    const days = Math.floor((Date.now() - at) / 86400000);
+    const ago =
+      days >= 1 ? `il y a ${days} j` : "il y a moins d'un jour";
+    return `Estimée le ${new Date(at).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })} (${ago})`;
+  }
+
   // Every cached estimate that is a genuine number, most valuable first (ties by name, so pages stay stable)
   function collectAllEvals() {
     const entries = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (!key || !key.startsWith(EVAL_KEY_PREFIX)) continue;
-
-      const cardName = key.slice(EVAL_KEY_PREFIX.length);
+    for (const cardName of etsNames()) {
       const value = getCardEvalValueByName(cardName);
       if (value !== null) {
         entries.push({
           cardName,
           value,
-          rarity: localStorage.getItem(`${RARITY_KEY_PREFIX}${cardName}`),
+          rarity: etsGetRarity(cardName),
           tags: readCardTags(cardName),
+          at: etsGetDate(cardName),
         });
       }
     }
@@ -9940,21 +10281,11 @@ const MY_USERNAME = "xxx";
     );
   }
 
-  // Deletes a card's cached estimate and rarity, returning what was there so that it can be put back
+  // Deletes a card's record (estimate, date, rarity and tags), returning what was there so that it can be put back
   function removeCardFromCache(cardName) {
-    const evalKey = `${EVAL_KEY_PREFIX}${cardName}`;
-    const rarityKey = `${RARITY_KEY_PREFIX}${cardName}`;
-    const tagsKey = `${TAGS_KEY_PREFIX}${cardName}`;
-    const removed = {
-      cardName,
-      value: localStorage.getItem(evalKey),
-      rarity: localStorage.getItem(rarityKey),
-      tagsRaw: localStorage.getItem(tagsKey),
-    };
+    const removed = { cardName, snapshot: etsSnapshot(cardName) };
 
-    localStorage.removeItem(evalKey);
-    localStorage.removeItem(rarityKey);
-    localStorage.removeItem(tagsKey);
+    etsRemove(cardName);
 
     // The estimate shown on the card's rarity tag would otherwise stay until the grid is re-rendered
     getAllCollectionCards()?.forEach((card) => {
@@ -9967,16 +10298,8 @@ const MY_USERNAME = "xxx";
     return removed;
   }
 
-  function restoreCardToCache({ cardName, value, rarity, tagsRaw }) {
-    if (value !== null) {
-      localStorage.setItem(`${EVAL_KEY_PREFIX}${cardName}`, value);
-    }
-    if (rarity !== null) {
-      localStorage.setItem(`${RARITY_KEY_PREFIX}${cardName}`, rarity);
-    }
-    if (tagsRaw !== null) {
-      localStorage.setItem(`${TAGS_KEY_PREFIX}${cardName}`, tagsRaw);
-    }
+  function restoreCardToCache({ cardName, snapshot }) {
+    etsRestore(cardName, snapshot);
     appendEvalToRarityTags();
   }
 
@@ -10299,6 +10622,7 @@ const MY_USERNAME = "xxx";
       value.textContent = entry.value.toLocaleString("fr-FR", {
         maximumFractionDigits: 2,
       });
+      value.title = formatEstimationAge(entry.at);
 
       const searchBtn = document.createElement("button");
       searchBtn.type = "button";
@@ -14187,7 +14511,9 @@ const MY_USERNAME = "xxx";
   // ============================================================
   // Init
   // ============================================================
-  function main() {
+  async function main() {
+    // Every reader of the estimates is synchronous: they are loaded in memory before any feature starts
+    await etsLoad();
     const flags = readFeatureFlags();
     const run = (id, fn) => {
       if (flags[id]) fn();

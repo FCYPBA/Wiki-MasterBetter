@@ -61,7 +61,7 @@ Je ne liste que celles qui change quelque chose de significatif pour l'utilisate
 
 - **Actions rapides** : Un bouton pour ouvrir directement la modale d'enchère sur chaque carte
 - **Tout sélectionner sauf étiquetées** : Sélectionne en un clic toutes les cartes non étiquetées de votre écran de collection
-- **Estimations mémorisées** : Les estimations du marché dans la modale de vente sont mémorisées et affichées à côté de la rareté dans votre collection
+- **Estimations mémorisées** : Les estimations du marché dans la modale de vente sont mémorisées et affichées à côté de la rareté dans votre collection. Elles sont conservées dans IndexedDB (et non dans le `localStorage`, limité à environ 5 Mo), avec la rareté, les étiquettes et la date de l'estimation de chaque carte ; ce qui était déjà enregistré est déplacé automatiquement au premier lancement
 - **Évaluation en masse** : Deux boutons permettent d'agir sur les cartes de la page via la modale d'estimation — évaluer les seules cartes sans estimation, réévaluer toute la page ; un bouton « Arrêter la reconnaissance » permet d'interrompre une évaluation en cours
 - **Estimation en masse sur une collection** : Le bouton rouge « Estimation complète » répète l'évaluation des cartes sans estimation sur chaque page de la collection, en changeant de page automatiquement ; son libellé indique une durée minimale en minutes, d'après le nombre de pages restantes
   - ⚠️ Pour ces deux évaluations en masse, gardez l'onglet actif et la fenêtre non réduite pendant toute la durée : en arrière-plan, le navigateur ralentit les temporisations dont elles dépendent, ce qui les rend peu fiables
