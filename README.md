@@ -119,6 +119,9 @@ Je ne liste que celles qui change quelque chose de significatif pour l'utilisate
 - **Heure de fin estimée** : Quand il reste plus d'une heure à une enchère, une heure de fin estimée (« ≈ 18:42 », « ≈ demain 02:15 »…) s'affiche sous sa durée dans la liste du marché, et à côté du compte à rebours sur la page de l'enchère
   - Le site ne donnant la durée restante qu'à la minute près, c'est une estimation, qui reste stable pendant que le compte à rebours avance
   - Elle disparaît quand il reste moins d'une heure ou une fois l'enchère terminée ; le survol donne la date complète
+- **Récapitulatif des estimations** : En bas du menu de gauche, le nombre de cartes dont une estimation est gardée, et combien datent de plus de 15 jours (en orange : celles à ré-estimer)
+  - Les estimations enregistrées avant que les dates ne soient conservées sont comptées à part (« sans date connue »)
+  - Menu replié, seule l'icône 🕒 s'affiche (orange s'il y a des estimations anciennes) ; le survol donne les chiffres
 
 ### 📊 Tableau de bord des enchères
 

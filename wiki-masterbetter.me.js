@@ -3642,12 +3642,35 @@ const MY_USERNAME = "xxx";
     }
   }
 
+  // Whoever displays the estimates in aggregate (Feature ESR) is told, once per burst of changes, that they moved
+  const etsListeners = new Set();
+  let etsNotifyId = null;
+
+  function etsOnChange(listener) {
+    etsListeners.add(listener);
+  }
+
+  function etsNotify() {
+    if (etsNotifyId !== null) return;
+    etsNotifyId = setTimeout(() => {
+      etsNotifyId = null;
+      etsListeners.forEach((listener) => {
+        try {
+          listener();
+        } catch (error) {
+          console.error("[WMB-ETS]", error);
+        }
+      });
+    }, 250);
+  }
+
   if (etsChannel) {
     etsChannel.onmessage = (event) => {
       const { name, record } = event.data ?? {};
       if (typeof name !== "string") return;
       if (record) etsRecords.set(name, etsNormalize(record));
       else etsRecords.delete(name);
+      etsNotify();
     };
   }
 
@@ -3671,6 +3694,7 @@ const MY_USERNAME = "xxx";
   function etsQueueWrite(name) {
     const record = etsRecords.get(name) ?? null;
     etsChannel?.postMessage({ name, record });
+    etsNotify();
     etsWrites = etsWrites
       .then(async () => {
         if (!etsUsesDb) {
@@ -4301,6 +4325,10 @@ const MY_USERNAME = "xxx";
       id: "feature-eta",
       label: "Heure de fin estimée des enchères qui ont encore plus d'une heure à courir (liste et page d'enchère)",
     },
+    {
+      id: "feature-esr",
+      label: "Récapitulatif des estimations en bas du menu de gauche (nombre de cartes estimées, dont celles de plus de 15 jours)",
+    },
   ];
 
   function readFeatureFlags() {
@@ -4747,6 +4775,10 @@ const MY_USERNAME = "xxx";
     {
       title: "Heure de fin estimée des enchères",
       text: "Quand il reste plus d'une heure à une enchère, une heure de fin estimée (« ≈ 18:42 », « ≈ demain 02:15 », « ≈ sam. 02:15 »…) s'affiche sous sa durée dans la liste du marché, et à côté du compte à rebours sur la page de l'enchère ; le survol donne la date complète. Le site n'indiquant la durée restante qu'à la minute près, l'heure est une estimation. Elle disparaît quand il reste moins d'une heure.",
+    },
+    {
+      title: "Récapitulatif des estimations",
+      text: "En bas de la barre de menu à gauche, le nombre de cartes dont le script garde une estimation, et combien datent de plus de 15 jours (en orange : ce sont celles à ré-estimer) ; les estimations enregistrées avant que le script ne note les dates sont comptées à part (« sans date connue »). Quand la barre est repliée, seule l'icône 🕒 s'affiche (orange s'il y a des estimations anciennes) ; survolez-la pour les chiffres.",
     },
   ];
 
@@ -14509,6 +14541,134 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Feature ESR: at the bottom of the left menu, a recap of the card estimates kept by Feature ETS: how many cards
+  // have an estimate, how many of those were last seen more than ESR_STALE_DAYS days ago (those worth estimating
+  // again), and how many have no known date (estimates saved before dates were kept). Folded, the menu shows only an
+  // icon (amber when some estimates are stale; the tooltip gives the figures); expanded, the figures in text.
+  // The "?" placeholder (no sale to estimate from) is not an estimate and is not counted.
+  // ============================================================
+  const ESR_STALE_DAYS = 15;
+
+  function computeEstimationRecap() {
+    const staleBefore = Date.now() - ESR_STALE_DAYS * 86400000;
+    let total = 0;
+    let stale = 0;
+    let undated = 0;
+    for (const cardName of etsNames()) {
+      if (getCardEvalValueByName(cardName) === null) continue;
+      total++;
+      const at = etsGetDate(cardName);
+      if (at === null) undated++;
+      else if (at < staleBefore) stale++;
+    }
+    return { total, stale, undated };
+  }
+
+  function renderEstimationRecap(block) {
+    const { total, stale, undated } = computeEstimationRecap();
+    const plural = (n, one, many) => (n > 1 ? many : one);
+
+    const lines = [
+      `${total.toLocaleString("fr-FR")} ${plural(total, "carte estimée", "cartes estimées")}`,
+      stale > 0
+        ? `dont ${stale.toLocaleString("fr-FR")} de plus de ${ESR_STALE_DAYS} j`
+        : `aucune de plus de ${ESR_STALE_DAYS} j`,
+    ];
+    if (undated > 0) {
+      lines.push(
+        `${undated.toLocaleString("fr-FR")} sans date connue`,
+      );
+    }
+
+    const text = block.querySelector(".wm-esr-text");
+    const summary = lines.join(" · ");
+    // Only touched when it changed, to not feed the observers
+    if (block.dataset.summary === summary && block.dataset.stale === String(stale > 0)) return;
+    block.dataset.summary = summary;
+    block.dataset.stale = String(stale > 0);
+    block.title = `Estimations enregistrées : ${summary}`;
+    text.replaceChildren(
+      ...lines.map((line, index) => {
+        const row = document.createElement("div");
+        row.className =
+          index === 1 && stale > 0 ? "wm-esr-line wm-esr-stale" : "wm-esr-line";
+        row.textContent = line;
+        return row;
+      }),
+    );
+  }
+
+  function ensureEstimationRecap() {
+    const nav = document.querySelector("nav h1")?.closest("nav");
+    if (!nav) return;
+
+    let block = nav.querySelector(":scope > .wm-esr");
+    if (!block) {
+      block = document.createElement("div");
+      block.className = "wm-esr";
+      const icon = document.createElement("span");
+      icon.className = "wm-esr-icon";
+      icon.textContent = "🕒";
+      const text = document.createElement("div");
+      text.className = "wm-esr-text";
+      block.append(icon, text);
+      nav.appendChild(block);
+    } else if (block !== nav.lastElementChild) {
+      nav.appendChild(block);
+    }
+    renderEstimationRecap(block);
+  }
+
+  function watchEstimationRecap() {
+    GM_addStyle(`
+      .wm-esr {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin-top: auto;
+        padding: 0.75rem;
+        border-top: 1px solid var(--color-border);
+        font-size: 0.75rem;
+        line-height: 1.35;
+        color: var(--color-foreground);
+        cursor: default;
+      }
+      .wm-esr-icon {
+        flex-shrink: 0;
+        width: 1.5rem;
+        text-align: center;
+        font-size: 1.1rem;
+        opacity: 0.6;
+      }
+      .wm-esr[data-stale="true"] .wm-esr-icon {
+        opacity: 1;
+        filter: sepia(1) saturate(4) hue-rotate(-10deg);
+      }
+      .wm-esr-text {
+        min-width: 0;
+        white-space: nowrap;
+        opacity: 0.75;
+      }
+      .wm-esr-stale {
+        color: #f59e0b;
+        font-weight: 600;
+      }
+      .wm-sidebar:not(:hover):not(.wm-sidebar-pinned) .wm-esr-text {
+        display: none;
+      }
+    `);
+
+    ensureEstimationRecap();
+    etsOnChange(ensureEstimationRecap);
+    // Estimates grow old by themselves
+    setInterval(ensureEstimationRecap, 10 * 60 * 1000);
+    new MutationObserver(ensureEstimationRecap).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
   async function main() {
@@ -14610,6 +14770,7 @@ const MY_USERNAME = "xxx";
     run("feature-mlm", watchMarketplaceList);
     run("feature-awl", watchAuctionWatchlist);
     run("feature-eta", watchEndEstimates);
+    run("feature-esr", watchEstimationRecap);
 
     watchFeatureConfigButton();
     watchTutorialButton();
