@@ -11,6 +11,8 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_notification
+// @grant        GM_xmlhttpRequest
+// @connect      workers.dev
 // @grant        unsafeWindow
 // @require      https://cdn.jsdelivr.net/npm/html-to-image@1.11.11/dist/html-to-image.js
 // ==/UserScript==
@@ -4754,7 +4756,7 @@ const MY_USERNAME = "xxx";
     },
     {
       title: "Archiver des enchères en direct",
-      text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau), et/ou cochez « Légendaires » pour archiver toutes les enchères de cartes Légendaires sans terme : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée, avec le détail des mises. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON, et un export JSON se réimporte (« Importer (JSON) ») pour transférer l'archive vers un autre navigateur ou ordinateur : les enchères sont fusionnées, rien n'est supprimé ; « Compacter » supprime le détail des mises des enchères de plus de 30 jours pour gagner de la place.",
+      text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau), et/ou cochez « Légendaires » pour archiver toutes les enchères de cartes Légendaires sans terme : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée, avec le détail des mises. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON, et un export JSON se réimporte (« Importer (JSON) ») pour transférer l'archive vers un autre navigateur ou ordinateur : les enchères sont fusionnées, rien n'est supprimé ; « Compacter » supprime le détail des mises des enchères de plus de 30 jours pour gagner de la place. Pour garder l'archive à l'abri (ou la transférer d'un navigateur à l'autre), la section « Export Cloudflare » l'envoie chaque jour vers votre propre espace Cloudflare (mise en place dans le dossier cloudflare/ du dépôt), et « Importer depuis Cloudflare » la récupère.",
     },
     {
       title: "Historique des prix d'une carte",
@@ -11067,6 +11069,9 @@ const MY_USERNAME = "xxx";
   // upgrade, and aarBackfill re-fetches them in the background, newest first, AAR_BACKFILL_PER_TICK per pass,
   // after the regular resolutions.
   //
+  // The archive can also be sent on its own, once or twice a day, to the user's own Cloudflare Worker (the modal's
+  // "Export Cloudflare" section; see "Cloud export" below and cloudflare/README.md).
+  //
   // A ribbon with a checkbox ("Légendaires", localStorage "wm-auction-archive-legendary") adds one more source to
   // the discovery: GET /api/marketplace?page=N&limit=50&sort=recent&rarity=L, crawled exactly like a term (same stop
   // rule) and stored in the records' "terms" under the label AAR_LEGENDARY_LABEL ("rarity:L"). It works with no term.
@@ -11320,9 +11325,15 @@ const MY_USERNAME = "xxx";
     });
   }
 
+  // Every write of the crawler stamps the record's "updatedAt": the automatic export (Feature AAR, cloud) sends
+  // only what changed since its last run
   function aarPutMany(records) {
+    const now = Date.now();
     return aarRun("readwrite", (store) => {
-      records.forEach((record) => store.put(record));
+      records.forEach((record) => {
+        record.updatedAt = now;
+        store.put(record);
+      });
     });
   }
 
@@ -11802,9 +11813,10 @@ const MY_USERNAME = "xxx";
     }
   }
 
-  // Two loops side by side in the leader tab, sharing only the request gate and the rate-limit pause
+  // Two loops side by side in the leader tab, sharing only the request gate and the rate-limit pause (plus a third,
+  // light one that decides when the automatic cloud export is due)
   function aarRunLoop() {
-    return Promise.all([aarDiscoverLoop(), aarResolveLoop()]);
+    return Promise.all([aarDiscoverLoop(), aarResolveLoop(), aarCloudLoop()]);
   }
 
   // ---- Export ----
@@ -11970,8 +11982,12 @@ const MY_USERNAME = "xxx";
     });
   }
 
-  async function importAuctionArchive(file) {
-    const total = { added: 0, updated: 0, kept: 0, invalid: 0 };
+  // file: a Blob (the export file, or a downloaded chunk when gzip is true); total: where the counts accumulate, so
+  // several chunks can be imported one after the other
+  async function importAuctionArchive(
+    file,
+    { gzip = false, total = { added: 0, updated: 0, kept: 0, invalid: 0 } } = {},
+  ) {
     let batch = new Map();
 
     const flush = async () => {
@@ -12007,7 +12023,10 @@ const MY_USERNAME = "xxx";
       if (batch.size >= AAR_EXPORT_CHUNK) await flush();
     };
 
-    const reader = file.stream().pipeThrough(new TextDecoderStream()).getReader();
+    const bytes = gzip
+      ? file.stream().pipeThrough(new DecompressionStream("gzip"))
+      : file.stream();
+    const reader = bytes.pipeThrough(new TextDecoderStream()).getReader();
     let rest = "";
     for (;;) {
       const { done, value } = await reader.read();
@@ -12052,6 +12071,221 @@ const MY_USERNAME = "xxx";
     });
 
     input.click();
+  }
+
+  // ---- Cloud export (Cloudflare Worker + R2, see cloudflare/README.md) ----
+  // Once enabled, the archive is sent to the user's own Worker at most every AAR_CLOUD_DEFAULT_HOURS hours (24 or
+  // 12): only the records that changed since the last successful export (the first export therefore sends it all),
+  // gzipped, as chunks of AAR_CLOUD_CHUNK records ("chunks/{date}-{n}.json.gz", the export JSON's own format). The
+  // Worker is a dumb pipe into R2; the script does the compressing. Importing lists the chunks and merges them all
+  // with the regular importer. Requests go through GM_xmlhttpRequest (no CORS, the Worker's host is in @connect).
+  // A record changed when its "updatedAt" (stamped by every crawler write) moved; an older record without it falls
+  // back on its last timestamp. The cursor is where the last run started, minus an overlap so that a write racing
+  // the scan is not missed; it only moves once every chunk was accepted. The URL, token and state are kept with
+  // GM_setValue (private to the script, unlike localStorage, which the site's own scripts can read).
+  const AAR_CLOUD_CONFIG_KEY = "wm-aar-cloud";
+  const AAR_CLOUD_STATE_KEY = "wm-aar-cloud-state";
+  const AAR_CLOUD_LOCK_NAME = "wmb-auction-archive-cloud-export";
+  const AAR_CLOUD_CHUNK = 10000;
+  const AAR_CLOUD_DEFAULT_HOURS = 24;
+  const AAR_CLOUD_CHECK_MS = 60 * 1000;
+  const AAR_CLOUD_RETRY_MS = 30 * 60 * 1000;
+  const AAR_CLOUD_OVERLAP_MS = 60 * 1000;
+  const AAR_CLOUD_TIMEOUT_MS = 5 * 60 * 1000;
+
+  function aarCloudConfig() {
+    const raw = GM_getValue(AAR_CLOUD_CONFIG_KEY, null);
+    const config = raw && typeof raw === "object" ? raw : {};
+    return {
+      url: String(config.url ?? "").trim().replace(/\/+$/, ""),
+      token: String(config.token ?? "").trim(),
+      enabled: config.enabled === true,
+      hours: config.hours === 12 ? 12 : AAR_CLOUD_DEFAULT_HOURS,
+    };
+  }
+
+  function aarCloudSaveConfig(config) {
+    GM_setValue(AAR_CLOUD_CONFIG_KEY, config);
+  }
+
+  function aarCloudState() {
+    const raw = GM_getValue(AAR_CLOUD_STATE_KEY, null);
+    return raw && typeof raw === "object" ? raw : {};
+  }
+
+  function aarCloudSetState(patch) {
+    GM_setValue(AAR_CLOUD_STATE_KEY, { ...aarCloudState(), ...patch });
+  }
+
+  function aarCloudReady(config) {
+    return /^https:\/\//i.test(config.url) && config.token.length > 0;
+  }
+
+  function aarCloudChangedAt(record) {
+    return (
+      record.updatedAt ??
+      Math.max(
+        record.lastSeenAt ?? 0,
+        record.resolvedAt ?? 0,
+        record.firstSeenAt ?? 0,
+      )
+    );
+  }
+
+  function aarCloudDue() {
+    const config = aarCloudConfig();
+    if (!config.enabled || !aarCloudReady(config)) return false;
+    const state = aarCloudState();
+    const now = Date.now();
+    return (
+      now - (state.lastExportAt ?? 0) >= config.hours * 3600 * 1000 &&
+      now - (state.lastAttemptAt ?? 0) >= AAR_CLOUD_RETRY_MS
+    );
+  }
+
+  // One request to the Worker; resolves with the GM response, rejects on a network error or a non-2xx status
+  function aarCloudRequest(config, method, path, { body, responseType } = {}) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method,
+        url: `${config.url}${path}`,
+        headers: {
+          Authorization: `Bearer ${config.token}`,
+          ...(body ? { "Content-Type": "application/octet-stream" } : {}),
+        },
+        data: body,
+        responseType: responseType ?? "text",
+        timeout: AAR_CLOUD_TIMEOUT_MS,
+        onload: (response) => {
+          if (response.status >= 200 && response.status < 300) {
+            resolve(response);
+          } else {
+            reject(
+              new Error(
+                response.status === 401
+                  ? "jeton refusé (HTTP 401)"
+                  : `HTTP ${response.status}`,
+              ),
+            );
+          }
+        },
+        onerror: () => reject(new Error("erreur réseau")),
+        ontimeout: () => reject(new Error("délai dépassé")),
+      });
+    });
+  }
+
+  function aarGzip(text) {
+    const stream = new Blob([text])
+      .stream()
+      .pipeThrough(new CompressionStream("gzip"));
+    return new Response(stream).blob();
+  }
+
+  async function aarCloudExportRun() {
+    const config = aarCloudConfig();
+    if (!aarCloudReady(config)) throw new Error("adresse ou jeton manquant");
+    const state = aarCloudState();
+    const startedAt = Date.now();
+    const since = state.cursor ?? 0;
+    const stamp = new Date(startedAt).toISOString().replace(/[:.]/g, "-");
+
+    aarCloudSetState({ lastAttemptAt: startedAt, running: true, sent: 0 });
+    let buffer = [];
+    let chunks = 0;
+    let records = 0;
+    const send = async () => {
+      if (buffer.length === 0) return;
+      const text = `[\n${buffer.map((record) => JSON.stringify(record)).join(",\n")}\n]\n`;
+      const blob = await aarGzip(text);
+      const name = `${stamp}-${String(++chunks).padStart(3, "0")}.json.gz`;
+      await aarCloudRequest(config, "PUT", `/chunks/${name}`, { body: blob });
+      records += buffer.length;
+      buffer = [];
+      aarCloudSetState({ sent: records });
+    };
+
+    try {
+      await aarForEachPage(async (page) => {
+        for (const record of page) {
+          if (aarCloudChangedAt(record) < since) continue;
+          buffer.push(record);
+          if (buffer.length >= AAR_CLOUD_CHUNK) await send();
+        }
+      });
+      await send();
+    } catch (error) {
+      aarCloudSetState({ running: false, lastError: String(error?.message ?? error) });
+      throw error;
+    }
+    aarCloudSetState({
+      running: false,
+      cursor: startedAt - AAR_CLOUD_OVERLAP_MS,
+      lastExportAt: Date.now(),
+      lastRecords: records,
+      lastChunks: chunks,
+      lastError: null,
+    });
+    return { records, chunks };
+  }
+
+  // Runs one export unless one is already running (in this tab or another: a Web Lock), resolving with its
+  // { records, chunks }, or null when it was skipped
+  function aarCloudExport() {
+    if (!navigator.locks?.request) return aarCloudExportRun();
+    return navigator.locks.request(
+      AAR_CLOUD_LOCK_NAME,
+      { ifAvailable: true },
+      (lock) => (lock ? aarCloudExportRun() : null),
+    );
+  }
+
+  async function aarCloudLoop() {
+    for (;;) {
+      await aarSleep(AAR_CLOUD_CHECK_MS);
+      if (!aarCloudDue()) continue;
+      try {
+        await aarCloudExport();
+      } catch (error) {
+        console.error("[WMB-AAR]", error);
+      }
+    }
+  }
+
+  // Lists the chunks of the bucket (the Worker gives up to 1000 names per call)
+  async function aarCloudListChunks(config) {
+    const names = [];
+    let cursor = null;
+    do {
+      const response = await aarCloudRequest(
+        config,
+        "GET",
+        `/chunks${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+      );
+      const page = JSON.parse(response.responseText);
+      names.push(...page.names.map((entry) => entry.name));
+      cursor = page.cursor ?? null;
+    } while (cursor);
+    return names.sort();
+  }
+
+  // Downloads every chunk and merges it into the archive; resolves with the import counts and the number of chunks
+  async function aarCloudImport(onProgress) {
+    const config = aarCloudConfig();
+    if (!aarCloudReady(config)) throw new Error("adresse ou jeton manquant");
+    const names = await aarCloudListChunks(config);
+    const total = { added: 0, updated: 0, kept: 0, invalid: 0 };
+    let done = 0;
+    for (const name of names) {
+      onProgress?.(done, names.length);
+      const response = await aarCloudRequest(config, "GET", `/chunks/${name}`, {
+        responseType: "blob",
+      });
+      await importAuctionArchive(response.response, { gzip: true, total });
+      done++;
+    }
+    onProgress?.(done, names.length);
+    return { ...total, chunks: names.length };
   }
 
   // ---- UI ----
@@ -12138,6 +12372,39 @@ const MY_USERNAME = "xxx";
         return row;
       }),
     );
+  }
+
+  function aarCloudStatusLines() {
+    const config = aarCloudConfig();
+    const state = aarCloudState();
+    const when = (time) => new Date(time).toLocaleString("fr-FR");
+    const lines = [];
+    if (!aarCloudReady(config)) {
+      lines.push("Non configuré : saisissez l'adresse du Worker (https://…) et le jeton.");
+    } else if (state.running) {
+      lines.push(
+        `Export en cours : ${state.sent ?? 0} enchère(s) envoyée(s)…`,
+      );
+    } else if (state.lastExportAt) {
+      lines.push(
+        `Dernier export : ${when(state.lastExportAt)} · ${state.lastRecords ?? 0} enchère(s) en ${state.lastChunks ?? 0} morceau(x)`,
+      );
+      if (config.enabled) {
+        const next = Math.max(
+          state.lastExportAt + config.hours * 3600 * 1000,
+          Date.now(),
+        );
+        lines.push(`Prochain export : ${when(next)}`);
+      }
+    } else if (config.enabled) {
+      lines.push(
+        "Premier export (toute l'archive) : dans la minute qui suit, un onglet wiki-masters.com ouvert.",
+      );
+    } else {
+      lines.push("Export automatique désactivé.");
+    }
+    if (state.lastError) lines.push(`Dernière erreur : ${state.lastError}`);
+    return lines;
   }
 
   function buildAuctionArchiveModal() {
@@ -12285,11 +12552,153 @@ const MY_USERNAME = "xxx";
       }),
     );
 
-    modal.append(header, hint, termsRow, legendaryRibbon, statusBox, actions);
+    // Automatic export to the user's own Cloudflare Worker (see the cloud export notes above)
+    const cloudBox = document.createElement("div");
+    cloudBox.className = "wm-aar-cloud";
+
+    const cloudTitle = document.createElement("strong");
+    cloudTitle.textContent = "Export Cloudflare";
+
+    const cloudHint = document.createElement("p");
+    cloudHint.className = "wm-settings-hint";
+    cloudHint.textContent =
+      "Envoie les enchères nouvelles ou modifiées vers votre Worker Cloudflare (mise en place : dossier cloudflare/ du dépôt), tant qu'un onglet wiki-masters.com reste ouvert.";
+
+    const cloudConfig = aarCloudConfig();
+    const cloudRow = document.createElement("div");
+    cloudRow.className = "wm-aar-row";
+    const urlInput = document.createElement("input");
+    urlInput.type = "url";
+    urlInput.className = "wm-aar-input";
+    urlInput.placeholder = "https://wmb-archive.votre-compte.workers.dev";
+    urlInput.value = cloudConfig.url;
+    const tokenInput = document.createElement("input");
+    tokenInput.type = "password";
+    tokenInput.className = "wm-aar-input";
+    tokenInput.placeholder = "Jeton";
+    tokenInput.autocomplete = "off";
+    tokenInput.value = cloudConfig.token;
+    cloudRow.append(urlInput, tokenInput);
+
+    const cloudOptions = document.createElement("div");
+    cloudOptions.className = "wm-aar-row";
+    const enabledLabel = document.createElement("label");
+    enabledLabel.className = "wm-aar-ribbon";
+    const enabledToggle = document.createElement("input");
+    enabledToggle.type = "checkbox";
+    enabledToggle.checked = cloudConfig.enabled;
+    const enabledText = document.createElement("span");
+    enabledText.textContent = "Export automatique, toutes les";
+    const hoursSelect = document.createElement("select");
+    hoursSelect.className = "wm-aar-input";
+    hoursSelect.style.flex = "0 0 auto";
+    [24, 12].forEach((hours) => {
+      const option = document.createElement("option");
+      option.value = String(hours);
+      option.textContent = `${hours} h`;
+      option.selected = cloudConfig.hours === hours;
+      hoursSelect.appendChild(option);
+    });
+    enabledLabel.append(enabledToggle, enabledText, hoursSelect);
+
+    const cloudStatus = document.createElement("div");
+    cloudStatus.className = "wm-aar-status";
+
+    const refreshCloud = () => {
+      cloudStatus.replaceChildren(
+        ...aarCloudStatusLines().map((line) => {
+          const row = document.createElement("div");
+          row.textContent = line;
+          return row;
+        }),
+      );
+    };
+    const saveCloud = () => {
+      const before = aarCloudConfig();
+      const next = {
+        url: urlInput.value.trim().replace(/\/+$/, ""),
+        token: tokenInput.value.trim(),
+        enabled: enabledToggle.checked,
+        hours: hoursSelect.value === "12" ? 12 : 24,
+      };
+      aarCloudSaveConfig(next);
+      // A new destination has none of the chunks yet: it gets the whole archive again
+      if (next.url !== before.url) {
+        aarCloudSetState({ cursor: 0, lastExportAt: 0, lastAttemptAt: 0, lastError: null });
+      }
+      refreshCloud();
+    };
+    const cloudSaveBtn = makeButton("Enregistrer", saveCloud);
+    const cloudNowBtn = makeButton("Exporter maintenant", async () => {
+      saveCloud();
+      cloudNowBtn.disabled = true;
+      try {
+        const result = await aarCloudExport();
+        GM_notification({
+          title: "Wiki-Masters",
+          text: result
+            ? `${result.records} enchère(s) envoyée(s) vers Cloudflare.`
+            : "Un export est déjà en cours.",
+          timeout: 5000,
+        });
+      } catch (error) {
+        console.error("[WMB-AAR]", error);
+        alert(`L'export vers Cloudflare a échoué : ${error?.message ?? error}`);
+      }
+      cloudNowBtn.disabled = false;
+      refreshCloud();
+    });
+    const cloudImportBtn = makeButton("Importer depuis Cloudflare", async () => {
+      saveCloud();
+      cloudImportBtn.disabled = true;
+      try {
+        const total = await aarCloudImport((done, count) => {
+          cloudImportBtn.textContent = `Import… ${done}/${count}`;
+        });
+        GM_notification({
+          title: "Wiki-Masters",
+          text: `Import Cloudflare terminé (${total.chunks} morceau(x)) : ${total.added} ajoutée(s), ${total.updated} mise(s) à jour, ${total.kept} déjà à jour.`,
+          timeout: 6000,
+        });
+      } catch (error) {
+        console.error("[WMB-AAR]", error);
+        alert(`L'import depuis Cloudflare a échoué : ${error?.message ?? error}`);
+      }
+      cloudImportBtn.textContent = "Importer depuis Cloudflare";
+      cloudImportBtn.disabled = false;
+      refresh();
+    });
+    const cloudActions = document.createElement("div");
+    cloudActions.className = "wm-aar-row";
+    cloudActions.append(cloudSaveBtn, cloudNowBtn, cloudImportBtn);
+
+    cloudBox.append(
+      cloudTitle,
+      cloudHint,
+      cloudRow,
+      cloudOptions,
+      cloudStatus,
+      cloudActions,
+    );
+    cloudOptions.appendChild(enabledLabel);
+    refreshCloud();
+
+    modal.append(
+      header,
+      hint,
+      termsRow,
+      legendaryRibbon,
+      statusBox,
+      actions,
+      cloudBox,
+    );
     overlay.appendChild(modal);
 
     refresh();
-    const refreshTimer = setInterval(refresh, 5000);
+    const refreshTimer = setInterval(() => {
+      refresh();
+      refreshCloud();
+    }, 5000);
 
     const onKeydown = (event) => {
       if (event.key === "Escape") close();
@@ -12417,6 +12826,11 @@ const MY_USERNAME = "xxx";
         height: 1rem;
         accent-color: #f59e0b;
         cursor: pointer;
+      }
+      .wm-aar-cloud {
+        margin-top: 0.75rem;
+        padding-top: 0.5rem;
+        border-top: 1px solid rgba(128, 128, 128, 0.4);
       }
       .wm-aar-status {
         margin: 0.5rem 0;
