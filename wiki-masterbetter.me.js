@@ -11,6 +11,8 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_notification
+// @grant        GM_xmlhttpRequest
+// @connect      workers.dev
 // @grant        unsafeWindow
 // @require      https://cdn.jsdelivr.net/npm/html-to-image@1.11.11/dist/html-to-image.js
 // ==/UserScript==
@@ -2538,7 +2540,7 @@ const MY_USERNAME = "xxx";
   // Feature BSP (cont'd) — seller's own sale: when the auction just sold ("Vendue") and the seller (p.text-sm.mt-1's
   // username) is MY_USERNAME, the tag instead grades how good a SALE it was — the mirror image of the buyer-facing
   // grading: a price above 120% of the reference value is an "excellente" sale, above 100% "agréable", above 80%
-  // "tolérable", below that "décevante". The reference here is the ETS eval price (localStorage "eval-{name}"),
+  // "tolérable", below that "décevante". The reference here is the ETS eval price (Feature ETS's store),
   // not the "observed-" BSP average: recordSoldBidPrice never logs the seller's own sales there (see its own
   // comment), so that cache is essentially always empty for a card you just sold. With no eval price cached
   // either, it falls back to the same "NEW ENTRY" (white) tag, worded for a sale instead.
@@ -2903,7 +2905,7 @@ const MY_USERNAME = "xxx";
   // ============================================================
   // Feature BSP (cont'd): on the user's own profile (/profile), dump every card's stored sold prices into a grid,
   // inserted as a sibling right after div.grid; each entry gets a "✕" button to clear its stored data. Next to
-  // "Vider le cache", an import/export pill copies/restores every "observed-"/"eval-" localStorage entry as JSON.
+  // "Vider le cache", an import/export pill copies/restores every "observed-"/"eval-" entry (the latter from Feature ETS's store) as CSV.
   // Entries are sorted by descending "Objectif" (trimmed average price); entries with no computable average sort last.
   // ============================================================
   function collectStoredBidPrices() {
@@ -2982,13 +2984,15 @@ const MY_USERNAME = "xxx";
   }
 
   // Feature BSP/ETS (cont'd): an import/export pill next to "Vider le cache" carries every "observed-" (Feature
-  // BSP) and "eval-" (Feature ETS) localStorage entry as a downloadable "key,value" CSV file, so that cache can be
+  // BSP) and "eval-" (Feature ETS, kept in IndexedDB) entry as a downloadable "key,value" CSV file, so that cache can be
   // moved to another browser/device. Values are carried as their raw stored strings (not re-parsed), since Feature
   // BSP's entries are JSON-encoded arrays while Feature ETS's are plain strings; both are CSV-quoted as needed.
   // Feature FOL's followed-users list is carried too, and so are the cards' base rarities ("wm-rarity-{name}", see
   // Feature ETS (cont'd)), which Feature EVL's drawer needs to tint and filter the estimates: without them a
   // freshly imported cache would show every card without its rarity until its collection page is displayed again.
-  // The cards' tags ("wm-tags-{name}") travel for the same reason (Feature EVL's tag filter).
+  // The cards' tags ("wm-tags-{name}") travel for the same reason (Feature EVL's tag filter), and so does the date
+  // of each estimate ("wm-evalat-{name}", ms since epoch). The estimates, rarities, tags and dates are read from
+  // (and, on import, merged into) Feature ETS's store rather than from localStorage, which they left.
   // Feature EVL's drawer offers the same Exporter / Importer buttons (the pill below only exists on /profile, and
   // only once some prices were observed, so it can't be used to restore a cache on a brand-new browser).
   const TAGGED_CACHE_PREFIXES = [BSP_KEY_PREFIX, "eval-"];
@@ -3001,6 +3005,7 @@ const MY_USERNAME = "xxx";
       key === FOLLOWED_USERS_KEY ||
       key.startsWith(RARITY_KEY_PREFIX) ||
       key.startsWith(TAGS_KEY_PREFIX) ||
+      key.startsWith(EVAL_AT_KEY_PREFIX) ||
       TAGGED_CACHE_PREFIXES.some((prefix) => key.startsWith(prefix))
     );
   }
@@ -3010,11 +3015,24 @@ const MY_USERNAME = "xxx";
 
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
-      if (!key || !isTaggedCacheKey(key)) continue;
+      // Estimates, dates, rarities and tags come from the Feature ETS store below, wherever it keeps them
+      if (
+        !key ||
+        !isTaggedCacheKey(key) ||
+        ETS_LEGACY_FIELDS.some(({ prefix }) => key.startsWith(prefix))
+      )
+        continue;
 
       const raw = localStorage.getItem(key);
       if (raw !== null) entries[key] = raw;
     }
+    etsRecords.forEach((record, name) => {
+      if (record.value !== null) entries[`${EVAL_KEY_PREFIX}${name}`] = record.value;
+      if (record.rarity !== null) entries[`${RARITY_KEY_PREFIX}${name}`] = record.rarity;
+      if (record.tags !== null)
+        entries[`${TAGS_KEY_PREFIX}${name}`] = record.tags.join(TAGS_SEPARATOR);
+      if (record.at !== null) entries[`${EVAL_AT_KEY_PREFIX}${name}`] = String(record.at);
+    });
 
     return entries;
   }
@@ -3116,9 +3134,15 @@ const MY_USERNAME = "xxx";
       if (!file) return;
 
       const reader = new FileReader();
-      reader.onload = () => {
+      reader.onload = async () => {
         const rows = parseCsvRows(String(reader.result ?? ""));
         let importedCount = 0;
+        // Pieces of the Feature ETS records, gathered per card and merged once the whole file is read
+        const patches = new Map();
+        const patchOf = (name) => {
+          if (!patches.has(name)) patches.set(name, {});
+          return patches.get(name);
+        };
 
         rows.forEach(([key, value]) => {
           if (typeof key !== "string" || typeof value !== "string") return;
@@ -3141,15 +3165,23 @@ const MY_USERNAME = "xxx";
             return;
           }
 
-          // A rarity is a short code ("UR"); anything else is not one of ours
-          if (key.startsWith(RARITY_KEY_PREFIX) && (!value || value.length > 20))
-            return;
-
-          if (key.startsWith(TAGS_KEY_PREFIX) && value.length > 2000) return;
-
-          localStorage.setItem(key, value);
+          const piece = ETS_LEGACY_FIELDS.find(({ prefix }) => key.startsWith(prefix));
+          if (piece) {
+            const name = key.slice(piece.prefix.length);
+            if (!name) return;
+            // A rarity is a short code ("UR"); anything else is not one of ours
+            if (piece.field === "rarity" && (!value || value.length > 20)) return;
+            if (piece.field === "tags" && value.length > 2000) return;
+            const parsed = piece.parse(value);
+            if (parsed === null) return;
+            patchOf(name)[piece.field] = parsed;
+          } else {
+            localStorage.setItem(key, value);
+          }
           importedCount++;
         });
+        patches.forEach((patch, name) => etsImport(name, patch));
+        await etsFlush();
 
         if (importedCount === 0) {
           alert("Le fichier n'est pas un export valide.");
@@ -3440,8 +3472,352 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
-  // Feature ETS: on /pulls and /collection, once span.tabular-nums appears, store its value in localStorage
-  // under "eval-{name}", name being the text content of p.truncate. If it's missing but div.mb-5 p.mt-1\.5 reads
+  // Feature ETS (storage): everything the script knows about a card of your collection lives in IndexedDB
+  // ("wmb-estimations", store "evals", keyPath "name"), not in localStorage: it is one record per card owned, and
+  // localStorage (about 5 MB for the whole site, shared with every other script) is too small for a collection that
+  // keeps growing. Same reasoning as Feature AAR's archive. A record is { name, value, rarity, tags, at }:
+  //  - value: the estimate as the site displays it (a number as text, e.g. "1250", or the "?" placeholder for a card
+  //    with no recorded sale); null for a card known by its rarity/tags only (an import, say);
+  //  - rarity: the card's base rarity ("UR"...) and tags: its tag names (array), both as seen on /collection (Feature
+  //    ETS (cont'd)); null while never seen. An empty tags array means "seen, no tag";
+  //  - at: when the estimate was last seen (ms since epoch); null when unknown (estimates saved before that date
+  //    existed, or imported without it). It is what an "old estimate" alert or an automatic re-estimation will read.
+  // The other per-card entries ("observed-" prices...) stay in localStorage, being small and expendable.
+  // Every reader of these is synchronous (the collection's grid, the sort, the polling of Feature EBC...), so the
+  // whole store is loaded in memory (etsRecords) before any feature starts (main awaits etsLoad), and the ets*
+  // readers read from it. Writes update the memory at once and queue the IndexedDB write behind the previous ones
+  // (etsFlush resolves when the queue is empty: awaited before a reload). Other tabs follow through a
+  // BroadcastChannel. On load, whatever still sits in localStorage — "eval-{name}" (estimate), "wm-rarity-{name}",
+  // "wm-tags-{name}" (tags joined by a tab) and "wm-evalat-{name}" — is moved to IndexedDB, then removed (which also
+  // frees its room); a value already in IndexedDB wins. Should IndexedDB be unavailable (blocked, private mode...),
+  // those four localStorage entries are the storage instead, as they used to be. Errors are logged in the browser
+  // console (lines starting with `[WMB-ETS]`).
+  // ============================================================
+  const EVAL_KEY_PREFIX = "eval-";
+  const RARITY_KEY_PREFIX = "wm-rarity-";
+  const TAGS_KEY_PREFIX = "wm-tags-";
+  const TAGS_SEPARATOR = "\t";
+  const EVAL_AT_KEY_PREFIX = "wm-evalat-";
+  const ETS_DB_NAME = "wmb-estimations";
+  const ETS_DB_VERSION = 1;
+  const ETS_STORE = "evals";
+  const ETS_CHANNEL_NAME = "wmb-estimations";
+  // An estimate seen again unchanged only has its date refreshed when the saved one is older than this (the card's
+  // modal is re-read on every page mutation)
+  const ETS_REFRESH_MS = 60 * 1000;
+  const etsRecords = new Map();
+  let etsDbPromise = null;
+  let etsUsesDb = false;
+  let etsWrites = Promise.resolve();
+  const etsChannel =
+    typeof BroadcastChannel === "function"
+      ? new BroadcastChannel(ETS_CHANNEL_NAME)
+      : null;
+
+  const etsBlank = () => ({ value: null, rarity: null, tags: null, at: null });
+
+  // A stored record, whatever its age (the first version held { name, value } only), as a clean in-memory one
+  function etsNormalize(record) {
+    return {
+      value: typeof record.value === "string" ? record.value : null,
+      rarity: typeof record.rarity === "string" ? record.rarity : null,
+      tags: Array.isArray(record.tags) ? record.tags : null,
+      at: Number.isFinite(record.at) ? record.at : null,
+    };
+  }
+
+  function etsOpenDb() {
+    if (!etsDbPromise) {
+      etsDbPromise = new Promise((resolve, reject) => {
+        if (!window.indexedDB) {
+          reject(new Error("IndexedDB unavailable"));
+          return;
+        }
+        const request = indexedDB.open(ETS_DB_NAME, ETS_DB_VERSION);
+        request.onupgradeneeded = () => {
+          request.result.createObjectStore(ETS_STORE, { keyPath: "name" });
+        };
+        request.onsuccess = () => {
+          const db = request.result;
+          db.onversionchange = () => {
+            db.close();
+            etsDbPromise = null;
+          };
+          resolve(db);
+        };
+        request.onerror = () => {
+          etsDbPromise = null;
+          reject(request.error);
+        };
+      });
+    }
+    return etsDbPromise;
+  }
+
+  // Runs work(store, setResult) in one transaction; resolves with what was passed to setResult once committed
+  async function etsRun(mode, work) {
+    const db = await etsOpenDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(ETS_STORE, mode);
+      let result;
+      tx.oncomplete = () => resolve(result);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error("transaction aborted"));
+      work(tx.objectStore(ETS_STORE), (value) => {
+        result = value;
+      });
+    });
+  }
+
+  // The localStorage keys of the four pieces a record is made of, and how to read each one back
+  const ETS_LEGACY_FIELDS = [
+    { prefix: EVAL_KEY_PREFIX, field: "value", parse: (raw) => raw },
+    { prefix: RARITY_KEY_PREFIX, field: "rarity", parse: (raw) => raw || null },
+    {
+      prefix: TAGS_KEY_PREFIX,
+      field: "tags",
+      parse: (raw) => (raw === "" ? [] : raw.split(TAGS_SEPARATOR)),
+    },
+    {
+      prefix: EVAL_AT_KEY_PREFIX,
+      field: "at",
+      parse: (raw) => (Number.isFinite(Number(raw)) && Number(raw) > 0 ? Number(raw) : null),
+    },
+  ];
+
+  // Every localStorage entry holding a piece of a record, as { key, name, field, value }
+  function etsLegacyEntries() {
+    const entries = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key) continue;
+      const kind = ETS_LEGACY_FIELDS.find(({ prefix }) => key.startsWith(prefix));
+      if (!kind) continue;
+      const raw = localStorage.getItem(key);
+      if (raw === null) continue;
+      entries.push({
+        key,
+        name: key.slice(kind.prefix.length),
+        field: kind.field,
+        value: kind.parse(raw),
+      });
+    }
+    return entries;
+  }
+
+  // Loads every record in memory, first moving the ones still in localStorage into IndexedDB. Never throws.
+  async function etsLoad() {
+    try {
+      const records = await etsRun("readonly", (store, out) => {
+        const request = store.getAll();
+        request.onsuccess = () => out(request.result);
+      });
+      records.forEach((record) => etsRecords.set(record.name, etsNormalize(record)));
+      etsUsesDb = true;
+    } catch (error) {
+      console.error("[WMB-ETS]", error);
+    }
+
+    const legacy = etsLegacyEntries();
+    if (legacy.length === 0) return;
+
+    // What localStorage brings, without replacing what IndexedDB already holds
+    const changed = new Set();
+    legacy.forEach(({ name, field, value }) => {
+      if (value === null) return;
+      const record = etsRecords.get(name) ?? etsBlank();
+      if (record[field] !== null) return;
+      record[field] = value;
+      etsRecords.set(name, record);
+      changed.add(name);
+    });
+    if (!etsUsesDb) return;
+
+    try {
+      await etsRun("readwrite", (store) => {
+        changed.forEach((name) => store.put({ name, ...etsRecords.get(name) }));
+      });
+      // Removed only now that everything is safely in IndexedDB
+      legacy.forEach(({ key }) => localStorage.removeItem(key));
+    } catch (error) {
+      console.error("[WMB-ETS] migration", error);
+    }
+  }
+
+  // Whoever displays the estimates in aggregate (Feature ESR) is told, once per burst of changes, that they moved
+  const etsListeners = new Set();
+  let etsNotifyId = null;
+
+  function etsOnChange(listener) {
+    etsListeners.add(listener);
+  }
+
+  function etsNotify() {
+    if (etsNotifyId !== null) return;
+    etsNotifyId = setTimeout(() => {
+      etsNotifyId = null;
+      etsListeners.forEach((listener) => {
+        try {
+          listener();
+        } catch (error) {
+          console.error("[WMB-ETS]", error);
+        }
+      });
+    }, 250);
+  }
+
+  if (etsChannel) {
+    etsChannel.onmessage = (event) => {
+      const { name, record } = event.data ?? {};
+      if (typeof name !== "string") return;
+      if (record) etsRecords.set(name, etsNormalize(record));
+      else etsRecords.delete(name);
+      etsNotify();
+    };
+  }
+
+  // The localStorage fallback: one entry per piece, absent when the piece is unknown
+  function etsPersistLegacy(name, record) {
+    ETS_LEGACY_FIELDS.forEach(({ prefix, field }) => {
+      const key = `${prefix}${name}`;
+      const piece = record?.[field] ?? null;
+      if (piece === null) {
+        localStorage.removeItem(key);
+      } else {
+        localStorage.setItem(
+          key,
+          field === "tags" ? piece.join(TAGS_SEPARATOR) : String(piece),
+        );
+      }
+    });
+  }
+
+  // Queues the write of the card's record as it is now (a missing record is deleted)
+  function etsQueueWrite(name) {
+    const record = etsRecords.get(name) ?? null;
+    etsChannel?.postMessage({ name, record });
+    etsNotify();
+    etsWrites = etsWrites
+      .then(async () => {
+        if (!etsUsesDb) {
+          etsPersistLegacy(name, record);
+          return;
+        }
+        await etsRun("readwrite", (store) => {
+          if (record) store.put({ name, ...record });
+          else store.delete(name);
+        });
+      })
+      .catch((error) => console.error("[WMB-ETS]", error));
+  }
+
+  function etsUpdate(name, patch) {
+    etsRecords.set(name, { ...(etsRecords.get(name) ?? etsBlank()), ...patch });
+    etsQueueWrite(name);
+  }
+
+  // The card's estimate as stored (a number as text, or "?"), null when there is none
+  function etsGet(cardName) {
+    return etsRecords.get(cardName)?.value ?? null;
+  }
+
+  // When the estimate was last seen (ms), null when there is none or when it is unknown
+  function etsGetDate(cardName) {
+    return etsRecords.get(cardName)?.at ?? null;
+  }
+
+  function etsGetRarity(cardName) {
+    return etsRecords.get(cardName)?.rarity ?? null;
+  }
+
+  function etsGetTags(cardName) {
+    return etsRecords.get(cardName)?.tags ?? null;
+  }
+
+  // Saves an estimate, dated now unless a date is given; the card's rarity and tags are kept
+  function etsSet(cardName, value, at = Date.now()) {
+    etsUpdate(cardName, { value, at });
+  }
+
+  // The estimate is seen again, unchanged: its date moves up to now (at most once per ETS_REFRESH_MS)
+  function etsTouch(cardName) {
+    const at = etsGetDate(cardName);
+    if (at !== null && Date.now() - at < ETS_REFRESH_MS) return;
+    etsUpdate(cardName, { at: Date.now() });
+  }
+
+  function etsSetRarity(cardName, rarity) {
+    if (etsGetRarity(cardName) === rarity) return;
+    etsUpdate(cardName, { rarity });
+  }
+
+  function etsSetTags(cardName, tags) {
+    const current = etsGetTags(cardName);
+    if (current && current.join(TAGS_SEPARATOR) === tags.join(TAGS_SEPARATOR))
+      return;
+    etsUpdate(cardName, { tags: [...tags] });
+  }
+
+  // Empties the estimate (value and date) but keeps the rarity and tags, returning what it was ({ value, at }, or
+  // null when there was none): Feature EBC clears an estimate to see its fresh one land, and puts it back if none does
+  function etsTake(cardName) {
+    const record = etsRecords.get(cardName);
+    if (!record || record.value === null) return null;
+    const taken = { value: record.value, at: record.at };
+    etsUpdate(cardName, { value: null, at: null });
+    return taken;
+  }
+
+  // The whole record (a copy), null when the card is unknown: what Feature EVL puts back after a removal
+  function etsSnapshot(cardName) {
+    const record = etsRecords.get(cardName);
+    return record ? { ...record } : null;
+  }
+
+  function etsRestore(cardName, snapshot) {
+    if (!snapshot) return;
+    etsRecords.set(cardName, { ...snapshot });
+    etsQueueWrite(cardName);
+  }
+
+  // Deletes the card's whole record
+  function etsRemove(cardName) {
+    if (!etsRecords.delete(cardName)) return;
+    etsQueueWrite(cardName);
+  }
+
+  // Names of the cards that have an estimate (the "?" placeholder included)
+  function etsNames() {
+    const names = [];
+    etsRecords.forEach((record, name) => {
+      if (record.value !== null) names.push(name);
+    });
+    return names;
+  }
+
+  // Merges what an import brings ({ value?, rarity?, tags?, at? }, pieces not given are left alone). A new value
+  // without a date has an unknown one, unless it is the very value already stored.
+  function etsImport(cardName, patch) {
+    const record = etsRecords.get(cardName) ?? etsBlank();
+    const next = { ...record };
+    for (const field of ["value", "rarity", "tags", "at"]) {
+      if (patch[field] !== undefined) next[field] = patch[field];
+    }
+    if (patch.at === undefined && patch.value !== undefined && patch.value !== record.value) {
+      next.at = null;
+    }
+    etsRecords.set(cardName, next);
+    etsQueueWrite(cardName);
+  }
+
+  // Resolves once every queued write has landed
+  function etsFlush() {
+    return etsWrites;
+  }
+
+  // ============================================================
+  // Feature ETS: on /pulls and /collection, once span.tabular-nums appears, store its value (see "Feature ETS
+  // (storage)" above: IndexedDB) under the card's name, name being the text content of p.truncate. If it's missing but div.mb-5 p.mt-1\.5 reads
   // "Aucune vente" (no sales recorded yet for that card), stores the "?" placeholder (UNKNOWN_EVAL_VALUE) instead
   // of leaving that card unrecorded. p.truncate's own text node is read directly (rather than its full
   // textContent) since Feature CNC prepends a 📋 button inside that same element — including it here would
@@ -3483,9 +3859,12 @@ const MY_USERNAME = "xxx";
     if (value === UNKNOWN_EVAL_VALUE && wasAutomationLimitedSince(Date.now() - 5000))
       return;
 
-    const key = `eval-${cardName}`;
-    const existingValue = localStorage.getItem(key);
-    if (existingValue === value) return;
+    const existingValue = etsGet(cardName);
+    if (existingValue === value) {
+      // Seen again as it was: the estimate is still current
+      etsTouch(cardName);
+      return;
+    }
     if (
       value === UNKNOWN_EVAL_VALUE &&
       existingValue !== null &&
@@ -3493,7 +3872,7 @@ const MY_USERNAME = "xxx";
     )
       return;
 
-    localStorage.setItem(key, value);
+    etsSet(cardName, value);
   }
 
   function watchTabularNumsRecording() {
@@ -3521,41 +3900,32 @@ const MY_USERNAME = "xxx";
   // "{rarity} ({eval})". The eval value is reformatted first: above 1000,
   // it's abbreviated to "{X,X} K" (French decimal comma); otherwise it's shown as stored — low values included —
   // as well as the "?" placeholder for a card with no recorded sales. While at it, the card's base rarity (the
-  // tag's text before our appendix) is saved under "wm-rarity-{name}" — only for cards that have an estimate, and
+  // tag's text before our appendix) is saved in the card's record (see "Feature ETS (storage)") — only for cards that have an estimate, and
   // only ever as seen on /collection — so that Feature EVL can show it; nothing else records it, hence a card
   // only gets one once its page of the collection has been displayed (Feature EBC's "Estimation complète" walks
   // them all). Part of the cache export (see TAGGED_CACHE_PREFIXES' comment).
   // ============================================================
-  const RARITY_KEY_PREFIX = "wm-rarity-";
-
   function recordCardRarity(cardName, rarity) {
     if (!rarity) return;
 
-    const key = `${RARITY_KEY_PREFIX}${cardName}`;
-    if (localStorage.getItem(key) !== rarity) localStorage.setItem(key, rarity);
+    etsSetRarity(cardName, rarity);
   }
 
   // Feature ETS (cont'd): the card's tags (étiquettes), read from the chips of its card in the grid
   // (div.flex-wrap.shrink-0 > span, text = emoji and name, e.g. "🛫Avions"), saved the same way and for the same
-  // cards as the rarity, under "wm-tags-{name}", for Feature EVL's tag filter. Stored as the tag names joined by a
-  // tab, never as a JSON array: an array (an empty one above all) would be taken by Feature BSP's legacy-key
-  // migration for a list of prices. The empty string means "seen, no tag"; a missing key means "never seen", which
-  // the filter must not mistake for "untagged". Refreshed every time the card is displayed, so re-tagging a card on
+  // cards as the rarity, in the same record, for Feature EVL's tag filter. An empty list means "seen, no tag"; null
+  // means "never seen", which the filter must not mistake for "untagged". (In the cache export and in the
+  // localStorage fallback they are "wm-tags-{name}" entries holding the tag names joined by a tab, never a JSON
+  // array: an array, an empty one above all, would be taken by Feature BSP's legacy-key migration for a list of
+  // prices.) Refreshed every time the card is displayed, so re-tagging a card on
   // the site is picked up. Part of the cache export.
-  const TAGS_KEY_PREFIX = "wm-tags-";
-  const TAGS_SEPARATOR = "\t";
-
   function recordCardTags(cardName, tags) {
-    const key = `${TAGS_KEY_PREFIX}${cardName}`;
-    const value = tags.join(TAGS_SEPARATOR);
-    if (localStorage.getItem(key) !== value) localStorage.setItem(key, value);
+    etsSetTags(cardName, tags);
   }
 
   // The card's saved tags, or null when they were never seen
   function readCardTags(cardName) {
-    const raw = localStorage.getItem(`${TAGS_KEY_PREFIX}${cardName}`);
-    if (raw === null) return null;
-    return raw === "" ? [] : raw.split(TAGS_SEPARATOR);
+    return etsGetTags(cardName);
   }
 
   function readCardTagChips(card) {
@@ -3588,7 +3958,7 @@ const MY_USERNAME = "xxx";
       if (!nameEl || !rarityEl) return;
 
       const cardName = nameEl.textContent.trim();
-      const evalValue = localStorage.getItem(`eval-${cardName}`);
+      const evalValue = etsGet(cardName);
       if (!cardName || !evalValue) return;
 
       const baseRarity =
@@ -3947,7 +4317,7 @@ const MY_USERNAME = "xxx";
     },
     {
       id: "feature-mlm",
-      label: "Liste des enchères : interrupteurs (mise de départ, atténuer / masquer les cartes possédées) et médiane des ventes (d'après l'archive) sur chaque carte",
+      label: "Liste des enchères : interrupteurs (mise de départ, atténuer / masquer les cartes possédées) et médiane des ventes (d'après l'archive) sur chaque carte, avec une teinte discrète sur les cartes dont la mise la dépasse (aussi sur la page d'une enchère)",
     },
     {
       id: "feature-awl",
@@ -3956,6 +4326,10 @@ const MY_USERNAME = "xxx";
     {
       id: "feature-eta",
       label: "Heure de fin estimée des enchères qui ont encore plus d'une heure à courir (liste et page d'enchère)",
+    },
+    {
+      id: "feature-esr",
+      label: "Récapitulatif des estimations en bas du menu de gauche (nombre de cartes estimées, dont celles de plus de 15 jours)",
     },
   ];
 
@@ -4382,7 +4756,7 @@ const MY_USERNAME = "xxx";
     },
     {
       title: "Archiver des enchères en direct",
-      text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau), et/ou cochez « Légendaires » pour archiver toutes les enchères de cartes Légendaires sans terme : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée, avec le détail des mises. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON, et un export JSON se réimporte (« Importer (JSON) ») pour transférer l'archive vers un autre navigateur ou ordinateur : les enchères sont fusionnées, rien n'est supprimé ; « Compacter » supprime le détail des mises des enchères de plus de 30 jours pour gagner de la place.",
+      text: "Le bouton 📦 du menu de gauche ouvre l'archive des enchères. Saisissez des termes de recherche (ex : avion, bateau), et/ou cochez « Légendaires » pour archiver toutes les enchères de cartes Légendaires sans terme : toutes les 5 minutes, les enchères correspondantes sont enregistrées dans votre navigateur, puis leur résultat (prix final, nombre d'enchères et d'enchérisseurs) est relevé une fois l'enchère terminée, avec le détail des mises. Un onglet wiki-masters.com doit rester ouvert (un seul onglet collecte à la fois). L'archive s'exporte en CSV ou en JSON, et un export JSON se réimporte (« Importer (JSON) ») pour transférer l'archive vers un autre navigateur ou ordinateur : les enchères sont fusionnées, rien n'est supprimé ; « Compacter » supprime le détail des mises des enchères de plus de 30 jours pour gagner de la place. Pour garder l'archive à l'abri (ou la transférer d'un navigateur à l'autre), la section « Export Cloudflare » l'envoie chaque jour vers votre propre espace Cloudflare (mise en place dans le dossier cloudflare/ du dépôt), et « Importer depuis Cloudflare » la récupère.",
     },
     {
       title: "Historique des prix d'une carte",
@@ -4394,7 +4768,7 @@ const MY_USERNAME = "xxx";
     },
     {
       title: "Liste des enchères : mises de départ et médiane",
-      text: "En haut du marché (onglet « Parcourir »), à côté du titre, trois interrupteurs (survolez-les pour le détail) : « Mise de départ » masque les cartes sur lesquelles quelqu'un a déjà enchéri (il ne reste que celles qui n'ont encore aucune mise) ; « Atténuer possédées » rend presque transparentes les cartes que vous possédez déjà ; « Masquer possédées » les retire de la liste. Ils suivent les cartes qui s'ajoutent avec « Charger la suite ». Sous chaque carte, une ligne « médiane … · n ventes » donne le prix médian des ventes de cette carte (même rareté) d'après votre archive des enchères (bouton 📦) ; rien ne s'affiche si la carte n'y a jamais été vendue.",
+      text: "En haut du marché (onglet « Parcourir »), à côté du titre, trois interrupteurs (survolez-les pour le détail) : « Mise de départ » masque les cartes sur lesquelles quelqu'un a déjà enchéri (il ne reste que celles qui n'ont encore aucune mise) ; « Atténuer possédées » rend presque transparentes les cartes que vous possédez déjà ; « Masquer possédées » les retire de la liste. Ils suivent les cartes qui s'ajoutent avec « Charger la suite ». Sous chaque carte, une ligne « médiane … · n ventes » donne le prix médian des ventes de cette carte (même rareté) d'après votre archive des enchères (bouton 📦) ; rien ne s'affiche si la carte n'y a jamais été vendue. Quand la mise affichée dépasse cette médiane, la carte devient discrète : elle s'estompe et se délave sous une légère teinte selon l'écart (jaune dès +1 %, orange dès +25 %, rouge dès +75 %, rouge foncé dès +150 %), pour que les cartes au bon prix ressortent par contraste ; il faut lire la carte pour connaître l'écart (survolez la ligne « médiane »). Elle reprend son aspect normal au survol ; aucune indication si la mise est au niveau de la médiane ou en dessous. Sur la page d'une enchère en cours, l'image de la carte reste intacte et le panneau de mise l'indique, bien visiblement : une ligne « ▲ +140 % au-dessus de la médiane… » en haut, et une bordure et un fond de la couleur du niveau.",
     },
     {
       title: "Suivi d'enchères",
@@ -4403,6 +4777,10 @@ const MY_USERNAME = "xxx";
     {
       title: "Heure de fin estimée des enchères",
       text: "Quand il reste plus d'une heure à une enchère, une heure de fin estimée (« ≈ 18:42 », « ≈ demain 02:15 », « ≈ sam. 02:15 »…) s'affiche sous sa durée dans la liste du marché, et à côté du compte à rebours sur la page de l'enchère ; le survol donne la date complète. Le site n'indiquant la durée restante qu'à la minute près, l'heure est une estimation. Elle disparaît quand il reste moins d'une heure.",
+    },
+    {
+      title: "Récapitulatif des estimations",
+      text: "En bas de la barre de menu à gauche, le nombre de cartes dont le script garde une estimation, et combien datent de plus de 15 jours (en orange : ce sont celles à ré-estimer) ; les estimations enregistrées avant que le script ne note les dates sont comptées à part (« sans date connue »). Quand la barre est repliée, seule l'icône 🕒 s'affiche (orange s'il y a des estimations anciennes) ; survolez-la pour les chiffres.",
     },
   ];
 
@@ -5319,8 +5697,7 @@ const MY_USERNAME = "xxx";
   // that count reaches 0 on the current page), and "Ordonner la page par prix" (reorders the grid by
   // each card's raw eval value, unknowns last). The two evaluation
   // buttons show a fixed "Arrêter la reconnaissance" button and, for each targeted card, click its
-  // .wm-quick-action button, wait for Feature ETS to record a fresh value under its "eval-{name}" localStorage
-  // key, then press Escape to close the modal before moving to the next card. The stop button cancels the run
+  // .wm-quick-action button, wait for Feature ETS to record a fresh value for the card, then press Escape to close the modal before moving to the next card. The stop button cancels the run
   // after the current card; the two evaluation buttons disable each other while either is running. Whenever a
   // native rarity filter button (button.px-3.py-1.transition-colors) shows up after "Ré-estimer la page" —
   // e.g. a new rarity tier's filter button getting appended past our own controls — it's moved back in front of
@@ -5474,13 +5851,13 @@ const MY_USERNAME = "xxx";
       const cardName = getCardName(card);
       if (!cardName || getCardLimitedAt(cardName) === null) return false;
 
-      const value = localStorage.getItem(`eval-${cardName}`);
+      const value = etsGet(cardName);
       return value === null || value === UNKNOWN_EVAL_VALUE;
     });
   }
 
-  // Resolves true once a fresh value lands under "eval-{cardName}" (the
-  // caller must have cleared that key beforehand so a stale value already
+  // Resolves true once a fresh value lands in the store for the card (the
+  // caller must have cleared it beforehand so a stale value already
   // present can't be mistaken for a freshly recorded one), or false if
   // stopped/timed out/rate-limited first (the caller tells the latter apart with wasAutomationLimitedSince)
   function waitForCardEvaluation(
@@ -5496,7 +5873,7 @@ const MY_USERNAME = "xxx";
           resolve(false);
           return;
         }
-        if (localStorage.getItem(`eval-${cardName}`) !== null) {
+        if (etsGet(cardName) !== null) {
           resolve(true);
           return;
         }
@@ -5605,9 +5982,9 @@ const MY_USERNAME = "xxx";
       const quickActionBtn = card.querySelector(".wm-quick-action");
       if (!cardName || !quickActionBtn) continue;
 
-      const key = `eval-${cardName}`;
-      const previousValue = localStorage.getItem(key);
-      localStorage.removeItem(key);
+      // The estimate (and its date) is emptied, the card's rarity and tags are kept
+      const previous = etsTake(cardName);
+      const previousValue = previous?.value ?? null;
 
       let limitedRetries = 0;
       let limited = false;
@@ -5631,7 +6008,7 @@ const MY_USERNAME = "xxx";
 
         if (wasAutomationLimitedSince(attemptStart)) {
           // Whatever the modal recorded meanwhile is not a real estimate
-          localStorage.removeItem(key);
+          etsTake(cardName);
           recorded = false;
           pressEscape();
 
@@ -5662,8 +6039,8 @@ const MY_USERNAME = "xxx";
           if (state.pacingMs < 500) state.pacingMs = 0;
         }
         clearCardLimited(cardName);
-      } else if (previousValue !== null) {
-        localStorage.setItem(key, previousValue);
+      } else if (previous) {
+        etsSet(cardName, previous.value, previous.at);
       }
 
       if (limited && (previousValue === null || previousValue === UNKNOWN_EVAL_VALUE)) {
@@ -5810,11 +6187,11 @@ const MY_USERNAME = "xxx";
     });
   }
 
-  // Reads a card's raw eval value straight from localStorage (not its
+  // Reads a card's raw eval value straight from the store (not its
   // formatted rarity-tag appendix, which loses precision to "X K"),
   // returning null when it's missing or the "?" unknown marker
   function getCardEvalValueByName(cardName) {
-    const raw = localStorage.getItem(`eval-${cardName}`);
+    const raw = etsGet(cardName);
     if (raw === null || raw === UNKNOWN_EVAL_VALUE) return null;
 
     const num = parseFloat(raw.replace(/\s/g, "").replace(",", "."));
@@ -6852,26 +7229,18 @@ const MY_USERNAME = "xxx";
 
   // ============================================================
   // Rule 35: on /collection, a "Top {TOP_LIMIT}" text button appended to the h1 inside div.gap-3.animate-fade-in-up
-  // (right after the heading's text) opens a modal listing the TOP_LIMIT (40) largest eval prices cached under
-  // "eval-{name}" (Feature ETS), as a 3-column grid sorted by descending value. Entries whose cached value is the
+  // (right after the heading's text) opens a modal listing the TOP_LIMIT (40) largest eval prices cached
+  // (Feature ETS), as a 3-column grid sorted by descending value. Entries whose cached value is the
   // "?" placeholder (or otherwise non-numeric) are left out. Each entry has a "✕" button that removes that eval
-  // from localStorage and grays the entry out, the same way the "✕" on /profile's sold-prices grid (Feature BSP)
+  // from the cache and grays the entry out, the same way the "✕" on /profile's sold-prices grid (Feature BSP)
   // does. The highest eval is pulled out of the grid and showcased above it with a golden pulsating glow
   // (wm-top-eval-glow). Reuses the settings modal's overlay/header/close styling (.wm-settings-*), fading in on open
   // (wm-top-evals-fade-in); closes on Escape, overlay click or its own close button.
   // ============================================================
   const TOP_LIMIT = 40;
-  const EVAL_KEY_PREFIX = "eval-";
 
   function collectTopEvals() {
-    const names = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (key && key.startsWith(EVAL_KEY_PREFIX))
-        names.push(key.slice(EVAL_KEY_PREFIX.length));
-    }
-
-    return names
+    return etsNames()
       .map((cardName) => ({
         cardName,
         value: getCardEvalValueByName(cardName),
@@ -7054,7 +7423,7 @@ const MY_USERNAME = "xxx";
       entries: collectTopEvals().map(({ cardName, value }) => ({
         cardName,
         valueText: formatEvalValue(String(value)),
-        onClear: () => localStorage.removeItem(`${EVAL_KEY_PREFIX}${cardName}`),
+        onClear: () => etsRemove(cardName),
       })),
     });
   }
@@ -7812,7 +8181,7 @@ const MY_USERNAME = "xxx";
   // ============================================================
   // Rule 38: on /collection, a toggle button is appended right after Rule 35's "Top 40" button (.wm-top-evals-btn,
   // or at the end of the heading when that rule is off). While on, every card of the page that has no eval gets a
-  // light red halo. "No eval" means no "eval-{name}" localStorage entry (Feature ETS): a stored "?" is an eval and
+  // light red halo. "No eval" means no stored estimate (Feature ETS): a stored "?" is an eval and
   // does not count. Cards are re-flagged (debounced) on every DOM mutation, since evals get recorded as cards are
   // opened; the halo itself is driven by a body attribute, so flipping the toggle needs no re-scan. The toggle
   // state is persisted in localStorage under "wm-no-eval-halo".
@@ -7841,7 +8210,7 @@ const MY_USERNAME = "xxx";
       const cardName = card.querySelector("h3")?.textContent.trim();
       if (!cardName) return;
 
-      const hasEval = !!localStorage.getItem(`eval-${cardName}`);
+      const hasEval = !!etsGet(cardName);
       card.classList.toggle("wm-no-eval-card", !hasEval);
     });
   }
@@ -9841,7 +10210,7 @@ const MY_USERNAME = "xxx";
   // own classes, deliberately not the site's "flex-wrap gap-2" ones, which other features use to find the
   // collection's own filter bar. A card whose rarity is unknown (never seen on /collection) has no tint and is
   // hidden by any active filter. The filter is kept in memory only. A 🗑 button on each row removes that card
-  // from the cache — for a card that was sold or traded: its "eval-{name}" estimate and its saved rarity are
+  // from the cache — for a card that was sold or traded: its whole record (estimate, date, rarity and tags) is
   // deleted, the row leaves the list (the following ones move up) and the stale estimate tag is taken off the
   // matching card of the collection grid. A bar under the header then offers an "Annuler" button that puts back
   // the last removed card (until another one is removed or the drawer is closed). The header has a refresh
@@ -9916,21 +10285,27 @@ const MY_USERNAME = "xxx";
     return `var(--color-rarity-${code.toLowerCase()})`;
   }
 
+  // When an estimate was last seen, for a tooltip: "Estimée le 10/11/2026 à 14:32 (il y a 3 j)"
+  function formatEstimationAge(at) {
+    if (at === null) return "Date d'estimation inconnue";
+    const days = Math.floor((Date.now() - at) / 86400000);
+    const ago =
+      days >= 1 ? `il y a ${days} j` : "il y a moins d'un jour";
+    return `Estimée le ${new Date(at).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })} (${ago})`;
+  }
+
   // Every cached estimate that is a genuine number, most valuable first (ties by name, so pages stay stable)
   function collectAllEvals() {
     const entries = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (!key || !key.startsWith(EVAL_KEY_PREFIX)) continue;
-
-      const cardName = key.slice(EVAL_KEY_PREFIX.length);
+    for (const cardName of etsNames()) {
       const value = getCardEvalValueByName(cardName);
       if (value !== null) {
         entries.push({
           cardName,
           value,
-          rarity: localStorage.getItem(`${RARITY_KEY_PREFIX}${cardName}`),
+          rarity: etsGetRarity(cardName),
           tags: readCardTags(cardName),
+          at: etsGetDate(cardName),
         });
       }
     }
@@ -9940,21 +10315,11 @@ const MY_USERNAME = "xxx";
     );
   }
 
-  // Deletes a card's cached estimate and rarity, returning what was there so that it can be put back
+  // Deletes a card's record (estimate, date, rarity and tags), returning what was there so that it can be put back
   function removeCardFromCache(cardName) {
-    const evalKey = `${EVAL_KEY_PREFIX}${cardName}`;
-    const rarityKey = `${RARITY_KEY_PREFIX}${cardName}`;
-    const tagsKey = `${TAGS_KEY_PREFIX}${cardName}`;
-    const removed = {
-      cardName,
-      value: localStorage.getItem(evalKey),
-      rarity: localStorage.getItem(rarityKey),
-      tagsRaw: localStorage.getItem(tagsKey),
-    };
+    const removed = { cardName, snapshot: etsSnapshot(cardName) };
 
-    localStorage.removeItem(evalKey);
-    localStorage.removeItem(rarityKey);
-    localStorage.removeItem(tagsKey);
+    etsRemove(cardName);
 
     // The estimate shown on the card's rarity tag would otherwise stay until the grid is re-rendered
     getAllCollectionCards()?.forEach((card) => {
@@ -9967,16 +10332,8 @@ const MY_USERNAME = "xxx";
     return removed;
   }
 
-  function restoreCardToCache({ cardName, value, rarity, tagsRaw }) {
-    if (value !== null) {
-      localStorage.setItem(`${EVAL_KEY_PREFIX}${cardName}`, value);
-    }
-    if (rarity !== null) {
-      localStorage.setItem(`${RARITY_KEY_PREFIX}${cardName}`, rarity);
-    }
-    if (tagsRaw !== null) {
-      localStorage.setItem(`${TAGS_KEY_PREFIX}${cardName}`, tagsRaw);
-    }
+  function restoreCardToCache({ cardName, snapshot }) {
+    etsRestore(cardName, snapshot);
     appendEvalToRarityTags();
   }
 
@@ -10299,6 +10656,7 @@ const MY_USERNAME = "xxx";
       value.textContent = entry.value.toLocaleString("fr-FR", {
         maximumFractionDigits: 2,
       });
+      value.title = formatEstimationAge(entry.at);
 
       const searchBtn = document.createElement("button");
       searchBtn.type = "button";
@@ -10711,6 +11069,9 @@ const MY_USERNAME = "xxx";
   // upgrade, and aarBackfill re-fetches them in the background, newest first, AAR_BACKFILL_PER_TICK per pass,
   // after the regular resolutions.
   //
+  // The archive can also be sent on its own, once or twice a day, to the user's own Cloudflare Worker (the modal's
+  // "Export Cloudflare" section; see "Cloud export" below and cloudflare/README.md).
+  //
   // A ribbon with a checkbox ("Légendaires", localStorage "wm-auction-archive-legendary") adds one more source to
   // the discovery: GET /api/marketplace?page=N&limit=50&sort=recent&rarity=L, crawled exactly like a term (same stop
   // rule) and stored in the records' "terms" under the label AAR_LEGENDARY_LABEL ("rarity:L"). It works with no term.
@@ -10964,9 +11325,15 @@ const MY_USERNAME = "xxx";
     });
   }
 
+  // Every write of the crawler stamps the record's "updatedAt": the automatic export (Feature AAR, cloud) sends
+  // only what changed since its last run
   function aarPutMany(records) {
+    const now = Date.now();
     return aarRun("readwrite", (store) => {
-      records.forEach((record) => store.put(record));
+      records.forEach((record) => {
+        record.updatedAt = now;
+        store.put(record);
+      });
     });
   }
 
@@ -11446,9 +11813,10 @@ const MY_USERNAME = "xxx";
     }
   }
 
-  // Two loops side by side in the leader tab, sharing only the request gate and the rate-limit pause
+  // Two loops side by side in the leader tab, sharing only the request gate and the rate-limit pause (plus a third,
+  // light one that decides when the automatic cloud export is due)
   function aarRunLoop() {
-    return Promise.all([aarDiscoverLoop(), aarResolveLoop()]);
+    return Promise.all([aarDiscoverLoop(), aarResolveLoop(), aarCloudLoop()]);
   }
 
   // ---- Export ----
@@ -11614,8 +11982,12 @@ const MY_USERNAME = "xxx";
     });
   }
 
-  async function importAuctionArchive(file) {
-    const total = { added: 0, updated: 0, kept: 0, invalid: 0 };
+  // file: a Blob (the export file, or a downloaded chunk when gzip is true); total: where the counts accumulate, so
+  // several chunks can be imported one after the other
+  async function importAuctionArchive(
+    file,
+    { gzip = false, total = { added: 0, updated: 0, kept: 0, invalid: 0 } } = {},
+  ) {
     let batch = new Map();
 
     const flush = async () => {
@@ -11651,7 +12023,10 @@ const MY_USERNAME = "xxx";
       if (batch.size >= AAR_EXPORT_CHUNK) await flush();
     };
 
-    const reader = file.stream().pipeThrough(new TextDecoderStream()).getReader();
+    const bytes = gzip
+      ? file.stream().pipeThrough(new DecompressionStream("gzip"))
+      : file.stream();
+    const reader = bytes.pipeThrough(new TextDecoderStream()).getReader();
     let rest = "";
     for (;;) {
       const { done, value } = await reader.read();
@@ -11696,6 +12071,221 @@ const MY_USERNAME = "xxx";
     });
 
     input.click();
+  }
+
+  // ---- Cloud export (Cloudflare Worker + R2, see cloudflare/README.md) ----
+  // Once enabled, the archive is sent to the user's own Worker at most every AAR_CLOUD_DEFAULT_HOURS hours (24 or
+  // 12): only the records that changed since the last successful export (the first export therefore sends it all),
+  // gzipped, as chunks of AAR_CLOUD_CHUNK records ("chunks/{date}-{n}.json.gz", the export JSON's own format). The
+  // Worker is a dumb pipe into R2; the script does the compressing. Importing lists the chunks and merges them all
+  // with the regular importer. Requests go through GM_xmlhttpRequest (no CORS, the Worker's host is in @connect).
+  // A record changed when its "updatedAt" (stamped by every crawler write) moved; an older record without it falls
+  // back on its last timestamp. The cursor is where the last run started, minus an overlap so that a write racing
+  // the scan is not missed; it only moves once every chunk was accepted. The URL, token and state are kept with
+  // GM_setValue (private to the script, unlike localStorage, which the site's own scripts can read).
+  const AAR_CLOUD_CONFIG_KEY = "wm-aar-cloud";
+  const AAR_CLOUD_STATE_KEY = "wm-aar-cloud-state";
+  const AAR_CLOUD_LOCK_NAME = "wmb-auction-archive-cloud-export";
+  const AAR_CLOUD_CHUNK = 10000;
+  const AAR_CLOUD_DEFAULT_HOURS = 24;
+  const AAR_CLOUD_CHECK_MS = 60 * 1000;
+  const AAR_CLOUD_RETRY_MS = 30 * 60 * 1000;
+  const AAR_CLOUD_OVERLAP_MS = 60 * 1000;
+  const AAR_CLOUD_TIMEOUT_MS = 5 * 60 * 1000;
+
+  function aarCloudConfig() {
+    const raw = GM_getValue(AAR_CLOUD_CONFIG_KEY, null);
+    const config = raw && typeof raw === "object" ? raw : {};
+    return {
+      url: String(config.url ?? "").trim().replace(/\/+$/, ""),
+      token: String(config.token ?? "").trim(),
+      enabled: config.enabled === true,
+      hours: config.hours === 12 ? 12 : AAR_CLOUD_DEFAULT_HOURS,
+    };
+  }
+
+  function aarCloudSaveConfig(config) {
+    GM_setValue(AAR_CLOUD_CONFIG_KEY, config);
+  }
+
+  function aarCloudState() {
+    const raw = GM_getValue(AAR_CLOUD_STATE_KEY, null);
+    return raw && typeof raw === "object" ? raw : {};
+  }
+
+  function aarCloudSetState(patch) {
+    GM_setValue(AAR_CLOUD_STATE_KEY, { ...aarCloudState(), ...patch });
+  }
+
+  function aarCloudReady(config) {
+    return /^https:\/\//i.test(config.url) && config.token.length > 0;
+  }
+
+  function aarCloudChangedAt(record) {
+    return (
+      record.updatedAt ??
+      Math.max(
+        record.lastSeenAt ?? 0,
+        record.resolvedAt ?? 0,
+        record.firstSeenAt ?? 0,
+      )
+    );
+  }
+
+  function aarCloudDue() {
+    const config = aarCloudConfig();
+    if (!config.enabled || !aarCloudReady(config)) return false;
+    const state = aarCloudState();
+    const now = Date.now();
+    return (
+      now - (state.lastExportAt ?? 0) >= config.hours * 3600 * 1000 &&
+      now - (state.lastAttemptAt ?? 0) >= AAR_CLOUD_RETRY_MS
+    );
+  }
+
+  // One request to the Worker; resolves with the GM response, rejects on a network error or a non-2xx status
+  function aarCloudRequest(config, method, path, { body, responseType } = {}) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method,
+        url: `${config.url}${path}`,
+        headers: {
+          Authorization: `Bearer ${config.token}`,
+          ...(body ? { "Content-Type": "application/octet-stream" } : {}),
+        },
+        data: body,
+        responseType: responseType ?? "text",
+        timeout: AAR_CLOUD_TIMEOUT_MS,
+        onload: (response) => {
+          if (response.status >= 200 && response.status < 300) {
+            resolve(response);
+          } else {
+            reject(
+              new Error(
+                response.status === 401
+                  ? "jeton refusé (HTTP 401)"
+                  : `HTTP ${response.status}`,
+              ),
+            );
+          }
+        },
+        onerror: () => reject(new Error("erreur réseau")),
+        ontimeout: () => reject(new Error("délai dépassé")),
+      });
+    });
+  }
+
+  function aarGzip(text) {
+    const stream = new Blob([text])
+      .stream()
+      .pipeThrough(new CompressionStream("gzip"));
+    return new Response(stream).blob();
+  }
+
+  async function aarCloudExportRun() {
+    const config = aarCloudConfig();
+    if (!aarCloudReady(config)) throw new Error("adresse ou jeton manquant");
+    const state = aarCloudState();
+    const startedAt = Date.now();
+    const since = state.cursor ?? 0;
+    const stamp = new Date(startedAt).toISOString().replace(/[:.]/g, "-");
+
+    aarCloudSetState({ lastAttemptAt: startedAt, running: true, sent: 0 });
+    let buffer = [];
+    let chunks = 0;
+    let records = 0;
+    const send = async () => {
+      if (buffer.length === 0) return;
+      const text = `[\n${buffer.map((record) => JSON.stringify(record)).join(",\n")}\n]\n`;
+      const blob = await aarGzip(text);
+      const name = `${stamp}-${String(++chunks).padStart(3, "0")}.json.gz`;
+      await aarCloudRequest(config, "PUT", `/chunks/${name}`, { body: blob });
+      records += buffer.length;
+      buffer = [];
+      aarCloudSetState({ sent: records });
+    };
+
+    try {
+      await aarForEachPage(async (page) => {
+        for (const record of page) {
+          if (aarCloudChangedAt(record) < since) continue;
+          buffer.push(record);
+          if (buffer.length >= AAR_CLOUD_CHUNK) await send();
+        }
+      });
+      await send();
+    } catch (error) {
+      aarCloudSetState({ running: false, lastError: String(error?.message ?? error) });
+      throw error;
+    }
+    aarCloudSetState({
+      running: false,
+      cursor: startedAt - AAR_CLOUD_OVERLAP_MS,
+      lastExportAt: Date.now(),
+      lastRecords: records,
+      lastChunks: chunks,
+      lastError: null,
+    });
+    return { records, chunks };
+  }
+
+  // Runs one export unless one is already running (in this tab or another: a Web Lock), resolving with its
+  // { records, chunks }, or null when it was skipped
+  function aarCloudExport() {
+    if (!navigator.locks?.request) return aarCloudExportRun();
+    return navigator.locks.request(
+      AAR_CLOUD_LOCK_NAME,
+      { ifAvailable: true },
+      (lock) => (lock ? aarCloudExportRun() : null),
+    );
+  }
+
+  async function aarCloudLoop() {
+    for (;;) {
+      await aarSleep(AAR_CLOUD_CHECK_MS);
+      if (!aarCloudDue()) continue;
+      try {
+        await aarCloudExport();
+      } catch (error) {
+        console.error("[WMB-AAR]", error);
+      }
+    }
+  }
+
+  // Lists the chunks of the bucket (the Worker gives up to 1000 names per call)
+  async function aarCloudListChunks(config) {
+    const names = [];
+    let cursor = null;
+    do {
+      const response = await aarCloudRequest(
+        config,
+        "GET",
+        `/chunks${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+      );
+      const page = JSON.parse(response.responseText);
+      names.push(...page.names.map((entry) => entry.name));
+      cursor = page.cursor ?? null;
+    } while (cursor);
+    return names.sort();
+  }
+
+  // Downloads every chunk and merges it into the archive; resolves with the import counts and the number of chunks
+  async function aarCloudImport(onProgress) {
+    const config = aarCloudConfig();
+    if (!aarCloudReady(config)) throw new Error("adresse ou jeton manquant");
+    const names = await aarCloudListChunks(config);
+    const total = { added: 0, updated: 0, kept: 0, invalid: 0 };
+    let done = 0;
+    for (const name of names) {
+      onProgress?.(done, names.length);
+      const response = await aarCloudRequest(config, "GET", `/chunks/${name}`, {
+        responseType: "blob",
+      });
+      await importAuctionArchive(response.response, { gzip: true, total });
+      done++;
+    }
+    onProgress?.(done, names.length);
+    return { ...total, chunks: names.length };
   }
 
   // ---- UI ----
@@ -11782,6 +12372,39 @@ const MY_USERNAME = "xxx";
         return row;
       }),
     );
+  }
+
+  function aarCloudStatusLines() {
+    const config = aarCloudConfig();
+    const state = aarCloudState();
+    const when = (time) => new Date(time).toLocaleString("fr-FR");
+    const lines = [];
+    if (!aarCloudReady(config)) {
+      lines.push("Non configuré : saisissez l'adresse du Worker (https://…) et le jeton.");
+    } else if (state.running) {
+      lines.push(
+        `Export en cours : ${state.sent ?? 0} enchère(s) envoyée(s)…`,
+      );
+    } else if (state.lastExportAt) {
+      lines.push(
+        `Dernier export : ${when(state.lastExportAt)} · ${state.lastRecords ?? 0} enchère(s) en ${state.lastChunks ?? 0} morceau(x)`,
+      );
+      if (config.enabled) {
+        const next = Math.max(
+          state.lastExportAt + config.hours * 3600 * 1000,
+          Date.now(),
+        );
+        lines.push(`Prochain export : ${when(next)}`);
+      }
+    } else if (config.enabled) {
+      lines.push(
+        "Premier export (toute l'archive) : dans la minute qui suit, un onglet wiki-masters.com ouvert.",
+      );
+    } else {
+      lines.push("Export automatique désactivé.");
+    }
+    if (state.lastError) lines.push(`Dernière erreur : ${state.lastError}`);
+    return lines;
   }
 
   function buildAuctionArchiveModal() {
@@ -11929,11 +12552,153 @@ const MY_USERNAME = "xxx";
       }),
     );
 
-    modal.append(header, hint, termsRow, legendaryRibbon, statusBox, actions);
+    // Automatic export to the user's own Cloudflare Worker (see the cloud export notes above)
+    const cloudBox = document.createElement("div");
+    cloudBox.className = "wm-aar-cloud";
+
+    const cloudTitle = document.createElement("strong");
+    cloudTitle.textContent = "Export Cloudflare";
+
+    const cloudHint = document.createElement("p");
+    cloudHint.className = "wm-settings-hint";
+    cloudHint.textContent =
+      "Envoie les enchères nouvelles ou modifiées vers votre Worker Cloudflare (mise en place : dossier cloudflare/ du dépôt), tant qu'un onglet wiki-masters.com reste ouvert.";
+
+    const cloudConfig = aarCloudConfig();
+    const cloudRow = document.createElement("div");
+    cloudRow.className = "wm-aar-row";
+    const urlInput = document.createElement("input");
+    urlInput.type = "url";
+    urlInput.className = "wm-aar-input";
+    urlInput.placeholder = "https://wmb-archive.votre-compte.workers.dev";
+    urlInput.value = cloudConfig.url;
+    const tokenInput = document.createElement("input");
+    tokenInput.type = "password";
+    tokenInput.className = "wm-aar-input";
+    tokenInput.placeholder = "Jeton";
+    tokenInput.autocomplete = "off";
+    tokenInput.value = cloudConfig.token;
+    cloudRow.append(urlInput, tokenInput);
+
+    const cloudOptions = document.createElement("div");
+    cloudOptions.className = "wm-aar-row";
+    const enabledLabel = document.createElement("label");
+    enabledLabel.className = "wm-aar-ribbon";
+    const enabledToggle = document.createElement("input");
+    enabledToggle.type = "checkbox";
+    enabledToggle.checked = cloudConfig.enabled;
+    const enabledText = document.createElement("span");
+    enabledText.textContent = "Export automatique, toutes les";
+    const hoursSelect = document.createElement("select");
+    hoursSelect.className = "wm-aar-input";
+    hoursSelect.style.flex = "0 0 auto";
+    [24, 12].forEach((hours) => {
+      const option = document.createElement("option");
+      option.value = String(hours);
+      option.textContent = `${hours} h`;
+      option.selected = cloudConfig.hours === hours;
+      hoursSelect.appendChild(option);
+    });
+    enabledLabel.append(enabledToggle, enabledText, hoursSelect);
+
+    const cloudStatus = document.createElement("div");
+    cloudStatus.className = "wm-aar-status";
+
+    const refreshCloud = () => {
+      cloudStatus.replaceChildren(
+        ...aarCloudStatusLines().map((line) => {
+          const row = document.createElement("div");
+          row.textContent = line;
+          return row;
+        }),
+      );
+    };
+    const saveCloud = () => {
+      const before = aarCloudConfig();
+      const next = {
+        url: urlInput.value.trim().replace(/\/+$/, ""),
+        token: tokenInput.value.trim(),
+        enabled: enabledToggle.checked,
+        hours: hoursSelect.value === "12" ? 12 : 24,
+      };
+      aarCloudSaveConfig(next);
+      // A new destination has none of the chunks yet: it gets the whole archive again
+      if (next.url !== before.url) {
+        aarCloudSetState({ cursor: 0, lastExportAt: 0, lastAttemptAt: 0, lastError: null });
+      }
+      refreshCloud();
+    };
+    const cloudSaveBtn = makeButton("Enregistrer", saveCloud);
+    const cloudNowBtn = makeButton("Exporter maintenant", async () => {
+      saveCloud();
+      cloudNowBtn.disabled = true;
+      try {
+        const result = await aarCloudExport();
+        GM_notification({
+          title: "Wiki-Masters",
+          text: result
+            ? `${result.records} enchère(s) envoyée(s) vers Cloudflare.`
+            : "Un export est déjà en cours.",
+          timeout: 5000,
+        });
+      } catch (error) {
+        console.error("[WMB-AAR]", error);
+        alert(`L'export vers Cloudflare a échoué : ${error?.message ?? error}`);
+      }
+      cloudNowBtn.disabled = false;
+      refreshCloud();
+    });
+    const cloudImportBtn = makeButton("Importer depuis Cloudflare", async () => {
+      saveCloud();
+      cloudImportBtn.disabled = true;
+      try {
+        const total = await aarCloudImport((done, count) => {
+          cloudImportBtn.textContent = `Import… ${done}/${count}`;
+        });
+        GM_notification({
+          title: "Wiki-Masters",
+          text: `Import Cloudflare terminé (${total.chunks} morceau(x)) : ${total.added} ajoutée(s), ${total.updated} mise(s) à jour, ${total.kept} déjà à jour.`,
+          timeout: 6000,
+        });
+      } catch (error) {
+        console.error("[WMB-AAR]", error);
+        alert(`L'import depuis Cloudflare a échoué : ${error?.message ?? error}`);
+      }
+      cloudImportBtn.textContent = "Importer depuis Cloudflare";
+      cloudImportBtn.disabled = false;
+      refresh();
+    });
+    const cloudActions = document.createElement("div");
+    cloudActions.className = "wm-aar-row";
+    cloudActions.append(cloudSaveBtn, cloudNowBtn, cloudImportBtn);
+
+    cloudBox.append(
+      cloudTitle,
+      cloudHint,
+      cloudRow,
+      cloudOptions,
+      cloudStatus,
+      cloudActions,
+    );
+    cloudOptions.appendChild(enabledLabel);
+    refreshCloud();
+
+    modal.append(
+      header,
+      hint,
+      termsRow,
+      legendaryRibbon,
+      statusBox,
+      actions,
+      cloudBox,
+    );
     overlay.appendChild(modal);
 
     refresh();
-    const refreshTimer = setInterval(refresh, 5000);
+    const refreshTimer = setInterval(() => {
+      refresh();
+      refreshCloud();
+    }, 5000);
 
     const onKeydown = (event) => {
       if (event.key === "Escape") close();
@@ -12061,6 +12826,11 @@ const MY_USERNAME = "xxx";
         height: 1rem;
         accent-color: #f59e0b;
         cursor: pointer;
+      }
+      .wm-aar-cloud {
+        margin-top: 0.75rem;
+        padding-top: 0.5rem;
+        border-top: 1px solid rgba(128, 128, 128, 0.4);
       }
       .wm-aar-status {
         margin: 0.5rem 0;
@@ -12916,13 +13686,24 @@ const MY_USERNAME = "xxx";
   // gets no line, the median of the plain card being misleading for it. Nothing is shown when the card has no
   // archived sale. Archive lookups are cached per card name for MLM_STATS_TTL_MS. Not shown on the "Historique" and
   // "Gagnées" tabs (the cards there are finished auctions). Reads only the archive.
+  // When the card's displayed price (start bid or current bid) is above that median, the card is made discreet: a
+  // CSS filter fades it and takes its colour away, under a tint of a 4-step scale by price / median
+  // (MLM_PREMIUM_LEVELS): from +1 % yellow, +25 % orange, +75 % red, +150 % deep red, the further, the fainter. No badge
+  // and no coloured price: the fair-priced cards stand out by contrast, and whoever wants the figure reads the card
+  // (the median line's tooltip gives the percentage). Back to normal on hover. Nothing at or below the median. The
+  // price is re-read on every pass (it moves with the bids); the level is a data attribute on the card's div.
+  // On a bid page the hint is given another way (see mlmUpdateDetail): in the bid panel, in plain sight.
   // ============================================================
   const MLM_START_LABEL = "Mise de départ";
   const MLM_STORAGE_KEY = "wm-mlm-start-only";
   const MLM_HIDE_OWNED_KEY = "wm-mlm-hide-owned";
+  const MLM_CURRENT_LABEL = "Mise actuelle";
+  // Price / median ratios from which each level of the "above the median" colour scale starts (+1 %, +25 %, +75 %, +150 %)
+  const MLM_PREMIUM_LEVELS = [1.0001, 1.25, 1.75, 2.5];
   const MLM_STATS_TTL_MS = 60 * 1000;
   const MLM_CARD_SELECTOR = 'div[id^="marketplace-auction-"]';
   const mlmStatsByName = new Map();
+  const mlmStatByCard = new WeakMap();
   const mlmReadFlag = (key) => {
     try {
       return localStorage.getItem(key) === "1";
@@ -12993,21 +13774,86 @@ const MY_USERNAME = "xxx";
     return promise;
   }
 
+  // The card's displayed price (start bid or current bid) and the label above it, null when it can't be read. The
+  // price span follows the label ("Mise de départ" / "Mise actuelle") and holds an icon and the figure.
+  function mlmReadPrice(card) {
+    for (const label of card.querySelectorAll("span.uppercase")) {
+      const text = label.textContent.trim();
+      if (text !== MLM_START_LABEL && text !== MLM_CURRENT_LABEL) continue;
+      const span = label.nextElementSibling;
+      const digits = (span?.textContent ?? "").replace(/\D/g, "");
+      if (!span || !digits) return null;
+      return { label: text, span, price: Number(digits) };
+    }
+    return null;
+  }
+
+  // How far above the median a price is: the level (1 to MLM_PREMIUM_LEVELS.length, 0 = not above it) and the
+  // rounded percentage
+  function mlmPremium(price, median) {
+    if (!(median > 0) || !(price > median)) return { level: 0, percent: 0 };
+    const ratio = price / median;
+    let level = 0;
+    MLM_PREMIUM_LEVELS.forEach((from, index) => {
+      if (ratio >= from) level = index + 1;
+    });
+    return { level, percent: Math.round((ratio - 1) * 100) };
+  }
+
+  // The hint that the price is above the median, deliberately discreet: the card is made less visible, and tinted
+  // with the colour of its level (a data attribute on the card, a CSS filter and tint do the rest), so that the
+  // reasonably priced cards stand out by contrast and nothing is highlighted. The figures are only in the tooltip
+  // of the median line. Cheap, and re-run on every pass since the price changes as bids come in. The card's stat
+  // was stored by mlmSetMedianLine.
+  function mlmApplyPremium(card) {
+    const stat = mlmStatByCard.get(card) ?? null;
+    const read = stat ? mlmReadPrice(card) : null;
+    const { level, percent } = read
+      ? mlmPremium(read.price, stat.median)
+      : { level: 0, percent: 0 };
+
+    const value = level > 0 ? String(level) : null;
+    if ((card.dataset.wmMlmPremium ?? null) !== value) {
+      if (value) card.dataset.wmMlmPremium = value;
+      else delete card.dataset.wmMlmPremium;
+    }
+
+    const line = card.querySelector(".wm-mlm-median");
+    if (!line) return;
+    let title = line.dataset.wmBaseTitle ?? "";
+    if (level > 0) {
+      const what =
+        read.label === MLM_START_LABEL ? "La mise de départ" : "La mise actuelle";
+      title += `\n${what} (${achNumberFormat.format(read.price)}) est ${achNumberFormat.format(percent)} % au-dessus de la médiane`;
+    }
+    if (line.title !== title) line.title = title;
+  }
+
   function mlmSetMedianLine(card, stat) {
     let line = card.querySelector(".wm-mlm-median");
     if (!stat) {
+      mlmStatByCard.delete(card);
       line?.remove();
+      mlmApplyPremium(card);
       return;
     }
+    mlmStatByCard.set(card, stat);
     if (!line) {
       line = document.createElement("div");
       line.className = "wm-mlm-median";
       (card.querySelector(":scope > a") ?? card).append(line);
     }
+    let label = line.querySelector(".wm-mlm-median-text");
+    if (!label) {
+      label = document.createElement("span");
+      label.className = "wm-mlm-median-text";
+      line.prepend(label);
+    }
     const text = `médiane ${achNumberFormat.format(Math.round(stat.median))} · ${stat.count} vente${stat.count > 1 ? "s" : ""}`;
-    if (line.textContent !== text) line.textContent = text;
+    if (label.textContent !== text) label.textContent = text;
     const title = `Ventes archivées de cette carte : de ${achNumberFormat.format(stat.min)} à ${achNumberFormat.format(stat.max)}`;
-    if (line.title !== title) line.title = title;
+    line.dataset.wmBaseTitle = title;
+    mlmApplyPremium(card);
   }
 
   async function mlmUpdateMedian(card) {
@@ -13021,6 +13867,7 @@ const MY_USERNAME = "xxx";
     ) {
       return;
     }
+    if (card.dataset.wmMlmKey !== key) mlmStatByCard.delete(card);
     card.dataset.wmMlmKey = key;
     card.dataset.wmMlmAt = String(Date.now());
     if (!name || !rarity || /✨|shiny/i.test(card.textContent)) {
@@ -13035,6 +13882,101 @@ const MY_USERNAME = "xxx";
     } catch (error) {
       console.error("[WMB-MLM]", error);
     }
+  }
+
+  // The hint on a bid page (/marketplace/{UUID}), for a live auction (the bid field is there) of a card that is not
+  // shiny. Here the card's picture is left alone and the hint is plainly visible, in the bid panel (the card-frame
+  // holding the bid field): a line "▲ +140 % au-dessus de la médiane des ventes archivées (50)" is put at its top, and
+  // its border and background take the colour of the level (same scale as the list). The price is the page's
+  // span.text-2xl; the median comes from the same archive lookup as the list's; the card is read off the page (name:
+  // heading's own text; rarity: the badge). Nothing is requested.
+  let mlmDetailKey = null;
+  let mlmDetailStat = null;
+
+  function mlmClearDetail() {
+    mlmDetailKey = null;
+    mlmDetailStat = null;
+    document.querySelectorAll(".wm-mlm-panel").forEach((panel) => {
+      panel.classList.remove("wm-mlm-panel");
+      delete panel.dataset.wmMlmPremium;
+      panel.querySelector(":scope > .wm-mlm-panel-note")?.remove();
+    });
+  }
+
+  function mlmApplyDetail(panel, priceSpan) {
+    const price = Number((priceSpan?.textContent ?? "").replace(/\D/g, ""));
+    const { level, percent } =
+      mlmDetailStat && price > 0
+        ? mlmPremium(price, mlmDetailStat.median)
+        : { level: 0, percent: 0 };
+
+    let note = panel.querySelector(":scope > .wm-mlm-panel-note");
+    if (level === 0) {
+      note?.remove();
+      delete panel.dataset.wmMlmPremium;
+      panel.classList.remove("wm-mlm-panel");
+      return;
+    }
+
+    if (!panel.classList.contains("wm-mlm-panel")) {
+      panel.classList.add("wm-mlm-panel");
+    }
+    if (panel.dataset.wmMlmPremium !== String(level)) {
+      panel.dataset.wmMlmPremium = String(level);
+    }
+    if (!note) {
+      note = document.createElement("p");
+      note.className = "wm-mlm-panel-note";
+    }
+    if (panel.firstElementChild !== note) panel.prepend(note);
+    const text = `▲ +${achNumberFormat.format(percent)} % au-dessus de la médiane des ventes archivées (${achNumberFormat.format(Math.round(mlmDetailStat.median))})`;
+    if (note.textContent !== text) note.textContent = text;
+  }
+
+  function mlmUpdateDetail() {
+    const field = document.querySelector(
+      'input[aria-label="Montant de la mise"], input.min-w-0',
+    );
+    const panel = field?.closest(".card-frame") ?? null;
+    const badgeHost = document.querySelector("div.top-2.left-2")?.parentElement;
+    const heading = document.querySelector("h1.flex-1");
+    const priceSpan = document.querySelector("span.text-2xl");
+    const name = heading
+      ? Array.from(heading.childNodes)
+          .filter((node) => node.nodeType === Node.TEXT_NODE)
+          .map((node) => node.textContent)
+          .join("")
+          .trim()
+      : "";
+    const rarity = badgeHost ? cprReadCardRarity(badgeHost) : null;
+    if (
+      !panel ||
+      !badgeHost ||
+      !priceSpan ||
+      !name ||
+      !rarity ||
+      /✨|shiny/i.test(badgeHost.textContent)
+    ) {
+      mlmClearDetail();
+      return;
+    }
+
+    const key = `${name}|${rarity}`;
+    if (key !== mlmDetailKey) {
+      mlmDetailKey = key;
+      mlmDetailStat = null;
+    }
+    mlmLoadStats(name)
+      .then((stats) => {
+        if (mlmDetailKey !== key) return;
+        const stat = stats.get(rarity) ?? null;
+        if (stat?.median !== mlmDetailStat?.median) {
+          mlmDetailStat = stat;
+          mlmApplyDetail(panel, priceSpan);
+        }
+      })
+      .catch((error) => console.error("[WMB-MLM]", error));
+    mlmApplyDetail(panel, priceSpan);
   }
 
   // One compact item of the bar: a short label and a switch (the site's switch look, scaled down), the
@@ -13154,6 +14096,11 @@ const MY_USERNAME = "xxx";
   }
 
   function updateMarketplaceList() {
+    if (MARKETPLACE_BID_PATH_REGEX.test(window.location.pathname)) {
+      mlmUpdateDetail();
+    } else if (mlmDetailKey !== null || document.querySelector(".wm-mlm-panel")) {
+      mlmClearDetail();
+    }
     const cards = Array.from(document.querySelectorAll(MLM_CARD_SELECTOR));
     const onList = /^\/marketplace\/?$/.test(window.location.pathname);
     const tabBar = onList ? awlFindTabBar() : null;
@@ -13182,7 +14129,10 @@ const MY_USERNAME = "xxx";
       if (card.classList.contains("wm-mlm-hidden") !== hide) {
         card.classList.toggle("wm-mlm-hidden", hide);
       }
-      if (listing) mlmUpdateMedian(card);
+      if (listing) {
+        mlmUpdateMedian(card);
+        mlmApplyPremium(card);
+      }
     }
 
     if (bar) {
@@ -13289,6 +14239,72 @@ const MY_USERNAME = "xxx";
         font-size: 10px;
         font-weight: 600;
         color: var(--color-accent);
+      }
+      /* "Above the median" scale, deliberately discreet: the card fades and loses colour, under a tint of its level's
+         colour (yellow, orange, red, deep red); the fair prices stand out by contrast. Back to normal on hover,
+         like Rule 41's dimming. The tint is a pseudo-element: no node is added to the site's markup. */
+      [data-wm-mlm-premium="1"] {
+        --wm-premium-color: #facc15;
+        --wm-premium-tint: rgb(250 204 21 / 0.14);
+        --wm-premium-filter: saturate(0.6);
+        --wm-premium-opacity: 0.72;
+      }
+      [data-wm-mlm-premium="2"] {
+        --wm-premium-color: #fb923c;
+        --wm-premium-tint: rgb(251 146 60 / 0.2);
+        --wm-premium-filter: saturate(0.4);
+        --wm-premium-opacity: 0.52;
+      }
+      [data-wm-mlm-premium="3"] {
+        --wm-premium-color: #f87171;
+        --wm-premium-tint: rgb(248 113 113 / 0.28);
+        --wm-premium-filter: saturate(0.2) brightness(0.9);
+        --wm-premium-opacity: 0.33;
+      }
+      [data-wm-mlm-premium="4"] {
+        --wm-premium-color: #f43f5e;
+        --wm-premium-tint: rgb(244 63 94 / 0.36);
+        --wm-premium-filter: saturate(0) brightness(0.8);
+        --wm-premium-opacity: 0.17;
+      }
+      /* In the list, what fades is the card's link */
+      [data-wm-mlm-premium] > a {
+        position: relative;
+        filter: var(--wm-premium-filter);
+        opacity: var(--wm-premium-opacity);
+        transition: filter 0.2s ease, opacity 0.2s ease, border-color 0.2s ease;
+      }
+      [data-wm-mlm-premium] > a::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        pointer-events: none;
+        z-index: 40;
+        background: var(--wm-premium-tint);
+        transition: opacity 0.2s ease;
+      }
+      [data-wm-mlm-premium] > a:hover {
+        filter: none;
+        opacity: 1;
+      }
+      [data-wm-mlm-premium] > a:hover::after {
+        opacity: 0;
+      }
+      /* On a bid page, the bid panel is the one that shows the level: border and background in its colour, plus a
+         line of text at its top. Plainly visible, there. */
+      .wm-mlm-panel[data-wm-mlm-premium] {
+        border-color: var(--wm-premium-color);
+        background-image: linear-gradient(
+          color-mix(in srgb, var(--wm-premium-color) 12%, transparent),
+          color-mix(in srgb, var(--wm-premium-color) 12%, transparent)
+        );
+      }
+      .wm-mlm-panel-note {
+        font-size: 0.8125rem;
+        font-weight: 600;
+        line-height: 1.25rem;
+        color: var(--wm-premium-color);
       }
     `);
 
@@ -14185,9 +15201,139 @@ const MY_USERNAME = "xxx";
   }
 
   // ============================================================
+  // Feature ESR: at the bottom of the left menu, a recap of the card estimates kept by Feature ETS: how many cards
+  // have an estimate, how many of those were last seen more than ESR_STALE_DAYS days ago (those worth estimating
+  // again), and how many have no known date (estimates saved before dates were kept). Folded, the menu shows only an
+  // icon (amber when some estimates are stale; the tooltip gives the figures); expanded, the figures in text.
+  // The "?" placeholder (no sale to estimate from) is not an estimate and is not counted.
+  // ============================================================
+  const ESR_STALE_DAYS = 15;
+
+  function computeEstimationRecap() {
+    const staleBefore = Date.now() - ESR_STALE_DAYS * 86400000;
+    let total = 0;
+    let stale = 0;
+    let undated = 0;
+    for (const cardName of etsNames()) {
+      if (getCardEvalValueByName(cardName) === null) continue;
+      total++;
+      const at = etsGetDate(cardName);
+      if (at === null) undated++;
+      else if (at < staleBefore) stale++;
+    }
+    return { total, stale, undated };
+  }
+
+  function renderEstimationRecap(block) {
+    const { total, stale, undated } = computeEstimationRecap();
+    const plural = (n, one, many) => (n > 1 ? many : one);
+
+    const lines = [
+      `${total.toLocaleString("fr-FR")} ${plural(total, "carte estimée", "cartes estimées")}`,
+      stale > 0
+        ? `dont ${stale.toLocaleString("fr-FR")} de plus de ${ESR_STALE_DAYS} j`
+        : `aucune de plus de ${ESR_STALE_DAYS} j`,
+    ];
+    if (undated > 0) {
+      lines.push(
+        `${undated.toLocaleString("fr-FR")} sans date connue`,
+      );
+    }
+
+    const text = block.querySelector(".wm-esr-text");
+    const summary = lines.join(" · ");
+    // Only touched when it changed, to not feed the observers
+    if (block.dataset.summary === summary && block.dataset.stale === String(stale > 0)) return;
+    block.dataset.summary = summary;
+    block.dataset.stale = String(stale > 0);
+    block.title = `Estimations enregistrées : ${summary}`;
+    text.replaceChildren(
+      ...lines.map((line, index) => {
+        const row = document.createElement("div");
+        row.className =
+          index === 1 && stale > 0 ? "wm-esr-line wm-esr-stale" : "wm-esr-line";
+        row.textContent = line;
+        return row;
+      }),
+    );
+  }
+
+  function ensureEstimationRecap() {
+    const nav = document.querySelector("nav h1")?.closest("nav");
+    if (!nav) return;
+
+    let block = nav.querySelector(":scope > .wm-esr");
+    if (!block) {
+      block = document.createElement("div");
+      block.className = "wm-esr";
+      const icon = document.createElement("span");
+      icon.className = "wm-esr-icon";
+      icon.textContent = "🕒";
+      const text = document.createElement("div");
+      text.className = "wm-esr-text";
+      block.append(icon, text);
+      nav.appendChild(block);
+    } else if (block !== nav.lastElementChild) {
+      nav.appendChild(block);
+    }
+    renderEstimationRecap(block);
+  }
+
+  function watchEstimationRecap() {
+    GM_addStyle(`
+      .wm-esr {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin-top: auto;
+        padding: 0.75rem;
+        border-top: 1px solid var(--color-border);
+        font-size: 0.75rem;
+        line-height: 1.35;
+        color: var(--color-foreground);
+        cursor: default;
+      }
+      .wm-esr-icon {
+        flex-shrink: 0;
+        width: 1.5rem;
+        text-align: center;
+        font-size: 1.1rem;
+        opacity: 0.6;
+      }
+      .wm-esr[data-stale="true"] .wm-esr-icon {
+        opacity: 1;
+        filter: sepia(1) saturate(4) hue-rotate(-10deg);
+      }
+      .wm-esr-text {
+        min-width: 0;
+        white-space: nowrap;
+        opacity: 0.75;
+      }
+      .wm-esr-stale {
+        color: #f59e0b;
+        font-weight: 600;
+      }
+      .wm-sidebar:not(:hover):not(.wm-sidebar-pinned) .wm-esr-text {
+        display: none;
+      }
+    `);
+
+    ensureEstimationRecap();
+    etsOnChange(ensureEstimationRecap);
+    // Estimates grow old by themselves
+    setInterval(ensureEstimationRecap, 10 * 60 * 1000);
+    new MutationObserver(ensureEstimationRecap).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  // ============================================================
   // Init
   // ============================================================
-  function main() {
+  async function main() {
+    // Every reader of the estimates is synchronous: they are loaded in memory before any feature starts
+    await etsLoad();
     const flags = readFeatureFlags();
     const run = (id, fn) => {
       if (flags[id]) fn();
@@ -14284,6 +15430,7 @@ const MY_USERNAME = "xxx";
     run("feature-mlm", watchMarketplaceList);
     run("feature-awl", watchAuctionWatchlist);
     run("feature-eta", watchEndEstimates);
+    run("feature-esr", watchEstimationRecap);
 
     watchFeatureConfigButton();
     watchTutorialButton();
